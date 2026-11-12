@@ -138,6 +138,11 @@ typedef struct {
     bool pc_usb_active;
     bool has_token;
 
+    oled_iot_status_t iot_status;
+    char pairing_code[12];
+    char event_code[24];
+    char mac_short[16];
+
     oled_ticket_status_t ticket_status;
     char ticket_code[24];
     char sub_msg[24];
@@ -159,6 +164,10 @@ static oled_state_t s_state = {
     .auto_confirm = false,
     .pc_usb_active = false,
     .has_token = false,
+    .iot_status = OLED_IOT_NONE,
+    .pairing_code = "",
+    .event_code = "",
+    .mac_short = "",
     .ticket_status = OLED_TICKET_IDLE,
     .ticket_code = "",
     .sub_msg = "",
@@ -474,6 +483,13 @@ static void render_oled_frame(const oled_state_t *st, uint32_t anim_step)
             fb_draw_text(39, 48, st->sub_msg[0] ? st->sub_msg : "VE KO TON TAI", 14, 1);
             break;
 
+        case OLED_TICKET_WRONG_EVENT:
+            draw_icon_cross(17, 39);
+            fb_draw_text(39, 20, "SAI SU KIEN!", 14, 1);
+            fb_draw_text(39, 34, code, 14, 1);
+            fb_draw_text(39, 48, st->sub_msg[0] ? st->sub_msg : "VE KHAC SU KIEN", 14, 1);
+            break;
+
         case OLED_TICKET_NET_ERR:
             draw_icon_cross(17, 39);
             fb_draw_text(39, 20, "LOI KET NOI!", 14, 1);
@@ -491,14 +507,41 @@ static void render_oled_frame(const oled_state_t *st, uint32_t anim_step)
         case OLED_TICKET_IDLE:
         default:
             draw_icon_qr(6, 27);
-            if (!st->pc_usb_active && !st->has_token) {
-                fb_draw_text(39, 20, "THIEU TOKEN!", 14, 1);
-                fb_draw_text(39, 34, "DANG NHAP PC", 14, 1);
-                fb_draw_text(39, 48, "DE SOAT VE", 14, 1);
+            if (st->iot_status == OLED_IOT_PENDING && st->pairing_code[0]) {
+                char line2[24];
+                char line3[24];
+                snprintf(line2, sizeof(line2), "MA: %s", st->pairing_code);
+                snprintf(line3, sizeof(line3), "MAC:%s", st->mac_short[0] ? st->mac_short : "--");
+                fb_draw_text(39, 20, "CHO DUYET!", 14, 1);
+                fb_draw_text(39, 34, line2, 14, 1);
+                fb_draw_text(39, 48, line3, 14, 1);
+            } else if (st->iot_status == OLED_IOT_REPAIR_REQUIRED) {
+                fb_draw_text(39, 20, "CAN RESET GHEP", 14, 1);
+                fb_draw_text(39, 34, "MO ADMIN WEB", 14, 1);
+                fb_draw_text(39, 48, "DE CAP MA MOI", 14, 1);
+            } else if (st->iot_status == OLED_IOT_DISABLED) {
+                fb_draw_text(39, 20, "MAY BI KHOA!", 14, 1);
+                fb_draw_text(39, 34, "TRANG THAI OFF", 14, 1);
+                fb_draw_text(39, 48, "LIEN HE ADMIN", 14, 1);
+            } else if (st->iot_status == OLED_IOT_NO_EVENT) {
+                fb_draw_text(39, 20, "CHUA CO SU KIEN", 14, 1);
+                fb_draw_text(39, 34, "GAN EVENT TREN", 14, 1);
+                fb_draw_text(39, 48, "TRANG ADMIN", 14, 1);
+            } else if (!st->pc_usb_active && !st->has_token && st->iot_status != OLED_IOT_READY) {
+                fb_draw_text(39, 20, "DANG DANG KY", 14, 1);
+                fb_draw_text(39, 34, "KET NOI SERVER", 14, 1);
+                fb_draw_text(39, 48, st->wifi_connected ? "CHO PHAN HOI.." : "CAN KET NOI WIFI", 14, 1);
             } else {
                 fb_draw_text(39, 20, "SAN SANG QUET", 14, 1);
-                fb_draw_text(39, 34, st->auto_confirm ? "AUTO: BAT" : "AUTO: TAT", 14, 1);
-                fb_draw_text(39, 48, st->pc_usb_active ? "CHEDO: PC USB" : "CHEDO: DOC LAP", 14, 1);
+                if (st->iot_status == OLED_IOT_READY && st->event_code[0]) {
+                    char evt_line[24];
+                    snprintf(evt_line, sizeof(evt_line), "SK:%.11s", st->event_code);
+                    fb_draw_text(39, 34, evt_line, 14, 1);
+                } else {
+                    fb_draw_text(39, 34, st->auto_confirm ? "AUTO: BAT" : "AUTO: TAT", 14, 1);
+                }
+                fb_draw_text(39, 48, st->pc_usb_active ? "CHEDO: PC USB" :
+                                     (st->iot_status == OLED_IOT_READY ? "CHEDO: IOT MAY" : "CHEDO: DOC LAP"), 14, 1);
             }
             break;
     }
@@ -792,6 +835,35 @@ void oled_show_ticket_status(oled_ticket_status_t status, const char *ticket_cod
     xSemaphoreGive(s_oled_mutex);
 
     if (s_oled_task) {
+        xTaskNotifyGive(s_oled_task);
+    }
+}
+
+void oled_update_iot_status(oled_iot_status_t iot_status,
+                            const char *pairing_code,
+                            const char *event_code,
+                            const char *mac_short)
+{
+    if (!s_oled_mutex) return;
+    const char *pc = pairing_code ? pairing_code : "";
+    const char *ec = event_code ? event_code : "";
+    const char *mc = mac_short ? mac_short : "";
+
+    xSemaphoreTake(s_oled_mutex, portMAX_DELAY);
+    bool changed = (s_state.iot_status != iot_status) ||
+                   (strncmp(s_state.pairing_code, pc, sizeof(s_state.pairing_code) - 1) != 0) ||
+                   (strncmp(s_state.event_code, ec, sizeof(s_state.event_code) - 1) != 0) ||
+                   (strncmp(s_state.mac_short, mc, sizeof(s_state.mac_short) - 1) != 0);
+    if (changed) {
+        s_state.iot_status = iot_status;
+        snprintf(s_state.pairing_code, sizeof(s_state.pairing_code), "%s", pc);
+        snprintf(s_state.event_code, sizeof(s_state.event_code), "%s", ec);
+        snprintf(s_state.mac_short, sizeof(s_state.mac_short), "%s", mc);
+        s_state.dirty = true;
+    }
+    xSemaphoreGive(s_oled_mutex);
+
+    if (changed && s_oled_task) {
         xTaskNotifyGive(s_oled_task);
     }
 }

@@ -2,7 +2,7 @@
 """
 EventHub QR Check-in System: Multi-Threaded USB High-Speed Video Streamer & Backend Proxy
 Connects to ESP32-S3 over CH343 USB-UART @ 2,000,000 baud, decodes JPEG frames,
-provides an MJPEG HTTP stream, and proxies Staff API calls to EventHub Backend.
+provides an MJPEG HTTP stream, and proxies IoT / Ticket Check-in API calls to EventHub Backend.
 """
 
 import sys
@@ -24,6 +24,36 @@ import requests
 # Enable line-buffered standard output
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(line_buffering=True)
+
+
+def _load_local_env():
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.isfile(env_path):
+        return
+    try:
+        with open(env_path, "r", encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip().strip('"').strip("'")
+                if k and k not in os.environ:
+                    os.environ[k] = v
+    except Exception as e:
+        print(f"[!] Warning reading .env: {e}")
+
+
+_load_local_env()
+
+DEFAULT_BACKEND_HOST = os.environ.get("EVENTHUB_BACKEND_HOST", "api.example.com").strip()
+DEFAULT_API_BASE_URL = os.environ.get("EVENTHUB_API_BASE_URL", f"https://{DEFAULT_BACKEND_HOST}/api").strip().rstrip("/")
+DEFAULT_IOT_BASE_URL = os.environ.get("EVENTHUB_IOT_BASE_URL", f"{DEFAULT_API_BASE_URL}/iot/v1").strip().rstrip("/")
+DEFAULT_FRONTEND_DOMAIN = os.environ.get("EVENTHUB_FRONTEND_DOMAIN", "example.com").strip()
+DEFAULT_ALLOWED_SUFFIX = os.environ.get("EVENTHUB_ALLOWED_DOMAIN_SUFFIX", "").strip()
+if not DEFAULT_ALLOWED_SUFFIX and DEFAULT_FRONTEND_DOMAIN and DEFAULT_FRONTEND_DOMAIN != "example.com":
+    DEFAULT_ALLOWED_SUFFIX = "." + DEFAULT_FRONTEND_DOMAIN.lstrip(".")
 
 # Default Settings
 DEFAULT_PORT = "COM6"
@@ -63,7 +93,7 @@ network_state = {
     "latency_ms": -1,
     "latency_quality": "offline",
     "server_reachable": False,
-    "backend_host": "api.eventhub.id.vn",
+    "backend_host": DEFAULT_BACKEND_HOST,
     "last_updated": 0,
 }
 network_lock = threading.Lock()
@@ -109,12 +139,14 @@ esp32_device_state = {
     "latency_quality": "offline",
     "status_text": "Chưa kết nối Wi-Fi",
     "auto_confirm": None,
-    "has_token": False,
     "wifi_profiles_count": 0,
     "last_scan": None,
+    "iot": None,
     "last_seen": 0,
 }
 esp32_state_lock = threading.Lock()
+esp32_iot_creds = {"device_id": "", "device_secret": ""}
+esp32_iot_creds_lock = threading.Lock()
 
 # Request routing mode: "pc" (PC sends requests) or "esp32" (ESP32 Wi-Fi sends requests directly)
 request_route_mode = "pc"
@@ -144,7 +176,6 @@ esp_scanned_networks = []
 esp_wifi_scan_lock = threading.Lock()
 esp_scan_event = threading.Event()
 esp_auto_event = threading.Event()
-esp_token_event = threading.Event()
 esp_wifi_profile_event = threading.Event()
 
 # ESP32 Direct UART HTTPS Request/Response State & Events
@@ -221,39 +252,49 @@ def notify_esp32_oled_and_beep(oled_status=None, qr_code="", beep_ms=0):
                 pass
 
 
-def classify_api_ticket_oled_feedback(url, qr_code, status_code, resp_json):
-    is_checkin = ("check-in" in url)
-    is_verify = ("verify-qr" in url)
-    if not is_checkin and not is_verify:
+def classify_api_ticket_oled_feedback(url, qr_code, status_code, resp_json, action_hint=None):
+    is_iot_scan = ("/tickets/scan" in url)
+    is_checkin = (action_hint == "checkin") or ("check-in" in url)
+    is_verify = (action_hint == "verify") or ("verify-qr" in url)
+    if not is_iot_scan and not is_checkin and not is_verify:
         return None, 0, ""
 
     body = resp_json if isinstance(resp_json, dict) else {}
     data_obj = body.get("data") if isinstance(body.get("data"), dict) else {}
     code = (
-        data_obj.get("ticket_code")
+        body.get("ticket_code")
+        or body.get("ticketCode")
+        or data_obj.get("ticket_code")
         or data_obj.get("ticketCode")
         or data_obj.get("code")
         or qr_code
     )
+    result_str = str(body.get("result", "")).upper()
     status_str = str(data_obj.get("status", "") or body.get("status", "")).upper()
-    err_code = str(body.get("errorCode", "")).upper()
+    err_code = str(body.get("errorCode", "") or body.get("code", "")).upper()
     msg_low = str(body.get("message", "")).lower()
 
     is_used = (
-        status_str in ("USED", "CHECKED_IN")
+        result_str == "USED"
+        or status_str in ("USED", "CHECKED_IN")
+        or status_code == 409
         or bool(data_obj.get("checked_in_at") or data_obj.get("checkedInAt") or data_obj.get("isCheckedIn"))
         or "ALREADY" in err_code
         or "USED" in err_code
         or any(k in msg_low for k in ("already", "đã sử dụng", "đã dùng", "đã check", "checked in", "checked-in"))
     )
-    is_ok = (status_code in (200, 201)) and bool(body.get("success")) and not is_used
-
     if is_used:
         return "USED", 240, code
+    if result_str == "OK":
+        return "OK", 90, code
+    if result_str == "VERIFIED":
+        return "VERIFIED", 60, code
+    if result_str in ("WRONG_EVENT", "NO_EVENT_ASSIGNED", "DEVICE_DISABLED") or status_code in (400, 401, 403):
+        return "ERROR", 240, code
+
+    is_ok = (status_code in (200, 201)) and bool(body.get("success"))
     if is_ok:
         return ("OK", 90, code) if is_checkin else ("VERIFIED", 60, code)
-    if status_code in (401, 403):
-        return "ERROR", 240, code
     return "NOTFOUND", 240, code
 
 
@@ -325,8 +366,6 @@ def parse_text_telemetry(raw_bytes):
                 esp32_device_state["status_text"] = "Đã tự kết nối Wi-Fi" if w_conn else "Chưa kết nối Wi-Fi"
                 if auto_val is not None:
                     esp32_device_state["auto_confirm"] = auto_val
-                if has_tok_val is not None:
-                    esp32_device_state["has_token"] = has_tok_val
                 if profiles_val is not None:
                     esp32_device_state["wifi_profiles_count"] = profiles_val
                 esp32_device_state["last_seen"] = time.time()
@@ -348,11 +387,49 @@ def parse_text_telemetry(raw_bytes):
                 esp32_device_state["auto_confirm"] = auto_enabled
             esp_auto_event.set()
 
-        for m in re.finditer(r"TOKENSET:([01])", text):
-            has_tok = (m.group(1) == "1")
+        for m in re.finditer(r"IOTCREDS:ID=([^|\r\n]*)\|SEC=([^\r\n]*)", text):
+            dev_id = m.group(1).strip()
+            dev_sec = m.group(2).strip()
+            if dev_id and dev_sec:
+                with esp32_iot_creds_lock:
+                    esp32_iot_creds["device_id"] = dev_id
+                    esp32_iot_creds["device_secret"] = dev_sec
+
+        for m in re.finditer(r"IOTSTAT:([^\r\n]+)", text):
+            parts = {}
+            for seg in m.group(1).strip().split("|"):
+                if "=" in seg:
+                    k, v = seg.split("=", 1)
+                    parts[k.strip()] = v.strip()
+            iot_state = parts.get("STATE", "UNPAIRED")
+            if iot_state != "ACTIVE":
+                with esp32_iot_creds_lock:
+                    esp32_iot_creds["device_id"] = ""
+                    esp32_iot_creds["device_secret"] = ""
+            iot_payload = {
+                "mac": parts.get("MAC", ""),
+                "state": iot_state,
+                "paired": (iot_state == "ACTIVE"),
+                "pairing_code": parts.get("CODE", ""),
+                "event_code": parts.get("EVT", ""),
+                "device_name": parts.get("NAME", ""),
+                "iot_base_url": parts.get("URL", ""),
+            }
+            if "VER" in parts:
+                try:
+                    iot_payload["config_version"] = int(parts["VER"])
+                except ValueError:
+                    pass
+            if "PEND" in parts:
+                iot_payload["pending_auto_sync"] = (parts["PEND"] == "1")
             with esp32_state_lock:
-                esp32_device_state["has_token"] = has_tok
-            esp_token_event.set()
+                prev_iot = esp32_device_state.get("iot") or {}
+                if isinstance(prev_iot, dict):
+                    merged = dict(prev_iot)
+                    merged.update({k: v for k, v in iot_payload.items() if v != "" or k in ("pairing_code", "event_code", "device_name")})
+                    esp32_device_state["iot"] = merged
+                else:
+                    esp32_device_state["iot"] = iot_payload
 
         for m in re.finditer(r"WIFISAVED:(\d+)", text):
             cnt = int(m.group(1))
@@ -702,10 +779,13 @@ def scan_nearby_wifi(force_refresh=False):
     return networks
 
 
-def check_server_latency(host="api.eventhub.id.vn", port=443, timeout=3.0):
+def check_server_latency(host=None, port=443, timeout=3.0):
+    target_host = host or DEFAULT_BACKEND_HOST
+    if not target_host or "example.com" in target_host:
+        return -1, False, "offline"
     t0 = time.time()
     try:
-        s = socket.create_connection((host, port), timeout=timeout)
+        s = socket.create_connection((target_host, port), timeout=timeout)
         s.close()
         latency = int((time.time() - t0) * 1000)
         if latency < 100:
@@ -747,7 +827,7 @@ def network_monitor_thread():
                     "latency_ms": lat_ms,
                     "latency_quality": quality,
                     "server_reachable": reachable,
-                    "backend_host": "api.eventhub.id.vn",
+                    "backend_host": DEFAULT_BACKEND_HOST,
                     "last_updated": time.time(),
                 }
 
@@ -813,12 +893,12 @@ def network_monitor_thread():
                                 esp32_device_state["status_text"] = "Đã tự kết nối Wi-Fi" if w_conn else "Chưa kết nối Wi-Fi"
                                 if "auto_confirm" in d:
                                     esp32_device_state["auto_confirm"] = bool(d.get("auto_confirm"))
-                                if "has_token" in d:
-                                    esp32_device_state["has_token"] = bool(d.get("has_token"))
                                 if "wifi_profiles_count" in d:
                                     esp32_device_state["wifi_profiles_count"] = int(d.get("wifi_profiles_count") or 0)
                                 if "last_scan" in d:
                                     esp32_device_state["last_scan"] = d.get("last_scan")
+                                if "iot" in d:
+                                    esp32_device_state["iot"] = d.get("iot")
                                 esp32_device_state["last_seen"] = time.time()
                     except Exception:
                         pass
@@ -942,13 +1022,13 @@ def serial_receiver_thread(port_name, baud_rate):
 def normalize_api_base(raw_url):
     url = str(raw_url or "").strip().rstrip("/")
     if not url:
-        return "https://api.eventhub.id.vn/api"
+        return DEFAULT_API_BASE_URL
     # Cắt bỏ phần route con sau /api nếu có (ví dụ /staff/tickets...)
     if "/api/" in url:
         url = url.split("/api/")[0] + "/api"
-    # Sửa lỗi nhập nhầm tên miền frontend eventhub.id.vn -> tự sửa thành subdomain backend api.eventhub.id.vn
-    if "eventhub.id.vn" in url and "api.eventhub.id.vn" not in url:
-        url = url.replace("eventhub.id.vn", "api.eventhub.id.vn")
+    # Sửa lỗi nhập nhầm tên miền frontend -> tự sửa thành subdomain backend
+    if DEFAULT_FRONTEND_DOMAIN and DEFAULT_BACKEND_HOST and DEFAULT_FRONTEND_DOMAIN in url and DEFAULT_BACKEND_HOST not in url:
+        url = url.replace(DEFAULT_FRONTEND_DOMAIN, DEFAULT_BACKEND_HOST)
     # Đảm bảo có giao thức http:// hoặc https://
     if not url.startswith("http://") and not url.startswith("https://"):
         url = f"https://{url}"
@@ -1013,8 +1093,23 @@ class CheckinHTTPHandler(BaseHTTPRequestHandler):
                 "network": net_info,
                 "esp32_device": esp_info,
                 "route_mode": r_mode,
+                "config": {
+                    "api_base_url": DEFAULT_API_BASE_URL,
+                    "iot_base_url": DEFAULT_IOT_BASE_URL,
+                    "backend_host": DEFAULT_BACKEND_HOST,
+                    "frontend_domain": DEFAULT_FRONTEND_DOMAIN,
+                    "allowed_domain_suffix": DEFAULT_ALLOWED_SUFFIX,
+                },
             }
             self.wfile.write(json.dumps(status_data).encode("utf-8"))
+        elif clean_path == "/api/client-config":
+            self.send_json_response(200, {
+                "api_base_url": DEFAULT_API_BASE_URL,
+                "iot_base_url": DEFAULT_IOT_BASE_URL,
+                "backend_host": DEFAULT_BACKEND_HOST,
+                "frontend_domain": DEFAULT_FRONTEND_DOMAIN,
+                "allowed_domain_suffix": DEFAULT_ALLOWED_SUFFIX,
+            })
         elif clean_path == "/api/network-status":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -1116,26 +1211,10 @@ class CheckinHTTPHandler(BaseHTTPRequestHandler):
             body = {}
 
         auth_header = self.headers.get("Authorization", "")
-        api_base = normalize_api_base(body.get("apiBase", "https://api.eventhub.id.vn/api"))
+        api_base = normalize_api_base(body.get("apiBase", DEFAULT_API_BASE_URL))
         clean_path = urlparse(self.path).path
 
-        if clean_path == "/api/proxy/login":
-            target_url = f"{api_base}/auth/login"
-            payload = {
-                "email": body.get("email"),
-                "password": body.get("password"),
-            }
-            self.forward_api_request("POST", target_url, payload, auth_header)
-
-        elif clean_path == "/api/proxy/verify-login-otp":
-            target_url = f"{api_base}/auth/verify-login-otp"
-            payload = {
-                "challengeId": body.get("challengeId"),
-                "otp": body.get("otp"),
-            }
-            self.forward_api_request("POST", target_url, payload, auth_header)
-
-        elif clean_path == "/api/config-route":
+        if clean_path == "/api/config-route":
             mode = body.get("mode", "pc").lower()
             if mode not in ("pc", "esp32"):
                 mode = "pc"
@@ -1180,32 +1259,51 @@ class CheckinHTTPHandler(BaseHTTPRequestHandler):
                     "message": "Chưa kết nối tới ESP32 (qua USB hoặc Wi-Fi) để lưu cấu hình vào NVS."
                 })
 
-        elif clean_path == "/api/esp32/staff-token":
-            token_val = str(body.get("token", "")).strip()
-            if not token_val and auth_header:
-                token_val = auth_header.replace("Bearer ", "").replace("bearer ", "").strip()
+        elif clean_path == "/api/esp32/iot-config":
+            new_url = str(body.get("iot_base_url", "")).strip()
+            do_reset = bool(body.get("reset", False))
+            do_sync = bool(body.get("sync", False))
+            http_payload = {}
+            if new_url:
+                http_payload["iot_base_url"] = new_url
+            if do_reset:
+                http_payload["reset"] = True
+            if do_sync:
+                http_payload["sync"] = True
 
-            ok, via, acked, _ = send_esp32_uart_or_http(
-                f"SETTOKEN:{token_val}",
-                esp_token_event,
-                "/api/token",
-                {"token": token_val},
-                wait_timeout=0.8,
-            )
-            if ok:
+            uart_cmd = None
+            if do_reset:
+                uart_cmd = "RESETIOT"
+            elif new_url:
+                uart_cmd = f"SETIOTURL:{new_url}"
+
+            ok, via, acked, http_data = False, "none", False, None
+            if uart_cmd:
+                ok, via, acked, http_data = send_esp32_uart_or_http(
+                    uart_cmd, None, "/api/iot-config", http_payload, wait_timeout=0.3
+                )
+            else:
                 with esp32_state_lock:
-                    esp32_device_state["has_token"] = bool(token_val)
+                    esp_ip = esp32_device_state.get("ip", "0.0.0.0")
+                if esp_ip and esp_ip != "0.0.0.0":
+                    try:
+                        resp = requests.post(f"http://{esp_ip}/api/iot-config", json=http_payload, timeout=3.0)
+                        if resp.status_code == 200:
+                            ok, via, http_data = True, "wifi", resp.json()
+                    except Exception:
+                        pass
+
+            if ok:
                 self.send_json_response(200, {
                     "success": True,
-                    "has_token": bool(token_val),
                     "via": via,
-                    "acked": acked,
+                    "iot": http_data if isinstance(http_data, dict) else None,
+                    "message": "Đã gửi cấu hình IoT xuống ESP32!"
                 })
             else:
                 self.send_json_response(503, {
                     "success": False,
-                    "has_token": bool(token_val),
-                    "message": "Chưa kết nối tới ESP32 để đồng bộ Staff Token."
+                    "message": "Chưa kết nối được ESP32 qua USB Serial hoặc Wi-Fi HTTP."
                 })
 
         elif clean_path == "/api/esp32/wifi-profiles":
@@ -1361,76 +1459,18 @@ class CheckinHTTPHandler(BaseHTTPRequestHandler):
                 })
                 return
 
-            if not auth_header:
-                print(f"   [Staff Auth]: Cảnh báo - Chưa có Token Staff! Trả về 401 yêu cầu đăng nhập hoặc dùng Test Offline.")
-                print(f"=======================================================")
-                self.send_json_response(401, {
-                    "success": False,
-                    "errorCode": "AUTH_REQUIRED",
-                    "message": "Chưa đăng nhập tài khoản Nhân Sự (Staff). Vui lòng đăng nhập ở cột bên phải hoặc bật Chế Độ Test Offline để xem vé ngay.",
-                    "scannedCode": qr_text
-                })
-                return
-
-            with request_route_lock:
-                curr_route = request_route_mode
-
-            print(f"   [Staff Auth]: Token Attached (Luồng gửi: {curr_route.upper()})...")
-
-            # Giải mã và hiển thị thông tin tài khoản đăng nhập từ JWT Token
-            try:
-                parts = auth_header.replace("Bearer ", "").strip().split(".")
-                if len(parts) >= 2:
-                    pad = len(parts[1]) % 4
-                    p_str = parts[1] + ("=" * (4 - pad) if pad > 0 else "")
-                    payload_raw = base64.urlsafe_b64decode(p_str.encode("utf-8")).decode("utf-8")
-                    token_info = json.loads(payload_raw)
-                    user_sub = str(token_info.get("sub", ""))
-                    user_roles = [str(r).upper() for r in token_info.get("roles", [])]
-                    print(f"   [Staff Account]: Sub: {user_sub[:8]}... | Roles: {user_roles}")
-                    if "STAFF" not in user_roles:
-                        print(f"   [!] CẢNH BÁO: Tài khoản này KHÔNG CÓ vai trò 'STAFF' (Hiện tại: {user_roles})!")
-                        print(f"       -> Backend EventHub sẽ trả về 403 AUTH_FORBIDDEN nếu không có quyền STAFF.")
-            except Exception:
-                pass
-
-            # Route: ESP32 Wi-Fi (Gửi trực tiếp từ ESP32-S3 qua Wi-Fi 2.4GHz)
-            if curr_route == "esp32":
-                self.forward_via_esp32("verify", qr_text, auth_header)
-                return
-
-            # Route: PC Network (Mặc định)
-            print(f"   [PC Route]: Đang gửi đối soát từ máy tính tới EventHub Backend: {api_base}...")
-            print(f"=======================================================")
-            target_url = f"{api_base}/staff/tickets/verify-qr"
-            payload = {
-                "qrCode": qr_text,
-            }
-            self.forward_api_request("POST", target_url, payload, auth_header)
+            has_explicit_api = bool(str(body.get("apiBase", "")).strip())
+            self.handle_iot_proxy_scan("verify", qr_text, api_base, has_explicit_api)
 
         elif clean_path == "/api/proxy/check-in":
-            qr_text = str(body.get("qrCode", ""))
+            qr_text = str(body.get("qrCode", "")).strip()
             print(f"\n[CHECK-IN REQUEST] Checking in ticket: '{qr_text}'")
-
-            with request_route_lock:
-                curr_route = request_route_mode
-
-            if curr_route == "esp32":
-                if not qr_text:
-                    self.send_json_response(400, {"success": False, "message": "Missing qrCode for ESP32 check-in"})
-                    return
-                self.forward_via_esp32("check-in", qr_text, auth_header)
+            if not qr_text:
+                self.send_json_response(400, {"success": False, "message": "Missing qrCode for check-in"})
                 return
 
-            if body.get("qrCode"):
-                target_url = f"{api_base}/staff/tickets/check-in/qr"
-                payload = {"qrCode": body.get("qrCode")}
-                self.forward_api_request("POST", target_url, payload, auth_header)
-            elif body.get("ticketId"):
-                target_url = f"{api_base}/staff/tickets/{body.get('ticketId')}/check-in"
-                self.forward_api_request("PATCH", target_url, {}, auth_header)
-            else:
-                self.send_json_response(400, {"success": False, "message": "Missing qrCode or ticketId"})
+            has_explicit_api = bool(str(body.get("apiBase", "")).strip())
+            self.handle_iot_proxy_scan("checkin", qr_text, api_base, has_explicit_api)
 
         elif clean_path == "/api/beep":
             duration = int(body.get("duration", 90))
@@ -1438,10 +1478,6 @@ class CheckinHTTPHandler(BaseHTTPRequestHandler):
             qr_code = body.get("qr_code", "")
             notify_esp32_oled_and_beep(oled_status=oled_status, qr_code=qr_code, beep_ms=duration)
             self.send_json_response(200, {"success": True})
-
-        elif clean_path == "/api/proxy/profile":
-            target_url = f"{api_base}/users/profile"
-            self.forward_api_request("GET", target_url, None, auth_header)
 
         elif clean_path == "/api/cam-settings":
             with serial_lock:
@@ -1483,7 +1519,90 @@ class CheckinHTTPHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw_bytes)
 
-    def forward_via_esp32(self, action, qr_text, auth_header):
+    def _sync_iot_cfg_into_state(self, parsed_body, from_pc_route=False):
+        if not isinstance(parsed_body, dict):
+            return
+        dev_cfg = parsed_body.get("device_config")
+        if not isinstance(dev_cfg, dict):
+            return
+        with esp32_state_lock:
+            iot_obj = dict(esp32_device_state.get("iot") or {})
+            for k in ("assigned_event_id", "event_code", "event_name", "config_version"):
+                if k in dev_cfg:
+                    iot_obj[k] = dev_cfg[k]
+            esp32_device_state["iot"] = iot_obj
+            pending = bool(iot_obj.get("pending_auto_sync"))
+            if not pending and isinstance(dev_cfg.get("auto_confirm"), bool):
+                esp32_device_state["auto_confirm"] = dev_cfg["auto_confirm"]
+        if from_pc_route and not pending and isinstance(dev_cfg.get("auto_confirm"), bool):
+            cfg_ver = int(dev_cfg.get("config_version") or 0)
+            auto_bit = 1 if dev_cfg["auto_confirm"] else 0
+            with serial_lock:
+                if serial_connection and serial_connection.is_open:
+                    try:
+                        serial_connection.write(f"\nAPPLYCFG:{auto_bit}|{cfg_ver}\n".encode("ascii"))
+                        serial_connection.flush()
+                    except Exception:
+                        pass
+
+    def handle_iot_proxy_scan(self, action, qr_text, api_base, has_explicit_api):
+        with request_route_lock:
+            curr_route = request_route_mode
+
+        if curr_route == "esp32":
+            self.forward_via_esp32(action, qr_text)
+            return
+
+        with esp32_iot_creds_lock:
+            dev_id = esp32_iot_creds.get("device_id", "")
+            dev_sec = esp32_iot_creds.get("device_secret", "")
+
+        if dev_id and dev_sec:
+            self.forward_iot_pc_request(action, qr_text, api_base, has_explicit_api, dev_id, dev_sec)
+            return
+
+        with esp32_state_lock:
+            esp_conn = esp32_device_state.get("wifi_connected", False)
+            esp_ip = esp32_device_state.get("ip", "0.0.0.0")
+            iot_info = esp32_device_state.get("iot") or {}
+            iot_paired = bool(iot_info.get("paired"))
+
+        if esp_conn and esp_ip != "0.0.0.0" and iot_paired:
+            self.forward_via_esp32(action, qr_text)
+            return
+
+        print("   [IoT Auth]: ESP32 chưa ghép nối IoT (chưa có Device Id/Secret)!")
+        self.send_json_response(400, {
+            "success": False,
+            "errorCode": "IOT_NOT_PAIRED",
+            "message": "ESP32 chưa được Admin duyệt ghép nối IoT! Hãy kết nối Wi-Fi cho ESP32 và nhập mã ghép nối ở thẻ Định Danh IoT lên trang Admin -> Thiết bị.",
+            "scannedCode": qr_text
+        })
+
+    def forward_iot_pc_request(self, action, qr_text, api_base, has_explicit_api, dev_id, dev_sec):
+        with esp32_state_lock:
+            esp_iot_url = str((esp32_device_state.get("iot") or {}).get("iot_base_url") or "").strip().rstrip("/")
+        if has_explicit_api:
+            iot_base = f"{api_base.rstrip('/')}/iot/v1"
+        elif esp_iot_url:
+            iot_base = esp_iot_url
+        else:
+            iot_base = DEFAULT_IOT_BASE_URL
+        target_url = f"{iot_base}/tickets/scan"
+        payload = {"qr_code": qr_text, "action": "checkin" if action in ("checkin", "check-in") else "verify"}
+        print(f"   [PC Route - IoT]: Gửi {payload['action'].upper()} tới {target_url} (Device: {dev_id})...")
+        print(f"=======================================================")
+        self.forward_api_request(
+            "POST",
+            target_url,
+            payload,
+            "",
+            extra_headers={"X-Device-Id": dev_id, "X-Device-Secret": dev_sec},
+            qr_hint=qr_text,
+            action_hint=payload["action"],
+        )
+
+    def forward_via_esp32(self, action, qr_text):
         with esp32_state_lock:
             esp_conn = esp32_device_state.get("wifi_connected", False)
             esp_ip = esp32_device_state.get("ip", "0.0.0.0")
@@ -1497,7 +1616,6 @@ class CheckinHTTPHandler(BaseHTTPRequestHandler):
             })
             return
 
-        token_raw = auth_header.replace("Bearer ", "").strip()
         clean_code = qr_text
         if qr_text.startswith("{") and qr_text.endswith("}"):
             try:
@@ -1524,7 +1642,7 @@ class CheckinHTTPHandler(BaseHTTPRequestHandler):
                 res_dict["status_code"] = 500
             ev.clear()
 
-            cmd = f"\n{uart_prefix}:{clean_code}|{token_raw}\n"
+            cmd = f"\n{uart_prefix}:{clean_code}\n"
             with serial_lock:
                 if serial_connection and serial_connection.is_open:
                     serial_connection.write(cmd.encode("utf-8"))
@@ -1539,16 +1657,26 @@ class CheckinHTTPHandler(BaseHTTPRequestHandler):
                     try:
                         parsed = json.loads(raw_resp.decode("utf-8", errors="ignore"))
                         if isinstance(parsed, dict):
+                            self._sync_iot_cfg_into_state(parsed, from_pc_route=False)
+                            res_tag = str(parsed.get("result", "")).upper()
+                            err_code = str(parsed.get("errorCode", "") or parsed.get("code", "")).upper()
+                            msg_lower = str(parsed.get("message", "")).lower()
                             if parsed.get("statusCode") and isinstance(parsed.get("statusCode"), int):
                                 status_to_send = parsed["statusCode"]
+                            elif res_tag == "USED":
+                                status_to_send = 409
+                            elif res_tag in ("DEVICE_DISABLED", "WRONG_EVENT"):
+                                status_to_send = 403
+                            elif res_tag == "NOT_FOUND":
+                                status_to_send = 404
+                            elif res_tag in ("NO_EVENT_ASSIGNED",) or err_code == "IOT_NOT_PAIRED":
+                                status_to_send = 400
                             elif parsed.get("success") is False:
-                                msg_lower = str(parsed.get("message", "")).lower()
-                                err_code = str(parsed.get("errorCode", "")).upper()
                                 if "401" in err_code or "unauthorized" in msg_lower:
                                     status_to_send = 401
                                 elif "403" in err_code or "forbidden" in msg_lower:
                                     status_to_send = 403
-                                elif "loi ket noi https" in msg_lower:
+                                elif "loi ket noi" in msg_lower:
                                     status_to_send = 502
                     except Exception:
                         pass
@@ -1561,9 +1689,13 @@ class CheckinHTTPHandler(BaseHTTPRequestHandler):
             try:
                 esp_resp = requests.post(
                     f"http://{esp_ip}{http_endpoint}",
-                    json={"qrCode": clean_code, "token": token_raw},
+                    json={"qrCode": clean_code},
                     timeout=10
                 )
+                try:
+                    self._sync_iot_cfg_into_state(esp_resp.json(), from_pc_route=False)
+                except Exception:
+                    pass
                 print(f"   [ESP32 Response via HTTP]: HTTP {esp_resp.status_code} ({len(esp_resp.content)} bytes)")
                 self._send_proxied_json_response(esp_resp.status_code, esp_resp.content, "esp32")
                 return
@@ -1576,7 +1708,7 @@ class CheckinHTTPHandler(BaseHTTPRequestHandler):
             "message": "ESP32 không phản hồi khi gửi yêu cầu qua Wi-Fi 2.4GHz (Timeout > 12s). Vui lòng kiểm tra kết nối Wi-Fi của ESP32 hoặc chuyển sang Mạng Máy Tính (PC)."
         })
 
-    def forward_api_request(self, method, url, data, auth_header):
+    def forward_api_request(self, method, url, data, auth_header, extra_headers=None, qr_hint="", action_hint=None):
         headers = {
             "Content-Type": "application/json",
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 EventHubStation/1.0",
@@ -1584,21 +1716,24 @@ class CheckinHTTPHandler(BaseHTTPRequestHandler):
         }
         if auth_header:
             headers["Authorization"] = auth_header
+        if extra_headers:
+            headers.update(extra_headers)
 
-        # Tự động phòng vệ nếu URL còn trỏ nhầm sang frontend eventhub.id.vn
-        if "eventhub.id.vn" in url and "api.eventhub.id.vn" not in url:
-            url = url.replace("eventhub.id.vn", "api.eventhub.id.vn")
-        if "/api/" not in url and not url.endswith("/api") and "api.eventhub.id.vn" in url:
-            url = url.replace("api.eventhub.id.vn", "api.eventhub.id.vn/api")
+        # Tự động phòng vệ nếu URL còn trỏ nhầm sang frontend domain
+        if DEFAULT_FRONTEND_DOMAIN and DEFAULT_BACKEND_HOST and DEFAULT_FRONTEND_DOMAIN in url and DEFAULT_BACKEND_HOST not in url:
+            url = url.replace(DEFAULT_FRONTEND_DOMAIN, DEFAULT_BACKEND_HOST)
+        api_root = f"{DEFAULT_BACKEND_HOST}/api"
+        if "/api/" not in url and not url.endswith("/api") and DEFAULT_BACKEND_HOST and DEFAULT_BACKEND_HOST in url:
+            url = url.replace(DEFAULT_BACKEND_HOST, api_root)
 
         try:
             r = send_session_request(method, url, data, headers, timeout=12)
 
             # Tự động khắc phục nếu nhận 405 Method Not Allowed từ host frontend
-            if r.status_code == 405 and "api.eventhub.id.vn/api" not in url:
-                retry_url = url.replace("eventhub.id.vn", "api.eventhub.id.vn")
+            if r.status_code == 405 and api_root not in url and DEFAULT_FRONTEND_DOMAIN and DEFAULT_BACKEND_HOST:
+                retry_url = url.replace(DEFAULT_FRONTEND_DOMAIN, DEFAULT_BACKEND_HOST)
                 if "/api/" not in retry_url and not retry_url.endswith("/api"):
-                    retry_url = retry_url.replace("api.eventhub.id.vn", "api.eventhub.id.vn/api")
+                    retry_url = retry_url.replace(DEFAULT_BACKEND_HOST, api_root)
                 print(f"   [!] Server trả về 405! Đang tự động retry sang API chuẩn: {retry_url}...")
                 try:
                     r = send_session_request(method, retry_url, data, headers, timeout=12)
@@ -1614,21 +1749,24 @@ class CheckinHTTPHandler(BaseHTTPRequestHandler):
             except Exception:
                 print(f"   [API Text]: {r.text[:200]}")
 
-            qr_hint = (data.get("qrCode") if isinstance(data, dict) else "") or ""
-            oled_st, beep_ms, code_hint = classify_api_ticket_oled_feedback(url, qr_hint, r.status_code, resp_json)
+            self._sync_iot_cfg_into_state(resp_json, from_pc_route=True)
+
+            effective_qr = qr_hint or ((data.get("qrCode") or data.get("qr_code")) if isinstance(data, dict) else "") or ""
+            oled_st, beep_ms, code_hint = classify_api_ticket_oled_feedback(
+                url, effective_qr, r.status_code, resp_json, action_hint=action_hint
+            )
 
             if r.status_code == 401:
-                print("   [!] 401 Unauthorized: Cần đăng nhập tài khoản nhân sự (Staff) trên giao diện Web!")
+                print("   [!] 401 Unauthorized: Thiết bị IoT cần reset/ghép nối lại trên Admin Web!")
             elif r.status_code == 403:
-                print("   [!] 403 Forbidden: Tài khoản hiện tại không có quyền STAFF cho sự kiện này (AUTH_FORBIDDEN)!")
-                print("       -> Vui lòng bấm [Đăng Xuất] trên Web và đăng nhập lại bằng tài khoản Staff được phân công.")
+                print("   [!] 403 Forbidden: Thiết bị bị khóa hoặc vé không thuộc sự kiện được gán!")
             elif r.status_code == 405:
                 print(f"   [!] 405 Method Not Allowed từ {url}!")
                 self.send_json_response(405, {
                     "success": False,
                     "statusCode": 405,
                     "errorCode": "METHOD_NOT_ALLOWED",
-                    "message": f"Máy chủ phản hồi 405 Method Not Allowed khi gửi tới '{url}'. Đang tự động điều chỉnh về https://api.eventhub.id.vn/api.",
+                    "message": f"Máy chủ phản hồi 405 Method Not Allowed khi gửi tới '{url}'. Đang tự động điều chỉnh về {DEFAULT_API_BASE_URL}.",
                     "url": url
                 })
                 return

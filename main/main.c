@@ -5,7 +5,7 @@
  * Dual-Mode Operation:
  *  1. Cắm dây USB: Stream ảnh JPEG @ 2Mbaud lên PC & nhận lệnh điều khiển UART.
  *  2. Rút dây USB (cấp nguồn rời): Tự động bắt Wi-Fi, chạy Web Server cổng 80,
- *     stream video & tự gửi HTTPS request tới api.eventhub.id.vn.
+ *     đăng ký thiết bị IoT & tự gửi HTTPS request tới EventHub Backend.
  * ============================================================================
  */
 
@@ -32,6 +32,7 @@
 #include "driver/uart.h"
 
 #include "esp_wifi.h"
+#include "esp_mac.h"
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_http_server.h"
@@ -47,6 +48,16 @@
 #include "oled_ssd1306.h"
 #include "quirc.h"
 #include "jpeg_decoder.h"
+
+#if defined(__has_include)
+#if __has_include("local_config.h")
+#include "local_config.h"
+#else
+#include "local_config.example.h"
+#endif
+#else
+#include "local_config.example.h"
+#endif
 
 static const char *TAG = "EVENTHUB_DUAL_CAM";
 
@@ -94,9 +105,36 @@ static volatile bool g_wifi_just_connected_led = false;
 
 /* Device Config (Persisted in NVS) & Standalone Auto Check-in State */
 static bool g_auto_confirm = false;
-static char g_staff_token[1536] = "";
 static volatile uint32_t g_pc_usb_last_tick = 0;
 static SemaphoreHandle_t g_scan_state_mutex = NULL;
+
+/* IoT Device Registration, Pairing & Event Assignment State (NVS: "iot_dev") */
+typedef enum {
+    IOT_STATE_UNPAIRED = 0,
+    IOT_STATE_PENDING,
+    IOT_STATE_ACTIVE,
+    IOT_STATE_REPAIR_REQUIRED,
+    IOT_STATE_DISABLED,
+} iot_reg_state_t;
+
+static SemaphoreHandle_t g_iot_mutex = NULL;
+static char g_device_mac[18] = "00:00:00:00:00:00";
+static char g_device_mac_short[8] = "000000";
+static char g_iot_base_url[192] = EVENTHUB_IOT_BASE_URL;
+static char g_iot_device_id[64] = "";
+static char g_iot_device_secret[160] = "";
+static char g_iot_device_name[64] = "";
+static char g_iot_pairing_code[16] = "";
+static char g_iot_claim_token[160] = "";
+static char g_iot_assigned_event_id[64] = "";
+static char g_iot_event_code[64] = "";
+static char g_iot_event_name[96] = "";
+static int g_iot_config_version = 0;
+static int g_iot_poll_interval_sec = 5;
+static iot_reg_state_t g_iot_state = IOT_STATE_UNPAIRED;
+static volatile bool g_iot_force_sync = false;
+static volatile bool g_iot_pending_auto_sync = false;
+static char g_iot_last_err[96] = "";
 
 #define SNAP_JPG_MAX_BYTES 131072
 static uint8_t *s_snap_jpg_buf = NULL;
@@ -120,6 +158,128 @@ static standalone_scan_state_t s_last_scan = {
     .auto_checked_in = false
 };
 
+static const char *iot_state_to_str(iot_reg_state_t st)
+{
+    switch (st) {
+        case IOT_STATE_PENDING: return "PENDING";
+        case IOT_STATE_ACTIVE: return "ACTIVE";
+        case IOT_STATE_REPAIR_REQUIRED: return "REPAIR_REQUIRED";
+        case IOT_STATE_DISABLED: return "DISABLED";
+        case IOT_STATE_UNPAIRED:
+        default: return "UNPAIRED";
+    }
+}
+
+static bool is_iot_device_paired_active(void)
+{
+    return (g_iot_state == IOT_STATE_ACTIVE &&
+            g_iot_device_id[0] != '\0' &&
+            g_iot_device_secret[0] != '\0');
+}
+
+static void init_device_mac(void)
+{
+    uint8_t mac[6] = {0};
+    if (esp_read_mac(mac, ESP_MAC_WIFI_STA) == ESP_OK || esp_efuse_mac_get_default(mac) == ESP_OK) {
+        snprintf(g_device_mac, sizeof(g_device_mac), "%02x:%02x:%02x:%02x:%02x:%02x",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        snprintf(g_device_mac_short, sizeof(g_device_mac_short), "%02X%02X%02X",
+                 mac[3], mac[4], mac[5]);
+    }
+}
+
+static void save_iot_nvs_str(const char *key, const char *value)
+{
+    nvs_handle_t h;
+    if (nvs_open("iot_dev", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_str(h, key, value ? value : "");
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+static void save_iot_nvs_i32(const char *key, int32_t value)
+{
+    nvs_handle_t h;
+    if (nvs_open("iot_dev", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_i32(h, key, value);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+static void clear_iot_credentials_nvs(bool keep_url)
+{
+    if (g_iot_mutex) xSemaphoreTake(g_iot_mutex, portMAX_DELAY);
+    g_iot_device_id[0] = '\0';
+    g_iot_device_secret[0] = '\0';
+    g_iot_device_name[0] = '\0';
+    g_iot_pairing_code[0] = '\0';
+    g_iot_claim_token[0] = '\0';
+    g_iot_assigned_event_id[0] = '\0';
+    g_iot_event_code[0] = '\0';
+    g_iot_event_name[0] = '\0';
+    g_iot_config_version = 0;
+    g_iot_state = IOT_STATE_UNPAIRED;
+    g_iot_pending_auto_sync = false;
+    g_iot_last_err[0] = '\0';
+    if (g_iot_mutex) xSemaphoreGive(g_iot_mutex);
+
+    save_iot_nvs_str("dev_id", "");
+    save_iot_nvs_str("dev_secret", "");
+    save_iot_nvs_str("dev_name", "");
+    save_iot_nvs_str("evt_id", "");
+    save_iot_nvs_str("evt_code", "");
+    save_iot_nvs_str("evt_name", "");
+    save_iot_nvs_i32("cfg_ver", 0);
+    save_iot_nvs_i32("pend_auto", 0);
+    if (!keep_url) {
+        snprintf(g_iot_base_url, sizeof(g_iot_base_url), "%s", EVENTHUB_IOT_BASE_URL);
+        save_iot_nvs_str("iot_url", "");
+    }
+    g_iot_force_sync = true;
+}
+
+static void load_iot_config_nvs(void)
+{
+    nvs_handle_t h;
+    if (nvs_open("iot_dev", NVS_READONLY, &h) == ESP_OK) {
+        size_t len = sizeof(g_iot_device_id);
+        nvs_get_str(h, "dev_id", g_iot_device_id, &len);
+        len = sizeof(g_iot_device_secret);
+        nvs_get_str(h, "dev_secret", g_iot_device_secret, &len);
+        len = sizeof(g_iot_device_name);
+        nvs_get_str(h, "dev_name", g_iot_device_name, &len);
+        len = sizeof(g_iot_assigned_event_id);
+        nvs_get_str(h, "evt_id", g_iot_assigned_event_id, &len);
+        len = sizeof(g_iot_event_code);
+        nvs_get_str(h, "evt_code", g_iot_event_code, &len);
+        len = sizeof(g_iot_event_name);
+        nvs_get_str(h, "evt_name", g_iot_event_name, &len);
+
+        char custom_url[192] = "";
+        len = sizeof(custom_url);
+        if (nvs_get_str(h, "iot_url", custom_url, &len) == ESP_OK &&
+            custom_url[0] != '\0' && strstr(custom_url, "example.com") == NULL) {
+            snprintf(g_iot_base_url, sizeof(g_iot_base_url), "%s", custom_url);
+        }
+
+        int32_t ver = 0;
+        if (nvs_get_i32(h, "cfg_ver", &ver) == ESP_OK) {
+            g_iot_config_version = (int)ver;
+        }
+        int32_t pend = 0;
+        if (nvs_get_i32(h, "pend_auto", &pend) == ESP_OK) {
+            g_iot_pending_auto_sync = (pend != 0);
+        }
+        nvs_close(h);
+    }
+
+    g_iot_state = (g_iot_device_id[0] != '\0' && g_iot_device_secret[0] != '\0')
+                  ? IOT_STATE_ACTIVE
+                  : IOT_STATE_UNPAIRED;
+}
+
 static bool is_pc_usb_active(void)
 {
     uint32_t last = g_pc_usb_last_tick;
@@ -130,7 +290,39 @@ static bool is_pc_usb_active(void)
 static void sync_oled_network_state(void)
 {
     oled_update_network(g_wifi_connected, g_wifi_ssid, g_wifi_ip, g_wifi_rssi,
-                        g_auto_confirm, is_pc_usb_active(), g_staff_token[0] != '\0');
+                        g_auto_confirm, is_pc_usb_active(),
+                        is_iot_device_paired_active());
+
+    oled_iot_status_t o_iot = OLED_IOT_NONE;
+    if (g_iot_state == IOT_STATE_PENDING) {
+        o_iot = OLED_IOT_PENDING;
+    } else if (g_iot_state == IOT_STATE_REPAIR_REQUIRED) {
+        o_iot = OLED_IOT_REPAIR_REQUIRED;
+    } else if (g_iot_state == IOT_STATE_DISABLED) {
+        o_iot = OLED_IOT_DISABLED;
+    } else if (g_iot_state == IOT_STATE_ACTIVE) {
+        o_iot = (g_iot_assigned_event_id[0] == '\0') ? OLED_IOT_NO_EVENT : OLED_IOT_READY;
+    } else {
+        o_iot = OLED_IOT_UNPAIRED;
+    }
+
+    oled_update_iot_status(o_iot, g_iot_pairing_code, g_iot_event_code, g_device_mac_short);
+}
+
+static void save_nvs_u8(const char *key, uint8_t value);
+
+static void mark_local_auto_confirm_changed(bool enabled)
+{
+    g_auto_confirm = enabled;
+    save_nvs_u8("auto_confirm", enabled ? 1 : 0);
+    if (is_iot_device_paired_active()) {
+        if (g_iot_mutex) xSemaphoreTake(g_iot_mutex, portMAX_DELAY);
+        g_iot_pending_auto_sync = true;
+        if (g_iot_mutex) xSemaphoreGive(g_iot_mutex);
+        save_iot_nvs_i32("pend_auto", 1);
+        g_iot_force_sync = true;
+    }
+    sync_oled_network_state();
 }
 
 /* Thread-safe UART output & HTTPS Keep-Alive client state */
@@ -373,7 +565,6 @@ static void load_wifi_config(void)
     if (nvs_open("wifi_store", NVS_READONLY, &my_handle) == ESP_OK) {
         size_t ssid_len = sizeof(g_wifi_ssid);
         size_t pass_len = sizeof(g_wifi_pass);
-        size_t tok_len = sizeof(g_staff_token);
         uint8_t auto_val = 0;
         uint8_t w_cnt = 0;
 
@@ -381,9 +572,6 @@ static void load_wifi_config(void)
         if (nvs_get_str(my_handle, "pass", g_wifi_pass, &pass_len) != ESP_OK) g_wifi_pass[0] = '\0';
         if (nvs_get_u8(my_handle, "auto_confirm", &auto_val) == ESP_OK) {
             g_auto_confirm = (auto_val != 0);
-        }
-        if (nvs_get_str(my_handle, "staff_token", g_staff_token, &tok_len) != ESP_OK) {
-            g_staff_token[0] = '\0';
         }
         if (nvs_get_u8(my_handle, "w_cnt", &w_cnt) == ESP_OK) {
             if (w_cnt > MAX_WIFI_PROFILES) w_cnt = MAX_WIFI_PROFILES;
@@ -414,8 +602,8 @@ static void load_wifi_config(void)
         snprintf(g_wifi_pass, sizeof(g_wifi_pass), "%s", g_wifi_profiles[0].pass);
     }
 
-    ESP_LOGI(TAG, "Loaded NVS config: ssid='%s', profiles=%d, auto_confirm=%d, has_token=%d",
-             g_wifi_ssid, g_wifi_profile_count, g_auto_confirm ? 1 : 0, g_staff_token[0] ? 1 : 0);
+    ESP_LOGI(TAG, "Loaded NVS config: ssid='%s', profiles=%d, auto_confirm=%d",
+             g_wifi_ssid, g_wifi_profile_count, g_auto_confirm ? 1 : 0);
 }
 
 static void persist_wifi_profiles_nvs(void)
@@ -498,16 +686,6 @@ static void save_nvs_u8(const char *key, uint8_t value)
     nvs_handle_t my_handle;
     if (nvs_open("wifi_store", NVS_READWRITE, &my_handle) == ESP_OK) {
         nvs_set_u8(my_handle, key, value);
-        nvs_commit(my_handle);
-        nvs_close(my_handle);
-    }
-}
-
-static void save_nvs_str(const char *key, const char *value)
-{
-    nvs_handle_t my_handle;
-    if (nvs_open("wifi_store", NVS_READWRITE, &my_handle) == ESP_OK) {
-        nvs_set_str(my_handle, key, value ? value : "");
         nvs_commit(my_handle);
         nvs_close(my_handle);
     }
@@ -816,8 +994,34 @@ static void reset_api_client_locked(void)
     s_api_client_connected = false;
 }
 
+static char s_api_client_origin[96] = "";
+
+static void extract_url_origin(const char *url, char *out, size_t out_max)
+{
+    if (!out || out_max == 0) return;
+    out[0] = '\0';
+    if (!url) return;
+    const char *scheme = strstr(url, "://");
+    const char *host_start = scheme ? (scheme + 3) : url;
+    const char *path_start = strchr(host_start, '/');
+    size_t len = path_start ? (size_t)(path_start - url) : strlen(url);
+    if (len >= out_max) len = out_max - 1;
+    memcpy(out, url, len);
+    out[len] = '\0';
+}
+
 static esp_err_t ensure_api_client_locked(const char *url)
 {
+    char origin[96];
+    extract_url_origin(url, origin, sizeof(origin));
+
+    if (s_api_client && strcmp(s_api_client_origin, origin) != 0) {
+        esp_http_client_cleanup(s_api_client);
+        s_api_client = NULL;
+        s_api_client_connected = false;
+        s_api_client_origin[0] = '\0';
+    }
+
     if (!s_api_client) {
         esp_http_client_config_t config = {
             .url = url,
@@ -835,8 +1039,9 @@ static esp_err_t ensure_api_client_locked(const char *url)
         if (!s_api_client) {
             return ESP_FAIL;
         }
-        esp_http_client_set_header(s_api_client, "User-Agent", "Mozilla/5.0 EventHubStation-ESP32/1.0");
+        esp_http_client_set_header(s_api_client, "User-Agent", "Mozilla/5.0 EventHubStation-ESP32/1.1");
         esp_http_client_set_header(s_api_client, "Connection", "keep-alive");
+        snprintf(s_api_client_origin, sizeof(s_api_client_origin), "%s", origin);
         s_api_client_connected = false;
     } else {
         esp_err_t uerr = esp_http_client_set_url(s_api_client, url);
@@ -844,6 +1049,7 @@ static esp_err_t ensure_api_client_locked(const char *url)
             esp_http_client_cleanup(s_api_client);
             s_api_client = NULL;
             s_api_client_connected = false;
+            s_api_client_origin[0] = '\0';
             return ensure_api_client_locked(url);
         }
     }
@@ -869,10 +1075,13 @@ static void https_prewarm_task(void *pvParameters)
     int64_t t0 = esp_timer_get_time();
 
     reset_api_client_locked();
-    if (ensure_api_client_locked("https://api.eventhub.id.vn/") == ESP_OK) {
+    if (ensure_api_client_locked(EVENTHUB_PREWARM_URL) == ESP_OK) {
         memset(&s_https_ctx, 0, sizeof(s_https_ctx));
         esp_http_client_set_method(s_api_client, HTTP_METHOD_GET);
         esp_http_client_delete_header(s_api_client, "Authorization");
+        esp_http_client_delete_header(s_api_client, "X-Claim-Token");
+        esp_http_client_delete_header(s_api_client, "X-Device-Id");
+        esp_http_client_delete_header(s_api_client, "X-Device-Secret");
         esp_http_client_set_header(s_api_client, "Accept", "application/json");
         esp_http_client_set_header(s_api_client, "Connection", "keep-alive");
 
@@ -918,10 +1127,19 @@ static void trigger_https_prewarm(void)
     }
 }
 
-static esp_err_t esp32_post_https_json(const char *url, const char *qr_code, const char *token,
-                                       char *out_response, size_t out_max, uint32_t ok_beep_ms)
+static esp_err_t esp32_http_json_request(esp_http_client_method_t method,
+                                         const char *url,
+                                         const char *post_body,
+                                         const char *bearer_token,
+                                         const char *claim_token,
+                                         const char *device_id,
+                                         const char *device_secret,
+                                         char *out_response,
+                                         size_t out_max,
+                                         int *out_status_code)
 {
-    if (!out_response || out_max == 0) return ESP_ERR_INVALID_ARG;
+    if (out_status_code) *out_status_code = -1;
+    if (!out_response || out_max == 0 || !url || url[0] == '\0') return ESP_ERR_INVALID_ARG;
     out_response[0] = '\0';
 
     if (!g_wifi_connected) {
@@ -929,25 +1147,17 @@ static esp_err_t esp32_post_https_json(const char *url, const char *qr_code, con
         return ESP_FAIL;
     }
 
-    char escaped_qr[384];
-    json_escape_into(qr_code, escaped_qr, sizeof(escaped_qr));
-
-    char *post_data = (char *)malloc(512);
-    char *auth_header = (char *)malloc(2048);
-    if (!post_data || !auth_header) {
-        free(post_data);
-        free(auth_header);
-        snprintf(out_response, out_max, "{\"success\":false,\"message\":\"ESP32 het bo nho tam!\"}");
-        return ESP_ERR_NO_MEM;
+    char *auth_header = NULL;
+    if (bearer_token && bearer_token[0] != '\0') {
+        auth_header = (char *)malloc(2048);
+        if (!auth_header) {
+            snprintf(out_response, out_max, "{\"success\":false,\"message\":\"ESP32 het bo nho tam!\"}");
+            return ESP_ERR_NO_MEM;
+        }
+        snprintf(auth_header, 2048, "Bearer %s", bearer_token);
     }
 
-    snprintf(post_data, 512, "{\"qrCode\":\"%s\"}", escaped_qr);
-    auth_header[0] = '\0';
-    if (token && strlen(token) > 0) {
-        snprintf(auth_header, 2048, "Bearer %s", token);
-    }
-
-    size_t post_len = strlen(post_data);
+    size_t post_len = (post_body && method == HTTP_METHOD_POST) ? strlen(post_body) : 0;
     int64_t t_start_us = esp_timer_get_time();
 
     if (g_https_mutex) {
@@ -968,20 +1178,43 @@ static esp_err_t esp32_post_https_json(const char *url, const char *qr_code, con
         }
 
         memset(&s_https_ctx, 0, sizeof(s_https_ctx));
-        esp_http_client_set_method(s_api_client, HTTP_METHOD_POST);
-        esp_http_client_set_header(s_api_client, "Content-Type", "application/json");
+        esp_http_client_set_method(s_api_client, method);
         esp_http_client_set_header(s_api_client, "Accept", "application/json");
         esp_http_client_set_header(s_api_client, "Connection", "keep-alive");
-        if (strlen(auth_header) > 0) {
+        if (method == HTTP_METHOD_POST) {
+            esp_http_client_set_header(s_api_client, "Content-Type", "application/json");
+        } else {
+            esp_http_client_delete_header(s_api_client, "Content-Type");
+        }
+
+        if (auth_header) {
             esp_http_client_set_header(s_api_client, "Authorization", auth_header);
         } else {
             esp_http_client_delete_header(s_api_client, "Authorization");
         }
+        if (claim_token && claim_token[0] != '\0') {
+            esp_http_client_set_header(s_api_client, "X-Claim-Token", claim_token);
+        } else {
+            esp_http_client_delete_header(s_api_client, "X-Claim-Token");
+        }
+        if (device_id && device_id[0] != '\0') {
+            esp_http_client_set_header(s_api_client, "X-Device-Id", device_id);
+        } else {
+            esp_http_client_delete_header(s_api_client, "X-Device-Id");
+        }
+        if (device_secret && device_secret[0] != '\0') {
+            esp_http_client_set_header(s_api_client, "X-Device-Secret", device_secret);
+        } else {
+            esp_http_client_delete_header(s_api_client, "X-Device-Secret");
+        }
 
         err = esp_http_client_open(s_api_client, (int)post_len);
         if (err == ESP_OK) {
-            int written = esp_http_client_write(s_api_client, post_data, (int)post_len);
-            if (written < 0) {
+            int written = 0;
+            if (post_len > 0) {
+                written = esp_http_client_write(s_api_client, post_body, (int)post_len);
+            }
+            if (post_len > 0 && written < 0) {
                 err = ESP_ERR_HTTP_WRITE_DATA;
             } else {
                 int64_t content_len = esp_http_client_fetch_headers(s_api_client);
@@ -999,15 +1232,13 @@ static esp_err_t esp32_post_https_json(const char *url, const char *qr_code, con
                         if (esp_http_client_is_complete_data_received(s_api_client)) {
                             s_api_client_connected = true;
                         } else {
-                            /* Nếu body vượt quá out_max - 1 thì đóng socket để tránh sót dữ liệu cho lượt sau */
                             reset_api_client_locked();
                         }
 
                         int64_t dt_ms = (esp_timer_get_time() - t_start_us) / 1000;
-                        ESP_LOGI(TAG, "ESP32 HTTPS (%s) HTTP %d, body=%d bytes, reused=%d, dt=%lld ms",
+                        ESP_LOGI(TAG, "ESP32 HTTP (%s) -> %d (%d bytes, reused=%d, dt=%lld ms)",
                                  url, status_code, read_len, was_reused ? 1 : 0, (long long)dt_ms);
 
-                        /* Loại bỏ ký tự xuống dòng để không làm vỡ giao thức khung dòng UART */
                         for (int i = 0; i < read_len; i++) {
                             if (out_response[i] == '\r' || out_response[i] == '\n') {
                                 out_response[i] = ' ';
@@ -1018,12 +1249,6 @@ static esp_err_t esp32_post_https_json(const char *url, const char *qr_code, con
                             snprintf(out_response, out_max,
                                      "{\"success\":false,\"statusCode\":%d,\"message\":\"May chu tra ve HTTP %d\"}",
                                      status_code, status_code);
-                        }
-
-                        if (status_code == 200 || status_code == 201) {
-                            if (ok_beep_ms > 0) buzzer_beep(ok_beep_ms);
-                        } else {
-                            buzzer_beep(220);
                         }
                         break;
                     }
@@ -1041,8 +1266,8 @@ static esp_err_t esp32_post_https_json(const char *url, const char *qr_code, con
     }
 
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "ESP32 HTTPS failed: err=%s tls=%s mbed=-0x%x flags=0x%x errno=%d",
-                 esp_err_to_name(err), esp_err_to_name(s_https_ctx.tls_last_err),
+        ESP_LOGE(TAG, "ESP32 HTTP failed (%s): err=%s tls=%s mbed=-0x%x flags=0x%x errno=%d",
+                 url, esp_err_to_name(err), esp_err_to_name(s_https_ctx.tls_last_err),
                  (unsigned)(-s_https_ctx.tls_err_code), (unsigned)s_https_ctx.tls_flags, sock_errno);
         snprintf(out_response, out_max,
                  "{\"success\":false,\"message\":\"Loi ket noi HTTPS tu ESP32: %s (tls=%s, mbed=-0x%x, flags=0x%x, errno=%d)\"}",
@@ -1050,26 +1275,53 @@ static esp_err_t esp32_post_https_json(const char *url, const char *qr_code, con
                  (unsigned)(-s_https_ctx.tls_err_code), (unsigned)s_https_ctx.tls_flags, sock_errno);
     }
 
+    if (out_status_code) *out_status_code = status_code;
     g_https_in_progress = false;
     if (g_https_mutex) {
         xSemaphoreGive(g_https_mutex);
     }
 
-    free(post_data);
     free(auth_header);
     return err;
 }
 
-static esp_err_t esp32_verify_ticket_https(const char *qr_code, const char *token, char *out_response, size_t out_max)
+static void build_iot_url(const char *suffix, char *out_url, size_t out_max)
 {
-    return esp32_post_https_json("https://api.eventhub.id.vn/api/staff/tickets/verify-qr",
-                                 qr_code, token, out_response, out_max, 60);
+    size_t blen = strlen(g_iot_base_url);
+    while (blen > 0 && g_iot_base_url[blen - 1] == '/') blen--;
+    snprintf(out_url, out_max, "%.*s%s", (int)blen, g_iot_base_url, suffix);
 }
 
-static esp_err_t esp32_checkin_ticket_https(const char *qr_code, const char *token, char *out_response, size_t out_max)
+static esp_err_t esp32_iot_scan_ticket(const char *qr_code, const char *action,
+                                       char *out_response, size_t out_max, int *out_status_code)
 {
-    return esp32_post_https_json("https://api.eventhub.id.vn/api/staff/tickets/check-in/qr",
-                                 qr_code, token, out_response, out_max, 120);
+    char escaped_qr[384];
+    json_escape_into(qr_code, escaped_qr, sizeof(escaped_qr));
+
+    char url[256];
+    build_iot_url("/tickets/scan", url, sizeof(url));
+
+    char *post_data = (char *)malloc(512);
+    if (!post_data) {
+        if (out_response && out_max > 0) {
+            snprintf(out_response, out_max, "{\"success\":false,\"message\":\"ESP32 het bo nho tam!\"}");
+        }
+        return ESP_ERR_NO_MEM;
+    }
+    snprintf(post_data, 512, "{\"qr_code\":\"%s\",\"action\":\"%s\"}",
+             escaped_qr, (action && action[0]) ? action : "auto");
+
+    char dev_id[64], dev_secret[160];
+    if (g_iot_mutex) xSemaphoreTake(g_iot_mutex, portMAX_DELAY);
+    snprintf(dev_id, sizeof(dev_id), "%s", g_iot_device_id);
+    snprintf(dev_secret, sizeof(dev_secret), "%s", g_iot_device_secret);
+    if (g_iot_mutex) xSemaphoreGive(g_iot_mutex);
+
+    esp_err_t err = esp32_http_json_request(HTTP_METHOD_POST, url, post_data,
+                                            NULL, NULL, dev_id, dev_secret,
+                                            out_response, out_max, out_status_code);
+    free(post_data);
+    return err;
 }
 
 /* ============================================================================
@@ -1183,6 +1435,25 @@ static bool extract_json_bool(const char *json, const char *key, bool *out_val)
     return false;
 }
 
+static bool extract_json_int(const char *json, const char *key, int *out_val)
+{
+    const char *val = find_json_key(json, key);
+    if (!val) return false;
+    if (*val == '\"') val++;
+    char *endp = NULL;
+    long v = strtol(val, &endp, 10);
+    if (endp == val) return false;
+    if (out_val) *out_val = (int)v;
+    return true;
+}
+
+static bool is_json_null_val(const char *json, const char *key)
+{
+    const char *val = find_json_key(json, key);
+    if (!val) return false;
+    return (strncmp(val, "null", 4) == 0);
+}
+
 static void json_escape_copy(const char *src, char *dst, size_t dst_max)
 {
     if (!dst || dst_max == 0) return;
@@ -1285,10 +1556,46 @@ static void update_last_scan_state(const char *qr, const char *status, const cha
     if (g_scan_state_mutex) xSemaphoreGive(g_scan_state_mutex);
 }
 
+static void build_iot_status_json_fragment(char *buf, size_t buf_max)
+{
+    char esc_name[96], esc_ec[96], esc_en[160], esc_url[256], esc_err[160];
+    if (g_iot_mutex) xSemaphoreTake(g_iot_mutex, portMAX_DELAY);
+    json_escape_copy(g_iot_device_name, esc_name, sizeof(esc_name));
+    json_escape_copy(g_iot_event_code, esc_ec, sizeof(esc_ec));
+    json_escape_copy(g_iot_event_name, esc_en, sizeof(esc_en));
+    json_escape_copy(g_iot_base_url, esc_url, sizeof(esc_url));
+    json_escape_copy(g_iot_last_err, esc_err, sizeof(esc_err));
+    snprintf(buf, buf_max,
+             "{\"mac\":\"%s\",\"mac_short\":\"%s\",\"state\":\"%s\",\"paired\":%s,"
+             "\"device_id\":\"%s\",\"device_name\":\"%s\",\"pairing_code\":\"%s\","
+             "\"assigned_event_id\":\"%s\",\"event_code\":\"%s\",\"event_name\":\"%s\","
+             "\"config_version\":%d,\"pending_auto_sync\":%s,\"iot_base_url\":\"%s\",\"last_error\":\"%s\"}",
+             g_device_mac,
+             g_device_mac_short,
+             iot_state_to_str(g_iot_state),
+             is_iot_device_paired_active() ? "true" : "false",
+             g_iot_device_id,
+             esc_name,
+             g_iot_pairing_code,
+             g_iot_assigned_event_id,
+             esc_ec,
+             esc_en,
+             g_iot_config_version,
+             g_iot_pending_auto_sync ? "true" : "false",
+             esc_url,
+             esc_err);
+    if (g_iot_mutex) xSemaphoreGive(g_iot_mutex);
+}
+
 static esp_err_t status_httpd_handler(httpd_req_t *req)
 {
-    char *json_response = (char *)malloc(1280);
-    if (!json_response) return httpd_resp_send_500(req);
+    char *json_response = (char *)malloc(2816);
+    char *iot_frag = (char *)malloc(1536);
+    if (!json_response || !iot_frag) {
+        free(json_response);
+        free(iot_frag);
+        return httpd_resp_send_500(req);
+    }
 
     wifi_ap_record_t ap_info;
     int8_t rssi = -100;
@@ -1307,10 +1614,12 @@ static esp_err_t status_httpd_handler(httpd_req_t *req)
 
     json_escape_copy(scan_copy.qr, esc_qr, sizeof(esc_qr));
     json_escape_copy(scan_copy.message, esc_msg, sizeof(esc_msg));
+    build_iot_status_json_fragment(iot_frag, 1536);
 
-    snprintf(json_response, 1280,
+    snprintf(json_response, 2816,
              "{\"status\":\"ok\",\"device\":\"ESP32-S3 OV5640\",\"wifi_connected\":%s,\"ip\":\"%s\",\"rssi\":%d,\"ssid\":\"%s\","
-             "\"wifi_profiles_count\":%d,\"auto_confirm\":%s,\"has_token\":%s,\"standalone_active\":%s,\"mode\":\"standalone\","
+             "\"wifi_profiles_count\":%d,\"auto_confirm\":%s,\"standalone_active\":%s,\"mode\":\"standalone\","
+             "\"iot\":%s,"
              "\"last_scan\":{\"qr\":\"%s\",\"status\":\"%s\",\"message\":\"%s\",\"seq\":%lu,\"auto_checked_in\":%s}}",
              g_wifi_connected ? "true" : "false",
              g_wifi_ip,
@@ -1318,8 +1627,8 @@ static esp_err_t status_httpd_handler(httpd_req_t *req)
              esc_ssid,
              g_wifi_profile_count,
              g_auto_confirm ? "true" : "false",
-             g_staff_token[0] ? "true" : "false",
              !is_pc_usb_active() ? "true" : "false",
+             iot_frag,
              esc_qr,
              scan_copy.status,
              esc_msg,
@@ -1329,8 +1638,54 @@ static esp_err_t status_httpd_handler(httpd_req_t *req)
     httpd_resp_set_type(req, "application/json");
     send_cors_headers(req);
     esp_err_t err = httpd_resp_send(req, json_response, strlen(json_response));
+    free(iot_frag);
     free(json_response);
     return err;
+}
+
+static esp_err_t iot_status_httpd_handler(httpd_req_t *req)
+{
+    char *iot_frag = (char *)malloc(1536);
+    if (!iot_frag) return httpd_resp_send_500(req);
+    build_iot_status_json_fragment(iot_frag, 1536);
+    httpd_resp_set_type(req, "application/json");
+    send_cors_headers(req);
+    esp_err_t err = httpd_resp_send(req, iot_frag, strlen(iot_frag));
+    free(iot_frag);
+    return err;
+}
+
+static esp_err_t iot_config_httpd_handler(httpd_req_t *req)
+{
+    char content[512];
+    int ret = httpd_req_recv(req, content, sizeof(content) - 1);
+    if (ret <= 0) return httpd_resp_send_500(req);
+    content[ret] = '\0';
+
+    char new_url[192] = "";
+    bool do_reset = false;
+    bool do_sync = false;
+    extract_json_str(content, "iot_base_url", new_url, sizeof(new_url));
+    extract_json_bool(content, "reset", &do_reset);
+    extract_json_bool(content, "sync", &do_sync);
+
+    if (do_reset) {
+        clear_iot_credentials_nvs(true);
+        sync_oled_network_state();
+        ESP_LOGW(TAG, "HTTP: Cleared IoT pairing credentials for re-registration");
+    }
+    if (new_url[0] != '\0') {
+        if (g_iot_mutex) xSemaphoreTake(g_iot_mutex, portMAX_DELAY);
+        snprintf(g_iot_base_url, sizeof(g_iot_base_url), "%s", new_url);
+        if (g_iot_mutex) xSemaphoreGive(g_iot_mutex);
+        save_iot_nvs_str("iot_url", new_url);
+        g_iot_force_sync = true;
+        ESP_LOGI(TAG, "HTTP: Updated IoT Base URL -> %s", new_url);
+    } else if (do_sync) {
+        g_iot_force_sync = true;
+    }
+
+    return iot_status_httpd_handler(req);
 }
 
 static esp_err_t auto_confirm_httpd_handler(httpd_req_t *req)
@@ -1344,64 +1699,17 @@ static esp_err_t auto_confirm_httpd_handler(httpd_req_t *req)
     if (!extract_json_bool(content, "enabled", &enabled)) {
         extract_json_bool(content, "auto_confirm", &enabled);
     }
-    g_auto_confirm = enabled;
-    save_nvs_u8("auto_confirm", enabled ? 1 : 0);
+    mark_local_auto_confirm_changed(enabled);
 
     char ack[48];
     snprintf(ack, sizeof(ack), "AUTOCFG:%d\n", enabled ? 1 : 0);
     safe_uart_write_string(ack);
-    sync_oled_network_state();
 
     char resp[128];
     snprintf(resp, sizeof(resp), "{\"success\":true,\"auto_confirm\":%s}", enabled ? "true" : "false");
     httpd_resp_set_type(req, "application/json");
     send_cors_headers(req);
     return httpd_resp_send(req, resp, strlen(resp));
-}
-
-static esp_err_t token_cfg_httpd_handler(httpd_req_t *req)
-{
-    char *content = (char *)malloc(2048);
-    if (!content) return httpd_resp_send_500(req);
-
-    int ret = httpd_req_recv(req, content, 2047);
-    if (ret < 0) {
-        free(content);
-        return httpd_resp_send_500(req);
-    }
-    content[ret] = '\0';
-
-    char *new_tok = (char *)malloc(sizeof(g_staff_token));
-    if (!new_tok) {
-        free(content);
-        return httpd_resp_send_500(req);
-    }
-    new_tok[0] = '\0';
-    if (!extract_json_str(content, "token", new_tok, sizeof(g_staff_token))) {
-        char auth_hdr[1536] = {0};
-        if (httpd_req_get_hdr_value_str(req, "Authorization", auth_hdr, sizeof(auth_hdr)) == ESP_OK) {
-            const char *p = auth_hdr;
-            if (strncmp(p, "Bearer ", 7) == 0 || strncmp(p, "bearer ", 7) == 0) p += 7;
-            snprintf(new_tok, sizeof(g_staff_token), "%s", p);
-        }
-    }
-
-    snprintf(g_staff_token, sizeof(g_staff_token), "%s", new_tok);
-    save_nvs_str("staff_token", g_staff_token);
-
-    char ack[32];
-    snprintf(ack, sizeof(ack), "TOKENSET:%d\n", g_staff_token[0] ? 1 : 0);
-    safe_uart_write_string(ack);
-    sync_oled_network_state();
-
-    char resp[96];
-    snprintf(resp, sizeof(resp), "{\"success\":true,\"has_token\":%s}", g_staff_token[0] ? "true" : "false");
-    httpd_resp_set_type(req, "application/json");
-    send_cors_headers(req);
-    esp_err_t err = httpd_resp_send(req, resp, strlen(resp));
-    free(new_tok);
-    free(content);
-    return err;
 }
 
 static bool parse_wifi_creds_from_req(httpd_req_t *req, char *ssid, size_t ssid_max, char *pass, size_t pass_max)
@@ -1504,48 +1812,124 @@ static bool is_json_network_error(const char *json)
     return (strstr(json, "Loi ket noi") != NULL || strstr(json, "ESP_ERR_") != NULL);
 }
 
-/* Check whether a verified ticket JSON is already used/cancelled so we do not double-confirm */
-static bool is_ticket_verify_eligible(const char *verify_json)
+static void apply_iot_server_config_from_json(const char *json, bool from_scan);
+
+static void sync_device_config_from_scan_response(const char *resp_json)
 {
-    bool ok = false;
-    if (!verify_json || !extract_json_bool(verify_json, "success", &ok) || !ok) return false;
-    if (is_json_ticket_used(verify_json)) return false;
-    if (strstr(verify_json, "\"CANCELLED\"") != NULL) return false;
-    return true;
+    const char *obj = find_json_key(resp_json, "device_config");
+    if (!obj || *obj != '{') return;
+
+    char cfg_buf[512];
+    size_t idx = 0;
+    int depth = 0;
+    bool in_str = false;
+    const char *p = obj;
+    while (*p && idx < sizeof(cfg_buf) - 1) {
+        char c = *p++;
+        cfg_buf[idx++] = c;
+        if (c == '\\' && in_str && *p) {
+            if (idx < sizeof(cfg_buf) - 1) cfg_buf[idx++] = *p++;
+            continue;
+        }
+        if (c == '"') {
+            in_str = !in_str;
+        } else if (!in_str) {
+            if (c == '{') depth++;
+            else if (c == '}') {
+                depth--;
+                if (depth <= 0) break;
+            }
+        }
+    }
+    cfg_buf[idx] = '\0';
+    apply_iot_server_config_from_json(cfg_buf, true);
 }
 
-static oled_ticket_status_t update_oled_from_api_json(const char *qr_code, const char *resp_json, bool is_checkin)
+static oled_ticket_status_t process_iot_scan_response(const char *raw_qr, const char *clean_qr,
+                                                      const char *resp_json, int http_code,
+                                                      bool *out_net_err)
 {
-    if (is_json_network_error(resp_json)) {
-        oled_show_ticket_status(OLED_TICKET_NET_ERR, qr_code, "KIEM TRA MANG");
+    if (out_net_err) *out_net_err = false;
+    if (http_code <= 0 || is_json_network_error(resp_json)) {
+        if (out_net_err) *out_net_err = true;
+        oled_show_ticket_status(OLED_TICKET_NET_ERR, clean_qr, "KIEM TRA MANG");
+        update_last_scan_state(raw_qr, "ERROR", "Loi ket noi server IoT", false);
+        buzzer_beep(240);
         return OLED_TICKET_NET_ERR;
     }
-    bool ok = false;
-    bool has_success = extract_json_bool(resp_json, "success", &ok) && ok;
-    bool used = is_json_ticket_used(resp_json);
 
-    if (is_checkin) {
-        if (has_success) {
-            oled_show_ticket_status(OLED_TICKET_OK, qr_code, "VE HOP LE");
-            return OLED_TICKET_OK;
-        }
-        if (used) {
-            oled_show_ticket_status(OLED_TICKET_USED, qr_code, "DA CHECKIN ROI");
-            return OLED_TICKET_USED;
-        }
-        oled_show_ticket_status(OLED_TICKET_NOT_FOUND, qr_code, "VE KO TON TAI");
-        return OLED_TICKET_NOT_FOUND;
+    sync_device_config_from_scan_response(resp_json);
+
+    char result_str[32] = "";
+    char error_code[32] = "";
+    char msg[192] = "";
+    extract_json_str(resp_json, "result", result_str, sizeof(result_str));
+    extract_json_str(resp_json, "code", error_code, sizeof(error_code));
+    extract_json_str(resp_json, "message", msg, sizeof(msg));
+
+    if (http_code == 401) {
+        clear_iot_credentials_nvs(true);
+        sync_oled_network_state();
+        oled_show_ticket_status(OLED_TICKET_NET_ERR, clean_qr, "CAN RESET GHEP");
+        update_last_scan_state(raw_qr, "ERROR", msg[0] ? msg : "Thiet bi can ghep noi lai", false);
+        buzzer_beep(240);
+        return OLED_TICKET_NET_ERR;
     }
 
-    if (used) {
-        oled_show_ticket_status(OLED_TICKET_USED, qr_code, "DA CHECKIN ROI");
-        return OLED_TICKET_USED;
+    if (http_code == 403 && (strcmp(result_str, "DEVICE_DISABLED") == 0 || strcmp(error_code, "DEVICE_DISABLED") == 0)) {
+        if (g_iot_mutex) xSemaphoreTake(g_iot_mutex, portMAX_DELAY);
+        g_iot_state = IOT_STATE_DISABLED;
+        if (g_iot_mutex) xSemaphoreGive(g_iot_mutex);
+        sync_oled_network_state();
+        oled_show_ticket_status(OLED_TICKET_NET_ERR, clean_qr, "MAY BI KHOA!");
+        update_last_scan_state(raw_qr, "DISABLED", msg[0] ? msg : "Thiet bi da bi khoa boi Admin", false);
+        buzzer_beep(240);
+        return OLED_TICKET_NET_ERR;
     }
-    if (has_success && strstr(resp_json, "\"CANCELLED\"") == NULL) {
-        oled_show_ticket_status(OLED_TICKET_VERIFIED, qr_code, g_auto_confirm ? "DANG XAC NHAN" : "BAM XAC NHAN");
+
+    if (http_code == 403 || strcmp(result_str, "WRONG_EVENT") == 0 || strcmp(error_code, "WRONG_EVENT") == 0) {
+        oled_show_ticket_status(OLED_TICKET_WRONG_EVENT, clean_qr, "SAI SU KIEN!");
+        update_last_scan_state(raw_qr, "WRONG_EVENT", msg[0] ? msg : "Ve khong thuoc su kien cua thiet bi nay", false);
+        buzzer_beep(240);
+        return OLED_TICKET_WRONG_EVENT;
+    }
+
+    if (http_code == 400 && (strcmp(result_str, "NO_EVENT_ASSIGNED") == 0 || strcmp(error_code, "NO_EVENT_ASSIGNED") == 0)) {
+        oled_show_ticket_status(OLED_TICKET_WRONG_EVENT, clean_qr, "CHUA GAN SK!");
+        update_last_scan_state(raw_qr, "NO_EVENT", msg[0] ? msg : "Admin chua gan su kien cho thiet bi", false);
+        buzzer_beep(240);
+        return OLED_TICKET_WRONG_EVENT;
+    }
+
+    if (strcmp(result_str, "OK") == 0) {
+        oled_show_ticket_status(OLED_TICKET_OK, clean_qr, "VE HOP LE");
+        update_last_scan_state(raw_qr, "CONFIRMED", msg[0] ? msg : "Check-in IoT thanh cong!", true);
+        set_led_duty(180);
+        buzzer_beep(65);
+        vTaskDelay(pdMS_TO_TICKS(120));
+        buzzer_beep(65);
+        vTaskDelay(pdMS_TO_TICKS(140));
+        set_led_duty(0);
+        return OLED_TICKET_OK;
+    }
+
+    if (strcmp(result_str, "VERIFIED") == 0) {
+        oled_show_ticket_status(OLED_TICKET_VERIFIED, clean_qr, "BAM XAC NHAN");
+        update_last_scan_state(raw_qr, "VERIFIED", msg[0] ? msg : "Ve hop le (cho xac nhan)", false);
+        buzzer_beep(65);
         return OLED_TICKET_VERIFIED;
     }
-    oled_show_ticket_status(OLED_TICKET_NOT_FOUND, qr_code, "VE KO TON TAI");
+
+    if (http_code == 409 || strcmp(result_str, "USED") == 0 || is_json_ticket_used(resp_json)) {
+        oled_show_ticket_status(OLED_TICKET_USED, clean_qr, "DA CHECKIN ROI");
+        update_last_scan_state(raw_qr, "USED", msg[0] ? msg : "Ve nay da duoc su dung truoc do", false);
+        buzzer_beep(240);
+        return OLED_TICKET_USED;
+    }
+
+    oled_show_ticket_status(OLED_TICKET_NOT_FOUND, clean_qr, "VE KO TON TAI");
+    update_last_scan_state(raw_qr, "INVALID", msg[0] ? msg : "Khong tim thay hoac ve khong hop le", false);
+    buzzer_beep(240);
     return OLED_TICKET_NOT_FOUND;
 }
 
@@ -1562,18 +1946,7 @@ static esp_err_t handle_ticket_action_httpd(httpd_req_t *req, bool is_checkin)
     content[ret] = '\0';
 
     char qr_code[128] = {0};
-    char *token = (char *)malloc(1536);
-    if (!token) {
-        free(content);
-        return httpd_resp_send_500(req);
-    }
-    token[0] = '\0';
-
     extract_json_str(content, "qrCode", qr_code, sizeof(qr_code));
-    extract_json_str(content, "token", token, 1536);
-    if (token[0] == '\0' && g_staff_token[0] != '\0') {
-        snprintf(token, 1536, "%s", g_staff_token);
-    }
 
     char clean_qr[64] = "";
     extract_ticket_code_c(qr_code, clean_qr, sizeof(clean_qr));
@@ -1582,21 +1955,24 @@ static esp_err_t handle_ticket_action_httpd(httpd_req_t *req, bool is_checkin)
     char *https_result = (char *)malloc(4096);
     if (https_result) {
         https_result[0] = '\0';
-        if (is_checkin) {
-            esp32_checkin_ticket_https(qr_code, token, https_result, 4096);
-            oled_ticket_status_t st = update_oled_from_api_json(clean_qr, https_result, true);
-            if (st == OLED_TICKET_OK) {
-                update_last_scan_state(qr_code, "CONFIRMED", "Da xac nhan soat ve thanh cong!", false);
-                buzzer_beep(65);
-            } else {
-                buzzer_beep(240);
-            }
+        int http_code = 400;
+        if (is_iot_device_paired_active()) {
+            esp32_iot_scan_ticket(qr_code, is_checkin ? "checkin" : "verify",
+                                  https_result, 4096, &http_code);
+            process_iot_scan_response(qr_code, clean_qr, https_result, http_code, NULL);
+            if (http_code == 400) httpd_resp_set_status(req, "400 Bad Request");
+            else if (http_code == 401) httpd_resp_set_status(req, "401 Unauthorized");
+            else if (http_code == 403) httpd_resp_set_status(req, "403 Forbidden");
+            else if (http_code == 404) httpd_resp_set_status(req, "404 Not Found");
+            else if (http_code == 409) httpd_resp_set_status(req, "409 Conflict");
+            else if (http_code <= 0 || http_code >= 500) httpd_resp_set_status(req, "502 Bad Gateway");
         } else {
-            esp32_verify_ticket_https(qr_code, token, https_result, 4096);
-            oled_ticket_status_t st = update_oled_from_api_json(clean_qr, https_result, false);
-            if (st == OLED_TICKET_USED || st == OLED_TICKET_NOT_FOUND || st == OLED_TICKET_NET_ERR) {
-                buzzer_beep(240);
-            }
+            snprintf(https_result, 4096,
+                     "{\"success\":false,\"errorCode\":\"IOT_NOT_PAIRED\",\"statusCode\":400,"
+                     "\"message\":\"ESP32 chua duoc Admin duyet ghep noi IoT!\"}");
+            httpd_resp_set_status(req, "400 Bad Request");
+            oled_show_ticket_status(OLED_TICKET_NET_ERR, clean_qr, "CHUA GHEP IOT");
+            buzzer_beep(240);
         }
         httpd_resp_set_type(req, "application/json");
         send_cors_headers(req);
@@ -1606,7 +1982,6 @@ static esp_err_t handle_ticket_action_httpd(httpd_req_t *req, bool is_checkin)
         httpd_resp_send_500(req);
     }
 
-    free(token);
     free(content);
     return ESP_OK;
 }
@@ -1638,27 +2013,42 @@ static const char STANDALONE_HTML[] =
 "<h2 style='margin:0 0 10px'>EventHub ESP32-S3 (Độc Lập)</h2>"
 "<img src='/stream' alt='Live Video Stream'>"
 "<div><span class='badge' id='b-wifi'>Wi-Fi Đang Hoạt Động</span>"
-"<span class='badge' id='b-tok' style='background:rgba(245,158,11,0.2);color:#fbbf24'>Đang tải Token...</span></div>"
+"<span class='badge' id='b-iot' style='background:rgba(59,130,246,0.2);color:#93c5fd'>IoT: Đang kiểm tra...</span></div>"
+"<div class='card' id='iot-card'><div style='color:#94a3b8;font-size:11px'>ĐỊNH DANH & SỰ KIỆN ĐƯỢC GÁN (ADMIN)</div>"
+"<div id='iot-main' style='font-weight:700;font-size:14px;margin:4px 0'>MAC: --</div>"
+"<div id='iot-sub' style='color:#cbd5e1;font-size:12px'>Đang đồng bộ cấu hình từ máy chủ...</div>"
+"<details style='margin-top:8px'><summary style='cursor:pointer;color:#93c5fd;font-size:12px'>⚙ Cấu hình IoT Server / Reset ghép nối</summary>"
+"<input id='iot-url-in' placeholder='https://.../api/iot/v1'>"
+"<div class='row' style='margin-top:8px'><button class='btn' style='flex:1' onclick='saveIotUrl()'>Lưu IoT URL</button>"
+"<button class='btn' style='background:#ef4444' onclick='resetIot()'>Reset ghép nối</button></div></details></div>"
 "<div class='card'><label class='row' style='cursor:pointer'><span><b>⚡ Tự động xác nhận vé (Auto Check-in)</b><br>"
-"<small style='color:#94a3b8'>Lưu trực tiếp vào Flash ESP32 khi rút PC</small></span>"
+"<small style='color:#94a3b8'>Đồng bộ từ Admin hoặc lưu vào Flash ESP32</small></span>"
 "<input type='checkbox' id='auto-chk' style='width:20px;height:20px;margin:0' onchange='setAuto(this.checked)'></label>"
 "<div id='auto-msg' style='font-size:11px;color:#34d399;margin-top:4px'></div></div>"
 "<div class='card' id='scan-card'><div style='color:#94a3b8;font-size:11px'>TRẠNG THÁI QUÉT ĐỘC LẬP</div>"
 "<div id='scan-qr' style='font-weight:700;font-size:15px;margin:4px 0'>Chờ mã QR...</div>"
 "<div id='scan-msg' style='color:#cbd5e1'>Đưa mã QR vào trước camera ESP32</div>"
 "<button id='btn-ci' class='btn btn-ok' style='display:none;margin-top:10px;width:100%' onclick='manualCi()'>Xác nhận soát vé ngay</button></div>"
-"<div class='card'><details><summary style='cursor:pointer;color:#93c5fd'>🔑 Cập nhật Token Staff (nếu cần)</summary>"
-"<input id='tok-in' placeholder='Dán JWT Staff Token rồi bấm Lưu'>"
-"<button class='btn' style='margin-top:8px;width:100%' onclick='saveTok()'>Lưu Token vào ESP32</button></details></div>"
 "</div><script>"
-"let lastQr='';let busyAuto=0;"
+"let lastQr='';let busyAuto=0;let iotUrlInit=false;"
 "async function setAuto(v){busyAuto=Date.now();const r=await fetch('/api/auto-confirm',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:v})});const d=await r.json();document.getElementById('auto-msg').innerText=d.auto_confirm?'✓ ESP32 đang BẬT tự xác nhận vé (đã lưu NVS)':'ESP32 đang TẮT tự xác nhận vé (đã lưu NVS)';}"
-"async function saveTok(){const t=document.getElementById('tok-in').value.trim();await fetch('/api/token',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:t})});poll();}"
+"async function saveIotUrl(){const u=document.getElementById('iot-url-in').value.trim();if(!u)return;await fetch('/api/iot-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({iot_base_url:u,sync:true})});poll();}"
+"async function resetIot(){if(!confirm('Xóa device_secret hiện tại để xin mã ghép nối mới?'))return;await fetch('/api/iot-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reset:true})});poll();}"
 "async function manualCi(){if(!lastQr)return;const r=await fetch('/api/check-in',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({qrCode:lastQr})});const d=await r.json();alert(d.message||(d.success?'Xác nhận thành công':'Lỗi xác nhận'));poll();}"
 "async function poll(){try{const r=await fetch('/status');const d=await r.json();"
 "document.getElementById('b-wifi').innerText=(d.wifi_connected?('📶 '+d.ssid+' ('+d.ip+')'):'Mất Wi-Fi');"
-"const bt=document.getElementById('b-tok');bt.innerText=d.has_token?'✓ Có Token Staff':'⚠ Chưa có Token (Đăng nhập ở PC hoặc dán Token)';bt.style.color=d.has_token?'#34d399':'#fbbf24';"
-"if(Date.now()-busyAuto>2000){document.getElementById('auto-chk').checked=!!d.auto_confirm;document.getElementById('auto-msg').innerText=d.auto_confirm?'✓ Đang BẬT Auto Check-in trong NVS ESP32':'Đang TẮT Auto Check-in trong NVS ESP32';}"
+"const iot=d.iot||{};const bi=document.getElementById('b-iot');"
+"bi.innerText='IoT: '+(iot.state||'UNPAIRED')+(iot.pairing_code?(' ['+iot.pairing_code+']'):'');"
+"bi.style.color=iot.paired?'#34d399':(iot.state==='DISABLED'?'#f87171':'#93c5fd');"
+"document.getElementById('iot-main').innerText='MAC: '+(iot.mac||'--')+(iot.device_name?(' • '+iot.device_name):'');"
+"let sub='Chờ đăng ký với máy chủ...';"
+"if(iot.state==='PENDING')sub='Mã ghép nối Admin: '+(iot.pairing_code||'--')+' (vào Admin -> Thiết bị để duyệt)';"
+"else if(iot.state==='REPAIR_REQUIRED')sub='Thiết bị đã từng ghép nối. Vào Admin -> Reset ghép nối hoặc bấm Reset bên dưới.';"
+"else if(iot.state==='DISABLED')sub='Thiết bị đang bị Admin KHÓA.';"
+"else if(iot.paired)sub=iot.assigned_event_id?('Sự kiện: '+(iot.event_name||iot.event_code)+' ['+iot.event_code+']'):'Đã kích hoạt nhưng CHƯA GÁN SỰ KIỆN trên Admin Web.';"
+"document.getElementById('iot-sub').innerText=sub;"
+"if(!iotUrlInit&&iot.iot_base_url){document.getElementById('iot-url-in').value=iot.iot_base_url;iotUrlInit=true;}"
+"if(Date.now()-busyAuto>2000){document.getElementById('auto-chk').checked=!!d.auto_confirm;document.getElementById('auto-msg').innerText=d.auto_confirm?'✓ Đang BẬT Auto Check-in':'Đang TẮT Auto Check-in';}"
 "const ls=d.last_scan||{};lastQr=ls.qr||'';document.getElementById('scan-qr').innerText=ls.qr||'Chờ mã QR...';"
 "document.getElementById('scan-msg').innerText=ls.message||'Đưa mã QR vào trước camera ESP32';"
 "document.getElementById('scan-card').className='card'+(ls.status==='CONFIRMED'?' ok':'');"
@@ -1680,13 +2070,17 @@ static void start_standalone_webserver(void)
     config.server_port = 80;
     config.ctrl_port = 32768;
     config.max_open_sockets = 6;
-    config.max_uri_handlers = 18;
+    config.max_uri_handlers = 24;
     config.stack_size = 8192;
 
     if (httpd_start(&g_http_server, &config) == ESP_OK) {
         const httpd_uri_t uris[] = {
             { .uri = "/stream",           .method = HTTP_GET,     .handler = jpg_stream_httpd_handler,     .user_ctx = NULL },
             { .uri = "/status",           .method = HTTP_GET,     .handler = status_httpd_handler,         .user_ctx = NULL },
+            { .uri = "/api/iot-status",   .method = HTTP_GET,     .handler = iot_status_httpd_handler,     .user_ctx = NULL },
+            { .uri = "/api/iot-status",   .method = HTTP_OPTIONS, .handler = cors_options_httpd_handler,   .user_ctx = NULL },
+            { .uri = "/api/iot-config",   .method = HTTP_POST,    .handler = iot_config_httpd_handler,     .user_ctx = NULL },
+            { .uri = "/api/iot-config",   .method = HTTP_OPTIONS, .handler = cors_options_httpd_handler,   .user_ctx = NULL },
             { .uri = "/api/wifi",         .method = HTTP_POST,    .handler = wifi_cfg_httpd_handler,       .user_ctx = NULL },
             { .uri = "/api/wifi",         .method = HTTP_OPTIONS, .handler = cors_options_httpd_handler,   .user_ctx = NULL },
             { .uri = "/api/wifi-profiles", .method = HTTP_POST,   .handler = wifi_profiles_httpd_handler,  .user_ctx = NULL },
@@ -1697,8 +2091,6 @@ static void start_standalone_webserver(void)
             { .uri = "/api/check-in",     .method = HTTP_OPTIONS, .handler = cors_options_httpd_handler,   .user_ctx = NULL },
             { .uri = "/api/auto-confirm", .method = HTTP_POST,    .handler = auto_confirm_httpd_handler,   .user_ctx = NULL },
             { .uri = "/api/auto-confirm", .method = HTTP_OPTIONS, .handler = cors_options_httpd_handler,   .user_ctx = NULL },
-            { .uri = "/api/token",        .method = HTTP_POST,    .handler = token_cfg_httpd_handler,      .user_ctx = NULL },
-            { .uri = "/api/token",        .method = HTTP_OPTIONS, .handler = cors_options_httpd_handler,   .user_ctx = NULL },
             { .uri = "/",                 .method = HTTP_GET,     .handler = index_httpd_handler,          .user_ctx = NULL },
         };
         for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
@@ -1770,7 +2162,7 @@ static void standalone_qr_task(void *pvParameters)
     bool resources_ready = false;
 
     while (1) {
-        if (is_pc_usb_active() || !g_wifi_connected || g_staff_token[0] == '\0') {
+        if (is_pc_usb_active() || !g_wifi_connected || !is_iot_device_paired_active()) {
             vTaskDelay(pdMS_TO_TICKS(350));
             continue;
         }
@@ -1878,60 +2270,23 @@ static void standalone_qr_task(void *pvParameters)
                     snprintf(last_code, sizeof(last_code), "%s", detected_code);
                     last_code_tick = now_t;
 
-                    ESP_LOGI(TAG, "[STANDALONE QR] Detected '%s' (auto_confirm=%d)", detected_code, g_auto_confirm ? 1 : 0);
-                    oled_show_ticket_status(OLED_TICKET_CHECKING, detected_code, NULL);
+                    char clean_code[64] = "";
+                    extract_ticket_code_c(detected_code, clean_code, sizeof(clean_code));
+                    if (clean_code[0] == '\0') {
+                        snprintf(clean_code, sizeof(clean_code), "%s", detected_code);
+                    }
+
+                    ESP_LOGI(TAG, "[STANDALONE QR] Detected '%s' (iot=%d, auto_confirm=%d)",
+                             detected_code, is_iot_device_paired_active() ? 1 : 0, g_auto_confirm ? 1 : 0);
+                    oled_show_ticket_status(OLED_TICKET_CHECKING, clean_code, NULL);
                     char *v_resp = (char *)malloc(4096);
                     if (v_resp) {
                         v_resp[0] = '\0';
-                        esp32_verify_ticket_https(detected_code, g_staff_token, v_resp, 4096);
-                        bool net_err = is_json_network_error(v_resp);
+                        int http_code = -1;
+                        bool net_err = false;
+                        esp32_iot_scan_ticket(detected_code, "auto", v_resp, 4096, &http_code);
+                        process_iot_scan_response(detected_code, clean_code, v_resp, http_code, &net_err);
                         last_code_cooldown_ms = net_err ? 2500 : 8000;
-
-                        if (is_ticket_verify_eligible(v_resp)) {
-                            if (g_auto_confirm) {
-                                oled_show_ticket_status(OLED_TICKET_CHECKING, detected_code, NULL);
-                                char *c_resp = (char *)malloc(4096);
-                                if (c_resp) {
-                                    c_resp[0] = '\0';
-                                    esp32_checkin_ticket_https(detected_code, g_staff_token, c_resp, 4096);
-                                    oled_ticket_status_t ost = update_oled_from_api_json(detected_code, c_resp, true);
-                                    if (ost == OLED_TICKET_OK) {
-                                        update_last_scan_state(detected_code, "CONFIRMED",
-                                                               "ESP32 da tu dong xac nhan ve doc lap!", true);
-                                        set_led_duty(180);
-                                        buzzer_beep(65);
-                                        vTaskDelay(pdMS_TO_TICKS(120));
-                                        buzzer_beep(65);
-                                        vTaskDelay(pdMS_TO_TICKS(140));
-                                        set_led_duty(0);
-                                    } else {
-                                        if (is_json_network_error(c_resp)) {
-                                            last_code_cooldown_ms = 2500;
-                                        }
-                                        char msg[192] = "Loi auto check-in";
-                                        extract_json_str(c_resp, "message", msg, sizeof(msg));
-                                        update_last_scan_state(detected_code, "ERROR", msg, false);
-                                        buzzer_beep(240);
-                                    }
-                                    free(c_resp);
-                                }
-                            } else {
-                                oled_show_ticket_status(OLED_TICKET_VERIFIED, detected_code, "BAM XAC NHAN");
-                                update_last_scan_state(detected_code, "VERIFIED",
-                                                       "Ve hop le (Auto Check-in dang TAT - cho bam xac nhan)", false);
-                                buzzer_beep(65);
-                            }
-                        } else {
-                            oled_ticket_status_t ost = update_oled_from_api_json(detected_code, v_resp, false);
-                            bool is_used = (ost == OLED_TICKET_USED);
-                            char msg[192] = "";
-                            extract_json_str(v_resp, "message", msg, sizeof(msg));
-                            if (msg[0] == '\0') {
-                                snprintf(msg, sizeof(msg), "%s", is_used ? "Ve nay da duoc su dung truoc do" : "Khong the xac minh ve");
-                            }
-                            update_last_scan_state(detected_code, is_used ? "USED" : "INVALID", msg, false);
-                            buzzer_beep(240);
-                        }
                         free(v_resp);
                     }
                 }
@@ -1939,6 +2294,342 @@ static void standalone_qr_task(void *pvParameters)
         }
 
         vTaskDelay(pdMS_TO_TICKS(120));
+    }
+}
+
+static void iot_wait_interruptible_ms(uint32_t total_ms)
+{
+    uint32_t elapsed = 0;
+    while (elapsed < total_ms) {
+        if (g_iot_force_sync) {
+            g_iot_force_sync = false;
+            return;
+        }
+        uint32_t step = (total_ms - elapsed) > 400 ? 400 : (total_ms - elapsed);
+        vTaskDelay(pdMS_TO_TICKS(step));
+        elapsed += step;
+    }
+}
+
+static void apply_iot_server_config_from_json(const char *json, bool from_scan)
+{
+    if (!json) return;
+
+    char evt_id[64] = "";
+    char evt_code[64] = "";
+    char evt_name[96] = "";
+    char dev_name[64] = "";
+    bool has_evt = false;
+    bool evt_cleared = false;
+    bool auto_val = g_auto_confirm;
+    bool has_auto = extract_json_bool(json, "auto_confirm", &auto_val);
+    int cfg_ver = g_iot_config_version;
+    bool has_ver = extract_json_int(json, "config_version", &cfg_ver);
+
+    if (is_json_null_val(json, "assigned_event_id")) {
+        evt_cleared = true;
+    } else if (extract_json_str(json, "assigned_event_id", evt_id, sizeof(evt_id))) {
+        has_evt = true;
+        if (evt_id[0] == '\0') evt_cleared = true;
+    }
+    extract_json_str(json, "event_code", evt_code, sizeof(evt_code));
+    extract_json_str(json, "event_name", evt_name, sizeof(evt_name));
+    if (!extract_json_str(json, "device_name", dev_name, sizeof(dev_name))) {
+        extract_json_str(json, "name", dev_name, sizeof(dev_name));
+    }
+
+    bool changed = false;
+    bool allow_auto_override = !(from_scan && g_iot_pending_auto_sync);
+    if (g_iot_mutex) xSemaphoreTake(g_iot_mutex, portMAX_DELAY);
+    if (evt_cleared) {
+        if (g_iot_assigned_event_id[0] != '\0' || g_iot_event_code[0] != '\0') changed = true;
+        g_iot_assigned_event_id[0] = '\0';
+        g_iot_event_code[0] = '\0';
+        g_iot_event_name[0] = '\0';
+        save_iot_nvs_str("evt_id", "");
+        save_iot_nvs_str("evt_code", "");
+        save_iot_nvs_str("evt_name", "");
+    } else if (has_evt) {
+        if (strcmp(g_iot_assigned_event_id, evt_id) != 0 ||
+            strcmp(g_iot_event_code, evt_code) != 0 ||
+            strcmp(g_iot_event_name, evt_name) != 0) {
+            changed = true;
+        }
+        snprintf(g_iot_assigned_event_id, sizeof(g_iot_assigned_event_id), "%s", evt_id);
+        snprintf(g_iot_event_code, sizeof(g_iot_event_code), "%s", evt_code);
+        snprintf(g_iot_event_name, sizeof(g_iot_event_name), "%s", evt_name);
+        save_iot_nvs_str("evt_id", g_iot_assigned_event_id);
+        save_iot_nvs_str("evt_code", g_iot_event_code);
+        save_iot_nvs_str("evt_name", g_iot_event_name);
+    }
+    if (dev_name[0] != '\0' && strcmp(g_iot_device_name, dev_name) != 0) {
+        snprintf(g_iot_device_name, sizeof(g_iot_device_name), "%s", dev_name);
+        save_iot_nvs_str("dev_name", g_iot_device_name);
+        changed = true;
+    }
+    if (allow_auto_override && has_ver && g_iot_config_version != cfg_ver) {
+        g_iot_config_version = cfg_ver;
+        save_iot_nvs_i32("cfg_ver", cfg_ver);
+        changed = true;
+    }
+    if (g_iot_mutex) xSemaphoreGive(g_iot_mutex);
+
+    if (allow_auto_override && has_auto && g_auto_confirm != auto_val) {
+        g_auto_confirm = auto_val;
+        save_nvs_u8("auto_confirm", auto_val ? 1 : 0);
+        changed = true;
+    }
+    if (changed) {
+        ESP_LOGI(TAG, "IoT Config synced: event=%s (%s), auto_confirm=%d, cfg_ver=%d",
+                 g_iot_event_code[0] ? g_iot_event_code : "NONE",
+                 g_iot_assigned_event_id[0] ? g_iot_assigned_event_id : "-",
+                 g_auto_confirm ? 1 : 0, g_iot_config_version);
+        sync_oled_network_state();
+    }
+}
+
+static void iot_device_task(void *pvParameters)
+{
+    (void)pvParameters;
+    char *resp = (char *)malloc(2048);
+    char *body = (char *)malloc(512);
+    if (!resp || !body) {
+        free(resp);
+        free(body);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "IoT Device Task started (MAC=%s, server=%s, paired=%d)",
+             g_device_mac, g_iot_base_url, is_iot_device_paired_active() ? 1 : 0);
+
+    while (1) {
+        if (!g_wifi_connected || strstr(g_iot_base_url, "example.com") != NULL) {
+            iot_wait_interruptible_ms(1500);
+            continue;
+        }
+
+        if (is_iot_device_paired_active()) {
+            char url[256], dev_id[64], dev_sec[160];
+            build_iot_url("/devices/heartbeat", url, sizeof(url));
+
+            bool send_override = false;
+            bool desired_auto = false;
+            int base_ver = 0;
+            if (g_iot_mutex) xSemaphoreTake(g_iot_mutex, portMAX_DELAY);
+            snprintf(dev_id, sizeof(dev_id), "%s", g_iot_device_id);
+            snprintf(dev_sec, sizeof(dev_sec), "%s", g_iot_device_secret);
+            send_override = g_iot_pending_auto_sync;
+            desired_auto = g_auto_confirm;
+            base_ver = g_iot_config_version;
+            if (g_iot_mutex) xSemaphoreGive(g_iot_mutex);
+
+            uint32_t free_heap = (uint32_t)esp_get_free_heap_size();
+            uint32_t uptime_sec = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+            if (send_override) {
+                snprintf(body, 512,
+                         "{\"rssi\":%d,\"ip\":\"%s\",\"free_heap\":%lu,\"uptime_sec\":%lu,\"firmware_version\":\"%s\","
+                         "\"auto_confirm_override\":%s,\"base_config_version\":%d}",
+                         (int)g_wifi_rssi, g_wifi_ip, (unsigned long)free_heap,
+                         (unsigned long)uptime_sec, EVENTHUB_FIRMWARE_VERSION,
+                         desired_auto ? "true" : "false", base_ver);
+            } else {
+                snprintf(body, 512,
+                         "{\"rssi\":%d,\"ip\":\"%s\",\"free_heap\":%lu,\"uptime_sec\":%lu,\"firmware_version\":\"%s\"}",
+                         (int)g_wifi_rssi, g_wifi_ip, (unsigned long)free_heap,
+                         (unsigned long)uptime_sec, EVENTHUB_FIRMWARE_VERSION);
+            }
+
+            int http_code = -1;
+            resp[0] = '\0';
+            esp_err_t err = esp32_http_json_request(HTTP_METHOD_POST, url, body,
+                                                    NULL, NULL, dev_id, dev_sec,
+                                                    resp, 2048, &http_code);
+            if (err == ESP_OK && (http_code == 200 || http_code == 201)) {
+                bool toggled_midflight = (send_override && g_auto_confirm != desired_auto);
+                bool cfg_applied = false;
+                bool has_applied = extract_json_bool(resp, "config_applied", &cfg_applied);
+
+                if (g_iot_mutex) xSemaphoreTake(g_iot_mutex, portMAX_DELAY);
+                g_iot_state = IOT_STATE_ACTIVE;
+                g_iot_last_err[0] = '\0';
+                if (send_override && (!toggled_midflight || (has_applied && !cfg_applied))) {
+                    g_iot_pending_auto_sync = false;
+                    save_iot_nvs_i32("pend_auto", 0);
+                }
+                if (g_iot_mutex) xSemaphoreGive(g_iot_mutex);
+
+                if (send_override) {
+                    ESP_LOGI(TAG, "IoT 2-way auto_confirm sync -> override=%s, base_ver=%d, config_applied=%d",
+                             desired_auto ? "true" : "false", base_ver, has_applied ? (cfg_applied ? 1 : 0) : -1);
+                }
+
+                if (!toggled_midflight || (has_applied && !cfg_applied)) {
+                    apply_iot_server_config_from_json(resp, false);
+                    sync_oled_network_state();
+                    iot_wait_interruptible_ms(10000);
+                } else {
+                    iot_wait_interruptible_ms(200);
+                }
+            } else if (http_code == 403) {
+                char msg[96] = "Thiet bi bi khoa hoac thu hoi";
+                extract_json_str(resp, "message", msg, sizeof(msg));
+                if (g_iot_mutex) xSemaphoreTake(g_iot_mutex, portMAX_DELAY);
+                g_iot_state = IOT_STATE_DISABLED;
+                snprintf(g_iot_last_err, sizeof(g_iot_last_err), "%s", msg);
+                if (g_iot_mutex) xSemaphoreGive(g_iot_mutex);
+                sync_oled_network_state();
+                iot_wait_interruptible_ms(15000);
+            } else if (http_code == 401) {
+                ESP_LOGW(TAG, "IoT Heartbeat HTTP 401 -> Secret invalid/reset, returning to pairing");
+                clear_iot_credentials_nvs(true);
+                sync_oled_network_state();
+                iot_wait_interruptible_ms(1500);
+            } else {
+                char msg[96] = "Loi heartbeat server";
+                extract_json_str(resp, "message", msg, sizeof(msg));
+                if (g_iot_mutex) xSemaphoreTake(g_iot_mutex, portMAX_DELAY);
+                snprintf(g_iot_last_err, sizeof(g_iot_last_err), "%s", msg);
+                if (g_iot_mutex) xSemaphoreGive(g_iot_mutex);
+                iot_wait_interruptible_ms(6000);
+            }
+            continue;
+        }
+
+        /* Unpaired / Pending pairing flow */
+        bool has_claim = false;
+        char claim_tok[160] = "";
+        if (g_iot_mutex) xSemaphoreTake(g_iot_mutex, portMAX_DELAY);
+        has_claim = (g_iot_claim_token[0] != '\0');
+        snprintf(claim_tok, sizeof(claim_tok), "%s", g_iot_claim_token);
+        if (g_iot_mutex) xSemaphoreGive(g_iot_mutex);
+
+        if (!has_claim) {
+            char url[256];
+            build_iot_url("/devices/register", url, sizeof(url));
+            snprintf(body, 512,
+                     "{\"mac_address\":\"%s\",\"hardware\":\"%s\",\"firmware_version\":\"%s\"}",
+                     g_device_mac, EVENTHUB_DEVICE_HARDWARE, EVENTHUB_FIRMWARE_VERSION);
+
+            int http_code = -1;
+            resp[0] = '\0';
+            esp_err_t err = esp32_http_json_request(HTTP_METHOD_POST, url, body,
+                                                    NULL, NULL, NULL, NULL,
+                                                    resp, 2048, &http_code);
+            if (err == ESP_OK && (http_code == 200 || http_code == 201)) {
+                char dev_id[64] = "", pcode[16] = "", ctok[160] = "";
+                int poll_sec = 5;
+                extract_json_str(resp, "device_id", dev_id, sizeof(dev_id));
+                extract_json_str(resp, "pairing_code", pcode, sizeof(pcode));
+                extract_json_str(resp, "claim_token", ctok, sizeof(ctok));
+                extract_json_int(resp, "poll_interval_sec", &poll_sec);
+                if (poll_sec < 3) poll_sec = 3;
+                if (poll_sec > 30) poll_sec = 30;
+
+                if (ctok[0] != '\0') {
+                    if (g_iot_mutex) xSemaphoreTake(g_iot_mutex, portMAX_DELAY);
+                    snprintf(g_iot_device_id, sizeof(g_iot_device_id), "%s", dev_id);
+                    snprintf(g_iot_pairing_code, sizeof(g_iot_pairing_code), "%s", pcode);
+                    snprintf(g_iot_claim_token, sizeof(g_iot_claim_token), "%s", ctok);
+                    g_iot_poll_interval_sec = poll_sec;
+                    g_iot_state = IOT_STATE_PENDING;
+                    g_iot_last_err[0] = '\0';
+                    if (g_iot_mutex) xSemaphoreGive(g_iot_mutex);
+                    ESP_LOGI(TAG, "IoT Pairing Pending! MAC=%s, Code=%s", g_device_mac, pcode);
+                    sync_oled_network_state();
+                    iot_wait_interruptible_ms((uint32_t)poll_sec * 1000U);
+                    continue;
+                }
+            } else if (http_code == 409) {
+                if (g_iot_mutex) xSemaphoreTake(g_iot_mutex, portMAX_DELAY);
+                g_iot_state = IOT_STATE_REPAIR_REQUIRED;
+                snprintf(g_iot_last_err, sizeof(g_iot_last_err), "Can Admin bam Reset ghep noi");
+                if (g_iot_mutex) xSemaphoreGive(g_iot_mutex);
+                sync_oled_network_state();
+                iot_wait_interruptible_ms(12000);
+                continue;
+            } else if (http_code == 403) {
+                if (g_iot_mutex) xSemaphoreTake(g_iot_mutex, portMAX_DELAY);
+                g_iot_state = IOT_STATE_DISABLED;
+                snprintf(g_iot_last_err, sizeof(g_iot_last_err), "Thiet bi dang bi Admin khoa");
+                if (g_iot_mutex) xSemaphoreGive(g_iot_mutex);
+                sync_oled_network_state();
+                iot_wait_interruptible_ms(15000);
+                continue;
+            } else {
+                char msg[96] = "Cho server /api/iot/v1";
+                extract_json_str(resp, "message", msg, sizeof(msg));
+                if (g_iot_mutex) xSemaphoreTake(g_iot_mutex, portMAX_DELAY);
+                snprintf(g_iot_last_err, sizeof(g_iot_last_err), "%s", msg);
+                if (g_iot_mutex) xSemaphoreGive(g_iot_mutex);
+                sync_oled_network_state();
+                iot_wait_interruptible_ms(10000);
+                continue;
+            }
+        } else {
+            char url[320];
+            char path[96];
+            snprintf(path, sizeof(path), "/devices/pairing-status?mac_address=%s", g_device_mac);
+            build_iot_url(path, url, sizeof(url));
+
+            int http_code = -1;
+            resp[0] = '\0';
+            esp_err_t err = esp32_http_json_request(HTTP_METHOD_GET, url, NULL,
+                                                    NULL, claim_tok, NULL, NULL,
+                                                    resp, 2048, &http_code);
+            if (err == ESP_OK && http_code == 200) {
+                char status_str[24] = "";
+                char dev_id[64] = "";
+                char dev_sec[160] = "";
+                extract_json_str(resp, "status", status_str, sizeof(status_str));
+                extract_json_str(resp, "device_id", dev_id, sizeof(dev_id));
+                extract_json_str(resp, "device_secret", dev_sec, sizeof(dev_sec));
+
+                if (strcmp(status_str, "ACTIVE") == 0 && dev_sec[0] != '\0') {
+                    if (g_iot_mutex) xSemaphoreTake(g_iot_mutex, portMAX_DELAY);
+                    if (dev_id[0] != '\0') {
+                        snprintf(g_iot_device_id, sizeof(g_iot_device_id), "%s", dev_id);
+                    }
+                    snprintf(g_iot_device_secret, sizeof(g_iot_device_secret), "%s", dev_sec);
+                    g_iot_claim_token[0] = '\0';
+                    g_iot_pairing_code[0] = '\0';
+                    g_iot_state = IOT_STATE_ACTIVE;
+                    g_iot_last_err[0] = '\0';
+                    if (g_iot_mutex) xSemaphoreGive(g_iot_mutex);
+
+                    save_iot_nvs_str("dev_id", g_iot_device_id);
+                    save_iot_nvs_str("dev_secret", g_iot_device_secret);
+                    apply_iot_server_config_from_json(resp, false);
+                    sync_oled_network_state();
+
+                    ESP_LOGI(TAG, "IoT Pairing COMPLETED! device_id=%s", g_iot_device_id);
+                    buzzer_beep(65);
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                    buzzer_beep(90);
+                    iot_wait_interruptible_ms(1000);
+                    continue;
+                } else if (strcmp(status_str, "DISABLED") == 0 || strcmp(status_str, "REVOKED") == 0) {
+                    if (g_iot_mutex) xSemaphoreTake(g_iot_mutex, portMAX_DELAY);
+                    g_iot_claim_token[0] = '\0';
+                    g_iot_pairing_code[0] = '\0';
+                    g_iot_state = IOT_STATE_DISABLED;
+                    if (g_iot_mutex) xSemaphoreGive(g_iot_mutex);
+                    sync_oled_network_state();
+                    iot_wait_interruptible_ms(15000);
+                    continue;
+                }
+            } else if (http_code == 401 || http_code == 404 || http_code == 410) {
+                if (g_iot_mutex) xSemaphoreTake(g_iot_mutex, portMAX_DELAY);
+                g_iot_claim_token[0] = '\0';
+                g_iot_pairing_code[0] = '\0';
+                g_iot_state = IOT_STATE_UNPAIRED;
+                if (g_iot_mutex) xSemaphoreGive(g_iot_mutex);
+                iot_wait_interruptible_ms(2000);
+                continue;
+            }
+        }
+
+        iot_wait_interruptible_ms((uint32_t)g_iot_poll_interval_sec * 1000U);
     }
 }
 
@@ -2101,11 +2792,35 @@ static void uart_cmd_task(void *pvParameters)
                     g_wifi_rssi = ap_info.rssi;
                 }
             }
-            char tele_buf[192];
+            char tele_buf[256];
             snprintf(tele_buf, sizeof(tele_buf), "ESPSTAT:WIFI=%d,IP=%s,RSSI=%d,SSID=%s,AUTO=%d,TOKEN=%d,PROFILES=%d\n",
                      g_wifi_connected ? 1 : 0, g_wifi_ip, (int)g_wifi_rssi, g_wifi_ssid,
-                     g_auto_confirm ? 1 : 0, g_staff_token[0] ? 1 : 0, g_wifi_profile_count);
+                     g_auto_confirm ? 1 : 0, is_iot_device_paired_active() ? 1 : 0, g_wifi_profile_count);
             safe_uart_write_string(tele_buf);
+
+            char iot_tele[512];
+            char iot_creds[320] = "";
+            if (g_iot_mutex) xSemaphoreTake(g_iot_mutex, portMAX_DELAY);
+            snprintf(iot_tele, sizeof(iot_tele),
+                     "IOTSTAT:MAC=%s|STATE=%s|CODE=%s|EVT=%s|NAME=%s|URL=%s|VER=%d|PEND=%d\n",
+                     g_device_mac,
+                     iot_state_to_str(g_iot_state),
+                     g_iot_pairing_code,
+                     g_iot_event_code,
+                     g_iot_device_name,
+                     g_iot_base_url,
+                     g_iot_config_version,
+                     g_iot_pending_auto_sync ? 1 : 0);
+            if (g_iot_state == IOT_STATE_ACTIVE && g_iot_device_id[0] != '\0' && g_iot_device_secret[0] != '\0') {
+                snprintf(iot_creds, sizeof(iot_creds), "IOTCREDS:ID=%s|SEC=%s\n",
+                         g_iot_device_id, g_iot_device_secret);
+            }
+            if (g_iot_mutex) xSemaphoreGive(g_iot_mutex);
+            safe_uart_write_string(iot_tele);
+            if (iot_creds[0] != '\0') {
+                safe_uart_write_string(iot_creds);
+            }
+
             sync_oled_network_state();
         }
 
@@ -2140,7 +2855,6 @@ static void uart_cmd_task(void *pvParameters)
                         char *savewifi_p = strstr(s_cmd_str, "SAVEWIFI:");
                         char *verify_p = strstr(s_cmd_str, "VERIFY:");
                         char *checkin_p = strstr(s_cmd_str, "CHECKIN:");
-                        char *settoken_p = strstr(s_cmd_str, "SETTOKEN:");
                         char *oled_p = strstr(s_cmd_str, "OLED:");
 
                         if (setwifi_p) {
@@ -2216,9 +2930,6 @@ static void uart_cmd_task(void *pvParameters)
                             char *tok_p = strchr(qr_p, '|');
                             if (tok_p) {
                                 *tok_p = '\0';
-                                tok_p++;
-                            } else {
-                                tok_p = "";
                             }
                             char clean_qr[64] = "";
                             extract_ticket_code_c(qr_p, clean_qr, sizeof(clean_qr));
@@ -2228,13 +2939,16 @@ static void uart_cmd_task(void *pvParameters)
                             char *uart_line = (char *)malloc(4120);
                             if (api_resp && uart_line) {
                                 api_resp[0] = '\0';
-                                if (is_checkin) {
-                                    esp32_checkin_ticket_https(qr_p, tok_p, api_resp, 4096);
+                                if (is_iot_device_paired_active()) {
+                                    int http_code = -1;
+                                    esp32_iot_scan_ticket(qr_p, is_checkin ? "checkin" : "verify",
+                                                          api_resp, 4096, &http_code);
+                                    process_iot_scan_response(qr_p, clean_qr, api_resp, http_code, NULL);
                                 } else {
-                                    esp32_verify_ticket_https(qr_p, tok_p, api_resp, 4096);
-                                }
-                                oled_ticket_status_t ost = update_oled_from_api_json(clean_qr, api_resp, is_checkin);
-                                if (ost == OLED_TICKET_USED || ost == OLED_TICKET_NOT_FOUND || ost == OLED_TICKET_NET_ERR) {
+                                    snprintf(api_resp, 4096,
+                                             "{\"success\":false,\"errorCode\":\"IOT_NOT_PAIRED\",\"statusCode\":400,"
+                                             "\"message\":\"ESP32 chua duoc Admin duyet ghep noi IoT!\"}");
+                                    oled_show_ticket_status(OLED_TICKET_NET_ERR, clean_qr, "CHUA GHEP IOT");
                                     buzzer_beep(240);
                                 }
                                 snprintf(uart_line, 4120, "%s:%s\n", is_checkin ? "CHECKINRESP" : "VERIFYRESP", api_resp);
@@ -2242,28 +2956,46 @@ static void uart_cmd_task(void *pvParameters)
                             }
                             free(uart_line);
                             free(api_resp);
-                        } else if (settoken_p) {
-                            const char *tok_p = settoken_p + 9;
-                            while (*tok_p == ' ' || *tok_p == '\t') tok_p++;
-                            size_t tlen = strlen(tok_p);
-                            if (tlen >= sizeof(g_staff_token)) tlen = sizeof(g_staff_token) - 1;
-                            memcpy(g_staff_token, tok_p, tlen);
-                            g_staff_token[tlen] = '\0';
-                            save_nvs_str("staff_token", g_staff_token);
-                            char ack[48];
-                            snprintf(ack, sizeof(ack), "TOKENSET:%d\n", g_staff_token[0] ? 1 : 0);
-                            safe_uart_write_string(ack);
-                            sync_oled_network_state();
-                            ESP_LOGI(TAG, "UART: Saved staff_token to NVS (has_token=%d)", g_staff_token[0] ? 1 : 0);
                         } else if (sscanf(s_cmd_str, "SETAUTO:%d", &val) == 1) {
                             bool enabled = (val != 0);
-                            g_auto_confirm = enabled;
-                            save_nvs_u8("auto_confirm", enabled ? 1 : 0);
+                            mark_local_auto_confirm_changed(enabled);
                             char ack[48];
                             snprintf(ack, sizeof(ack), "AUTOCFG:%d\n", enabled ? 1 : 0);
                             safe_uart_write_string(ack);
+                            ESP_LOGI(TAG, "UART: Saved auto_confirm=%d to NVS (pend_iot=%d)",
+                                     enabled ? 1 : 0, g_iot_pending_auto_sync ? 1 : 0);
+                        } else if (strncmp(s_cmd_str, "APPLYCFG:", 9) == 0) {
+                            int cfg_auto = 0, cfg_ver = 0;
+                            if (sscanf(s_cmd_str + 9, "%d|%d", &cfg_auto, &cfg_ver) == 2) {
+                                if (g_iot_mutex) xSemaphoreTake(g_iot_mutex, portMAX_DELAY);
+                                bool can_apply = !g_iot_pending_auto_sync && cfg_ver >= g_iot_config_version;
+                                if (can_apply) {
+                                    g_iot_config_version = cfg_ver;
+                                    save_iot_nvs_i32("cfg_ver", cfg_ver);
+                                }
+                                if (g_iot_mutex) xSemaphoreGive(g_iot_mutex);
+                                if (can_apply) {
+                                    g_auto_confirm = (cfg_auto != 0);
+                                    save_nvs_u8("auto_confirm", g_auto_confirm ? 1 : 0);
+                                    sync_oled_network_state();
+                                }
+                            }
+                        } else if (strncmp(s_cmd_str, "SETIOTURL:", 10) == 0) {
+                            const char *u = s_cmd_str + 10;
+                            while (*u == ' ') u++;
+                            if (u[0] != '\0') {
+                                if (g_iot_mutex) xSemaphoreTake(g_iot_mutex, portMAX_DELAY);
+                                snprintf(g_iot_base_url, sizeof(g_iot_base_url), "%.*s",
+                                         (int)(sizeof(g_iot_base_url) - 1), u);
+                                if (g_iot_mutex) xSemaphoreGive(g_iot_mutex);
+                                save_iot_nvs_str("iot_url", g_iot_base_url);
+                                g_iot_force_sync = true;
+                                ESP_LOGI(TAG, "UART: Updated IoT URL -> %s", g_iot_base_url);
+                            }
+                        } else if (strcmp(s_cmd_str, "RESETIOT") == 0) {
+                            clear_iot_credentials_nvs(true);
                             sync_oled_network_state();
-                            ESP_LOGI(TAG, "UART: Saved auto_confirm=%d to NVS", enabled ? 1 : 0);
+                            ESP_LOGW(TAG, "UART: Cleared IoT pairing credentials");
                         } else if (oled_p) {
                             char *st_p = oled_p + 5;
                             char *code_p = strchr(st_p, '|');
@@ -2346,14 +3078,21 @@ void app_main(void)
     if (!g_scan_state_mutex) {
         ESP_LOGE(TAG, "Failed to create scan state mutex!");
     }
+    g_iot_mutex = xSemaphoreCreateMutex();
+    if (!g_iot_mutex) {
+        ESP_LOGE(TAG, "Failed to create IoT mutex!");
+    }
 
-    /* 1. Khởi tạo NVS Flash */
+    /* 1. Khởi tạo NVS Flash & đọc MAC + IoT Device Config */
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+
+    init_device_mac();
+    load_iot_config_nvs();
 
     /* 2. Khởi tạo Còi Buzzer, Đèn LED PWM & Màn hình OLED 0.96" I2C (SSD1306) */
     init_buzzer();
@@ -2398,5 +3137,8 @@ void app_main(void)
     /* 8. Khởi chạy Task Quét QR Độc Lập khi rút khỏi PC */
     xTaskCreatePinnedToCore(standalone_qr_task, "qr_standalone", 10240, NULL, 2, NULL, 1);
 
-    ESP_LOGI(TAG, "EventHub Dual-Mode Station ready! Waiting for client...");
+    /* 9. Khởi chạy Task Đăng ký IoT, Ghép nối & Heartbeat trên Core 0 */
+    xTaskCreatePinnedToCore(iot_device_task, "iot_device", 8192, NULL, 3, NULL, 0);
+
+    ESP_LOGI(TAG, "EventHub Dual-Mode Station ready! MAC=%s", g_device_mac);
 }

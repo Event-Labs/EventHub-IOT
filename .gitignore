@@ -76,3 +76,19 @@ Desktop.ini
 *.workspace # General workspace files, can be from various tools
 *.suo       # Visual Studio Solution User Options
 *.sln.docstates # Visual Studio
+
+# Local secrets, domains, credentials & environment config
+.env
+.env.*
+!.env.example
+main/local_config.h
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Local runtime state & editor files
+.esp32_last_ip.json
+.clangd
+.vscode/
+*.wifi_backup

@@ -513,9 +513,6 @@
       <span class="badge badge-live">
         <span class="badge-dot"></span> <span id="fps-counter">0 FPS</span>
       </span>
-      <span class="badge" style="background:#334155;" id="staff-badge">
-        Chưa đăng nhập
-      </span>
     </div>
   </header>
 
@@ -827,7 +824,7 @@
         </div>
       </div>
 
-      <!-- Cài đặt Hệ Thống, Wi-Fi & Tài Khoản Staff (Bên phải) -->
+      <!-- Cài đặt Hệ Thống & Wi-Fi (Bên phải) -->
       <div style="display: flex; flex-direction: column; gap: 16px;">
 
         <!-- Mode Selector Card (Test Offline vs Live Production) -->
@@ -889,7 +886,7 @@
                 -- ms
               </div>
               <div style="font-size: 11px; color: #94a3b8;" id="card-latency-status">
-                api.eventhub.id.vn
+                EventHub Backend
               </div>
             </div>
           </div>
@@ -966,6 +963,35 @@
             </div>
           </div>
 
+          <!-- 2B. Định danh thiết bị IoT, Mã ghép nối Admin & Sự kiện được gán -->
+          <div id="esp-iot-card" style="background: #0f172a; border-radius: 8px; padding: 10px 12px; border: 1px solid rgba(59,130,246,0.22); margin-bottom: 12px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+              <span style="font-size: 11.5px; font-weight: 700; color: #93c5fd;">🔐 ĐỊNH DANH IOT & GHÉP NỐI ADMIN</span>
+              <span id="esp-iot-badge" style="font-size: 10.5px; font-weight: 700; padding: 2px 8px; border-radius: 999px; background: rgba(100,116,139,0.25); color: #cbd5e1;">CHƯA ĐỒNG BỘ</span>
+            </div>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; font-size: 11.5px;">
+              <div>
+                <div style="color: #94a3b8;">MAC Thiết Bị:</div>
+                <div id="esp-iot-mac" style="font-family: monospace; font-weight: 700; color: #e2e8f0;">--:--:--:--:--:--</div>
+              </div>
+              <div>
+                <div style="color: #94a3b8;">Mã Ghép Nối / Tên:</div>
+                <div id="esp-iot-code" style="font-family: monospace; font-weight: 700; color: #fbbf24;">--</div>
+              </div>
+            </div>
+            <div id="esp-iot-event" style="margin-top: 6px; font-size: 11.5px; color: #cbd5e1;">
+              Chờ ESP32 đăng ký với máy chủ...
+            </div>
+            <details style="margin-top: 8px;">
+              <summary style="cursor: pointer; font-size: 11px; color: #93c5fd;">⚙ Cấu hình IoT API URL / Reset ghép nối</summary>
+              <div style="display: flex; gap: 6px; margin-top: 6px;">
+                <input type="text" id="esp-iot-url-input" class="form-input" style="font-size: 11px; padding: 5px 8px;" placeholder="https://.../api/iot/v1">
+                <button class="btn btn-primary" style="font-size: 11px; padding: 5px 10px; white-space: nowrap;" onclick="saveEspIotUrl()">Lưu URL</button>
+                <button class="btn btn-ghost" style="font-size: 11px; padding: 5px 10px; color: #f87171; border-color: rgba(239,68,68,0.35); white-space: nowrap;" onclick="resetEspIotPairing()">Reset</button>
+              </div>
+            </details>
+          </div>
+
           <!-- 3. Form Cài Đặt & Quét Wi-Fi Cho ESP32 -->
           <div style="background: #0f172a; border-radius: 8px; padding: 12px; border: 1px solid rgba(255,255,255,0.08);">
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
@@ -1030,68 +1056,26 @@
           </div>
         </div>
 
-        <!-- Staff Auth Card -->
-        <div class="card" id="staff-auth-card">
+        <!-- Cài đặt API & Test Offline -->
+        <div class="card" id="api-settings-card">
           <div class="card-title">
-            <span>Tài Khoản Nhân Sự (Staff Auth)</span>
-            <button class="btn btn-ghost" style="padding: 4px 8px; font-size: 11px;" onclick="toggleConfig()">Cài đặt API</button>
+            <span>⚙️ Cài Đặt API Server</span>
+            <button class="btn btn-ghost" style="padding: 4px 8px; font-size: 11px;" onclick="toggleConfig()">Mở / Đóng</button>
           </div>
 
           <!-- API Settings (Ẩn mặc định) -->
-          <div id="api-config" style="display: none; margin-bottom: 14px; padding: 12px; background: #0f172a; border-radius: 8px;">
+          <div id="api-config" style="display: none; padding: 12px; background: #0f172a; border-radius: 8px;">
             <div class="form-group">
               <label>Backend API Base URL:</label>
-              <input type="text" id="api-base-url" class="form-input" value="https://api.eventhub.id.vn/api">
+              <input type="text" id="api-base-url" class="form-input" value="" placeholder="https://api.example.com/api">
             </div>
             <div style="display: flex; gap: 8px; margin-bottom: 8px;">
-              <button class="btn btn-ghost" style="font-size: 11px;" onclick="setApiUrl('https://api.eventhub.id.vn/api')">Production</button>
+              <button class="btn btn-ghost" style="font-size: 11px;" onclick="setProductionApiUrl()">Production</button>
               <button class="btn btn-ghost" style="font-size: 11px;" onclick="setApiUrl('http://localhost:3000/api')">Localhost:3000</button>
             </div>
             <label class="checkbox-label" style="color: #fbbf24; font-size: 12px;">
-              <input type="checkbox" id="mock-api-toggle"> Bật chế độ Test Offline (Tự động giả lập dữ liệu vé khi server Cloudflare 502)
+              <input type="checkbox" id="mock-api-toggle"> Bật chế độ Test Offline (Giả lập dữ liệu vé không cần gọi máy chủ)
             </label>
-          </div>
-
-          <div id="login-section">
-            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
-              <div class="form-group">
-                <label>Email Staff:</label>
-                <input type="email" id="staff-email" class="form-input" placeholder="staff@eventhub.com">
-              </div>
-              <div class="form-group">
-                <label>Mật khẩu:</label>
-                <input type="password" id="staff-password" class="form-input" placeholder="••••••••">
-              </div>
-            </div>
-            <div style="display: flex; gap: 10px; align-items: center; margin-top: 4px;">
-              <button class="btn btn-primary" onclick="handleStaffLogin()" id="btn-login">Đăng Nhập Staff</button>
-              <span style="font-size: 12px; color: var(--text-muted);">Hoặc dán Token trực tiếp:</span>
-            </div>
-
-            <!-- Khung nhập OTP khi tài khoản có 2FA -->
-            <div id="otp-section" style="display: none; margin-top: 12px; padding: 12px; background: #0f172a; border-radius: 8px; border: 1px solid #3b82f6;">
-              <div style="font-size: 13px; font-weight: 600; color: #60a5fa; margin-bottom: 6px;">🔐 Nhập mã OTP xác thực (2FA)</div>
-              <div style="font-size: 12px; color: var(--text-muted); margin-bottom: 8px;">Mã OTP đã được gửi về email của bạn. Vui lòng nhập mã 6 số:</div>
-              <div style="display: flex; gap: 8px;">
-                <input type="text" id="staff-otp" class="form-input" placeholder="VD: 123456" maxlength="6" style="font-size: 16px; letter-spacing: 0.2em; text-align: center; width: 140px;">
-                <button class="btn btn-primary" onclick="handleVerifyOtp()" id="btn-verify-otp">Xác Nhận OTP</button>
-                <button class="btn btn-ghost" onclick="cancelOtp()">Hủy</button>
-              </div>
-            </div>
-
-            <div style="margin-top: 10px;">
-              <input type="text" id="manual-token" class="form-input" placeholder="Dán Bearer JWT token vào đây nếu đã đăng nhập trên web..." onchange="handleManualToken()">
-            </div>
-          </div>
-
-          <div id="logged-section" style="display: none;">
-            <div style="display: flex; justify-content: space-between; align-items: center;">
-              <div>
-                <div style="font-size: 14px; font-weight: 700; color: #fff;" id="logged-name">Nhân viên EventHub</div>
-                <div style="font-size: 12px; color: var(--text-muted);" id="logged-email">staff@eventhub.com</div>
-              </div>
-              <button class="btn btn-danger" style="padding: 6px 12px; font-size: 12px;" onclick="handleLogout()">Đăng Xuất</button>
-            </div>
           </div>
         </div>
 
@@ -1101,8 +1085,6 @@
 
   <script>
     // State
-    let staffToken = localStorage.getItem('eventhub_staff_token') || '';
-    let staffUser = JSON.parse(localStorage.getItem('eventhub_staff_user') || 'null');
     let currentTicket = null;
     let currentQrRaw = '';
     let isVerifying = false;
@@ -1121,9 +1103,47 @@
     decodeHints.set(ZXing.DecodeHintType.CHARACTER_SET, 'UTF-8');
     const qrReader = new ZXing.QRCodeReader();
 
+    let runtimeConfig = {
+      apiBaseUrl: '',
+      iotBaseUrl: '',
+      backendHost: 'EventHub Backend',
+      frontendDomain: '',
+      initialized: false
+    };
+
+    function applyRuntimeConfig(cfg) {
+      if (!cfg) return;
+      if (cfg.api_base_url) runtimeConfig.apiBaseUrl = cfg.api_base_url;
+      if (cfg.iot_base_url) runtimeConfig.iotBaseUrl = cfg.iot_base_url;
+      if (cfg.backend_host) runtimeConfig.backendHost = cfg.backend_host;
+      if (cfg.frontend_domain) runtimeConfig.frontendDomain = cfg.frontend_domain;
+
+      const apiIn = document.getElementById('api-base-url');
+      if (apiIn && (!apiIn.value || !runtimeConfig.initialized) && runtimeConfig.apiBaseUrl) {
+        apiIn.value = runtimeConfig.apiBaseUrl;
+        apiIn.placeholder = runtimeConfig.apiBaseUrl;
+      }
+      const iotIn = document.getElementById('esp-iot-url-input');
+      if (iotIn && !iotIn.value && runtimeConfig.iotBaseUrl) {
+        iotIn.placeholder = runtimeConfig.iotBaseUrl;
+      }
+      runtimeConfig.initialized = true;
+      updateOperatingModeUI();
+    }
+
+    async function loadClientConfig() {
+      try {
+        const res = await fetch('/api/client-config');
+        if (res.ok) {
+          const cfg = await res.json();
+          applyRuntimeConfig(cfg);
+        }
+      } catch (e) {}
+    }
+
     // Init
-    window.addEventListener('DOMContentLoaded', () => {
-      initAuthStatus();
+    window.addEventListener('DOMContentLoaded', async () => {
+      await loadClientConfig();
       updateOperatingModeUI();
       initVideoOrientation();
       startQrScanningLoop();
@@ -1154,15 +1174,20 @@
       document.getElementById('api-base-url').value = url;
     }
 
+    function setProductionApiUrl() {
+      setApiUrl(runtimeConfig.apiBaseUrl || 'http://localhost:3000/api');
+    }
+
     function getApiBaseUrl() {
       let inputEl = document.getElementById('api-base-url');
       let url = (inputEl ? inputEl.value : '').trim().replace(/\/+$/, '');
-      if (!url) url = 'https://api.eventhub.id.vn/api';
+      if (!url) url = runtimeConfig.apiBaseUrl || 'http://localhost:3000/api';
       if (url.includes('/api/')) {
         url = url.split('/api/')[0] + '/api';
       }
-      if (url.includes('eventhub.id.vn') && !url.includes('api.eventhub.id.vn')) {
-        url = url.replace('eventhub.id.vn', 'api.eventhub.id.vn');
+      if (runtimeConfig.frontendDomain && runtimeConfig.backendHost &&
+          url.includes(runtimeConfig.frontendDomain) && !url.includes(runtimeConfig.backendHost)) {
+        url = url.replace(runtimeConfig.frontendDomain, runtimeConfig.backendHost);
       }
       if (!url.endsWith('/api') && !url.includes('localhost') && !url.includes(':3000')) {
         url += '/api';
@@ -1171,207 +1196,6 @@
       }
       if (inputEl && inputEl.value !== url) inputEl.value = url;
       return url;
-    }
-
-    function initAuthStatus() {
-      if (staffToken) {
-        document.getElementById('login-section').style.display = 'none';
-        document.getElementById('logged-section').style.display = 'block';
-
-        let roles = [];
-        if (staffUser && Array.isArray(staffUser.roles)) {
-          roles = staffUser.roles.map(r => String(r).toUpperCase());
-        }
-        const isStaff = roles.includes('STAFF');
-        const roleLabel = roles.length > 0 ? roles.join(', ') : (isStaff ? 'STAFF' : 'USER');
-        const displayName = staffUser?.name || staffUser?.full_name || 'Nhân sự EventHub';
-
-        const badge = document.getElementById('staff-badge');
-        if (badge) {
-          if (isStaff) {
-            badge.innerText = `✓ ${displayName} (${roleLabel})`;
-            badge.style.background = 'rgba(16, 185, 129, 0.2)';
-            badge.style.color = '#34d399';
-            badge.style.border = '1px solid rgba(16, 185, 129, 0.4)';
-          } else {
-            badge.innerText = `⚠️ ${displayName} (${roleLabel} - Chưa có quyền STAFF)`;
-            badge.style.background = 'rgba(245, 158, 11, 0.2)';
-            badge.style.color = '#fbbf24';
-            badge.style.border = '1px solid rgba(245, 158, 11, 0.4)';
-          }
-        }
-        if (staffUser) {
-          document.getElementById('logged-name').innerText = displayName + (isStaff ? ' [STAFF CHÍNH THỨC]' : ' [CHƯA CÓ QUYỀN STAFF]');
-          document.getElementById('logged-email').innerText = (staffUser.email || '') + ` • Vai trò: ${roleLabel}`;
-        }
-      } else {
-        document.getElementById('login-section').style.display = 'block';
-        document.getElementById('logged-section').style.display = 'none';
-        const badge = document.getElementById('staff-badge');
-        if (badge) {
-          badge.innerText = 'Chưa đăng nhập';
-          badge.style.background = '#334155';
-          badge.style.color = '#cbd5e1';
-          badge.style.border = 'none';
-        }
-      }
-    }
-
-    let currentChallengeId = '';
-
-    async function handleStaffLogin() {
-      const email = document.getElementById('staff-email').value.trim();
-      const password = document.getElementById('staff-password').value;
-      const apiBase = getApiBaseUrl();
-
-      if (!email || !password) {
-        showAlert('Vui lòng nhập email và mật khẩu.', 'error');
-        return;
-      }
-
-      const btn = document.getElementById('btn-login');
-      btn.innerText = 'Đang đăng nhập...';
-      btn.classList.add('btn-disabled');
-
-      try {
-        const res = await fetch('/api/proxy/login', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ email, password, apiBase })
-        });
-        const data = await res.json();
-        console.log('[Login Response]', res.status, data);
-
-        if (res.ok && data.success) {
-          if (data.data?.requiresTwoFactor && data.data?.challengeId) {
-            currentChallengeId = data.data.challengeId;
-            document.getElementById('otp-section').style.display = 'block';
-            document.getElementById('staff-otp').focus();
-            showAlert('Tài khoản yêu cầu OTP 2FA. Đã gửi mã OTP đến email ' + (data.data.email || email), 'success');
-          } else if (data.data?.accessToken) {
-            staffToken = data.data.accessToken;
-            staffUser = data.data.user;
-            localStorage.setItem('eventhub_staff_token', staffToken);
-            localStorage.setItem('eventhub_staff_user', JSON.stringify(staffUser));
-            document.getElementById('otp-section').style.display = 'none';
-            initAuthStatus();
-            syncStaffTokenToEsp32(staffToken);
-
-            const roles = Array.isArray(staffUser?.roles) ? staffUser.roles.map(r => String(r).toUpperCase()) : [];
-            if (!roles.includes('STAFF')) {
-              showAlert('⚠️ Đăng nhập thành công với vai trò (' + roles.join(', ') + '), nhưng chưa có quyền STAFF trên EventHub!', 'error');
-            } else {
-              showAlert('Đăng nhập thành công! Chào mừng Staff ' + (staffUser?.name || staffUser?.full_name || ''), 'success');
-            }
-          } else {
-            showAlert(data.message || 'Không nhận được mã truy cập.', 'error');
-          }
-        } else {
-          if (res.status === 401) {
-            showAlert('❌ Email hoặc mật khẩu Staff không chính xác (401). Vui lòng kiểm tra lại!', 'error');
-          } else if (res.status === 504) {
-            showAlert('⚠️ Mạng bị quá thời gian / Timeout (504). Hãy kiểm tra tín hiệu Wi-Fi hoặc dùng [🧪 Test Offline] để soát vé ngay.', 'error');
-          } else {
-            showAlert(data.message || 'Đăng nhập thất bại. Kiểm tra lại email/mật khẩu hoặc API URL.', 'error');
-          }
-        }
-      } catch (err) {
-        showAlert('⚠️ Lỗi kết nối mạng: ' + err.message + '. Hãy kiểm tra lại kết nối Wi-Fi hoặc dùng Test Offline.', 'error');
-      } finally {
-        btn.innerText = 'Đăng Nhập Staff';
-        btn.classList.remove('btn-disabled');
-      }
-    }
-
-    async function handleVerifyOtp() {
-      const otp = document.getElementById('staff-otp').value.trim();
-      const apiBase = getApiBaseUrl();
-
-      if (!otp || !currentChallengeId) {
-        showAlert('Vui lòng nhập mã OTP 6 số.', 'error');
-        return;
-      }
-
-      const btn = document.getElementById('btn-verify-otp');
-      btn.innerText = 'Đang kiểm tra...';
-      btn.classList.add('btn-disabled');
-
-      try {
-        const res = await fetch('/api/proxy/verify-login-otp', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ challengeId: currentChallengeId, otp, apiBase })
-        });
-        const data = await res.json();
-        console.log('[OTP Response]', res.status, data);
-
-        if (res.ok && data.success && data.data?.accessToken) {
-          staffToken = data.data.accessToken;
-          staffUser = data.data.user;
-          localStorage.setItem('eventhub_staff_token', staffToken);
-          localStorage.setItem('eventhub_staff_user', JSON.stringify(staffUser));
-          document.getElementById('otp-section').style.display = 'none';
-          initAuthStatus();
-          syncStaffTokenToEsp32(staffToken);
-          showAlert('Xác thực OTP thành công! Đã đăng nhập.', 'success');
-        } else {
-          showAlert(data.message || 'Mã OTP không chính xác hoặc đã hết hạn.', 'error');
-        }
-      } catch (err) {
-        showAlert('Lỗi kết nối OTP: ' + err.message, 'error');
-      } finally {
-        btn.innerText = 'Xác Nhận OTP';
-        btn.classList.remove('btn-disabled');
-      }
-    }
-
-    function cancelOtp() {
-      currentChallengeId = '';
-      document.getElementById('otp-section').style.display = 'none';
-      document.getElementById('staff-otp').value = '';
-    }
-
-    async function handleManualToken() {
-      let token = document.getElementById('manual-token').value.trim();
-      if (!token) return;
-
-      if (token.toLowerCase().startsWith('bearer ')) {
-        token = token.slice(7).trim();
-      }
-
-      staffToken = token;
-      localStorage.setItem('eventhub_staff_token', staffToken);
-
-      try {
-        const apiBase = getApiBaseUrl();
-        const res = await fetch('/api/proxy/profile', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': 'Bearer ' + staffToken
-          },
-          body: JSON.stringify({ apiBase })
-        });
-        const data = await res.json();
-        if (res.ok && data.success && data.data) {
-          staffUser = data.data;
-          localStorage.setItem('eventhub_staff_user', JSON.stringify(staffUser));
-        }
-      } catch(e) {}
-
-      initAuthStatus();
-      syncStaffTokenToEsp32(staffToken);
-      showAlert('Đã lưu Token thành công!', 'success');
-    }
-
-    function handleLogout() {
-      staffToken = '';
-      staffUser = null;
-      localStorage.removeItem('eventhub_staff_token');
-      localStorage.removeItem('eventhub_staff_user');
-      initAuthStatus();
-      syncStaffTokenToEsp32('');
-      showAlert('Đã đăng xuất.', 'success');
     }
 
     // Camera Tuning functions
@@ -1888,7 +1712,7 @@
         } catch(e) {}
       }
 
-      // 2. Đường dẫn URL: https://eventhub.id.vn/.../?code=... hoặc /tickets/...
+      // 2. Đường dẫn URL vé dạng https://<frontend-domain>/.../?code=... hoặc /tickets/...
       if (text.startsWith('http://') || text.startsWith('https://')) {
         try {
           const url = new URL(text);
@@ -1904,8 +1728,8 @@
       return text;
     }
 
-    // Chế độ hoạt động: 'test' (Offline tức thì) hoặc 'live' (Server thật api.eventhub.id.vn)
-    let operatingMode = localStorage.getItem('checkin_op_mode') || 'test';
+    // Chế độ hoạt động: 'test' (Offline tức thì) hoặc 'live' (Server thật qua kết nối IoT)
+    let operatingMode = localStorage.getItem('checkin_op_mode') || 'live';
 
     function setOperatingMode(mode) {
       operatingMode = mode;
@@ -1913,8 +1737,8 @@
       updateOperatingModeUI();
       showAlert(
         mode === 'test'
-          ? '🧪 Đã bật Chế Độ Test Offline: Xem thông tin vé ngay sau khi quét QR mà không cần đăng nhập!'
-          : '🌐 Đã chuyển sang Chế Độ Server Thật: Yêu cầu đăng nhập Staff để xác thực vé với api.eventhub.id.vn',
+          ? '🧪 Đã bật Chế Độ Test Offline: Xem thông tin vé giả lập mà không gọi máy chủ.'
+          : `🌐 Đã chuyển sang Chế Độ Server Thật: Đối soát trực tiếp qua kết nối IoT với ${runtimeConfig.backendHost}`,
         'success'
       );
     }
@@ -1933,7 +1757,7 @@
           badge.style.color = '#fbbf24';
           badge.style.borderColor = 'rgba(245, 158, 11, 0.4)';
         }
-        if (desc) desc.innerText = 'Quét bất kỳ mã QR nào (vé giấy, điện thoại) để xem ngay thông tin vé & test check-in mà không lo lỗi 401.';
+        if (desc) desc.innerText = 'Quét bất kỳ mã QR nào (vé giấy, điện thoại) để test giao diện check-in offline.';
         if (btnTest) {
           btnTest.style.background = '#d97706';
           btnTest.style.color = '#fff';
@@ -1946,12 +1770,12 @@
         }
       } else {
         if (badge) {
-          badge.innerText = '🌐 Server EventHub (Cần Login Staff)';
+          badge.innerText = '🌐 Server EventHub (Kết Nối IoT)';
           badge.style.background = 'rgba(59, 130, 246, 0.2)';
           badge.style.color = '#60a5fa';
           badge.style.borderColor = 'rgba(59, 130, 246, 0.4)';
         }
-        if (desc) desc.innerText = 'Gửi mã vé trực tiếp tới máy chủ api.eventhub.id.vn để đối soát dữ liệu thực tế (yêu cầu tài khoản Staff).';
+        if (desc) desc.innerText = `Gửi mã vé trực tiếp tới máy chủ ${runtimeConfig.backendHost} qua kết nối thiết bị IoT (không cần đăng nhập).`;
         if (btnTest) {
           btnTest.style.background = 'transparent';
           btnTest.style.color = 'var(--text-muted)';
@@ -1994,17 +1818,6 @@
       navigator.clipboard.writeText(currentQrRaw).then(() => {
         showAlert('Đã sao chép mã QR vào bộ nhớ tạm: ' + currentQrRaw.slice(0, 30) + '...', 'success');
       }).catch(() => {});
-    }
-
-    function focusStaffLogin() {
-      const authCard = document.getElementById('staff-auth-card') || document.getElementById('login-section');
-      const emailInput = document.getElementById('staff-email');
-      if (authCard) {
-        authCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        authCard.style.boxShadow = '0 0 25px rgba(59, 130, 246, 0.8)';
-        setTimeout(() => { authCard.style.boxShadow = ''; }, 3000);
-      }
-      if (emailInput) emailInput.focus();
     }
 
     function enableMockAndRecheck(encodedQr) {
@@ -2155,6 +1968,39 @@
       };
     }
 
+    function buildTicketFromIotResponse(rawValue, cleanCode, data) {
+      let parsed = null;
+      try {
+        if (typeof rawValue === 'string' && rawValue.startsWith('{') && rawValue.endsWith('}')) {
+          parsed = JSON.parse(rawValue);
+        }
+      } catch (e) {}
+
+      const cfg = (data && data.device_config) || {};
+      const code = data?.ticket_code || data?.ticketCode || cleanCode || parsed?.ticket_code || parsed?.code || 'N/A';
+      const eventName = cfg.event_name || data?.event_name || cfg.event_code || data?.event_code || parsed?.event || 'Sự kiện EventHub';
+      const resTag = String(data?.result || '').toUpperCase();
+      const status = (resTag === 'OK' || resTag === 'USED') ? 'USED' : 'VALID';
+
+      return {
+        id: data?.ticket_id || data?.ticketId || parsed?.ticket_id || parsed?.id || code,
+        ticket_code: code,
+        ticketCode: code,
+        status: status,
+        checked_in_at: data?.checked_in_at || data?.checkedInAt || (status === 'USED' ? new Date().toISOString() : null),
+        checkedInAt: data?.checked_in_at || data?.checkedInAt || (status === 'USED' ? new Date().toISOString() : null),
+        checkedInBy: data?.checked_in_by || data?.checkedInBy || 'Thiết bị IoT',
+        attendee_name: data?.attendee_name || parsed?.attendee_name || parsed?.name || 'Khách tham dự',
+        attendee_email: data?.attendee_email || parsed?.email || '--',
+        buyerName: data?.buyer_name || data?.attendee_name || parsed?.attendee_name || parsed?.name || 'Khách tham dự',
+        buyerEmail: data?.buyer_email || parsed?.email || '--',
+        buyerPhone: data?.buyer_phone || parsed?.phone || 'Không có',
+        eventName: eventName,
+        ticketType: data?.ticket_type_name || data?.ticket_type || parsed?.ticket_type || 'Vé tiêu chuẩn',
+        seat: parsed?.seat || data?.seat_label || 'Không có'
+      };
+    }
+
     // Tạo đối tượng vé dự phòng thông minh (đảm bảo hiển thị đầy đủ 8 trường thông tin khi offline hoặc lỗi server)
     function buildFallbackTicket(rawValue, cleanCode) {
       let parsed = null;
@@ -2269,49 +2115,11 @@
         return;
       }
 
-      // 3. NẾU Ở CHẾ ĐỘ SERVER THẬT MÀ CHƯA ĐĂNG NHẬP STAFF:
-      if (!staffToken) {
-        if (vf) vf.className = 'viewfinder active-error';
-        playBeep('error');
-        // Vẫn hiển thị đầy đủ thông tin vé để nhân sự đối soát ngay lập tức!
-        const fallbackTicket = buildFallbackTicket(rawValue, cleanCode);
-        displayTicket(fallbackTicket);
-
-        const warningBox = document.getElementById('checkin-warning');
-        if (warningBox) {
-          warningBox.style.display = 'block';
-          warningBox.innerHTML = `⚠️ <b>Chưa đăng nhập Staff:</b> Cần đăng nhập để đồng bộ kết quả lên hệ thống EventHub.<br>
-            <small style="color: #cbd5e1;">Mã vé: <b>${cleanCode || rawValue}</b>. Bạn vẫn có thể bấm [Xác nhận soát vé] để soát vé offline cho khách.</small>`;
-        }
-
-        statusEl.innerHTML = `
-          <div style="background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.35); border-radius: 8px; padding: 12px; margin-top: 6px;">
-            <div style="font-weight: 700; color: #f87171; font-size: 13px; margin-bottom: 4px;">
-              ⚠️ CẦN ĐĂNG NHẬP STAFF (LỖI 401 SERVER THẬT)
-            </div>
-            <div style="color: #cbd5e1; font-size: 12px; line-height: 1.5; margin-bottom: 10px;">
-              Camera đã <b>đọc chính xác 100%</b> mã QR: <span style="font-family: monospace; color: #38bdf8; font-weight: bold;">"${cleanCode || rawValue}"</span>.<br>
-              Để lấy thông tin từ database EventHub thật, bạn cần đăng nhập tài khoản Nhân Sự (Staff).
-            </div>
-            <div style="display: flex; gap: 8px; flex-wrap: wrap;">
-              <button class="btn btn-success" style="font-size: 12px; padding: 7px 14px; font-weight: 700;" onclick="enableMockAndRecheck('${encodeURIComponent(rawValue)}')">
-                👉 Xem Thông Tin Vé Ngay (Test Offline)
-              </button>
-              <button class="btn btn-primary" style="font-size: 12px; padding: 7px 12px;" onclick="focusStaffLogin()">
-                🔐 Đăng Nhập Staff Bên Dưới
-              </button>
-            </div>
-          </div>
-        `;
-        showAlert('⚠️ Cần đăng nhập Staff để tra cứu server, hoặc bấm [Xác Nhận Soát Vé] để check-in offline.', 'error');
-        return;
-      }
-
-      // 4. ĐÃ CÓ TOKEN: Gửi kiểm tra với EventHub Backend
+      // 3. Gửi kiểm tra qua kết nối IoT tới EventHub Backend (không cần đăng nhập Staff)
       isVerifying = true;
       statusEl.innerHTML = `
         <div style="color: #60a5fa; font-size: 12px; display: flex; align-items: center; gap: 6px; padding: 6px 0;">
-          <span>⏳</span> Đang đối soát mã vé <b>${cleanCode || rawValue}</b> với máy chủ api.eventhub.id.vn...
+          <span>⏳</span> Đang đối soát mã vé <b>${cleanCode || rawValue}</b> với máy chủ ${runtimeConfig.backendHost}...
         </div>
       `;
 
@@ -2321,109 +2129,105 @@
         const res = await fetch('/api/proxy/verify-qr', {
           method: 'POST',
           headers: {
-            'Content-Type': 'application/json',
-            'Authorization': 'Bearer ' + staffToken
+            'Content-Type': 'application/json'
           },
           body: JSON.stringify({ qrCode: rawValue, apiBase })
         });
+        const serverRoute = res.headers?.get ? res.headers.get('X-Checkin-Route') : null;
         const data = await res.json();
+        const resTag = String(data?.result || '').toUpperCase();
 
-        if (res.ok && data.success && data.data) {
-          statusEl.innerHTML = `
-            <div style="color: #34d399; font-size: 12px; font-weight: 600; padding: 4px 0;">
-              ✓ Xác thực vé thành công từ máy chủ EventHub!
-            </div>
-          `;
-          displayTicket(data.data);
-          if (data.data.status === 'USED' || data.data.checked_in_at || data.data.checkedInAt) {
-            showAlert('⚠️ Vé này đã được check-in trước đó!', 'error');
+        if (res.ok && data.success) {
+          const resolvedTicket = data.data || data.ticket || buildTicketFromIotResponse(rawValue, cleanCode, data);
+          if (resTag === 'OK') {
+            const confirmSource = resolveCurrentConfirmSource(serverRoute);
+            statusEl.innerHTML = `
+              <div style="color: #34d399; font-size: 12px; font-weight: 600; padding: 4px 0;">
+                ✓ Đã xác thực & check-in vé thành công qua IoT!
+              </div>
+            `;
+            displayTicket(resolvedTicket, true, { confirmedSource: confirmSource, confirmedAuto: true });
+            addCheckinHistory(currentTicket, confirmSource, true);
+            showAlert('✅ Check-in thành công: ' + (resolvedTicket.ticketCode || cleanCode), 'success');
           } else {
-            const isAutoConfirm = Boolean(document.getElementById('auto-confirm')?.checked);
-            showAlert(
-              isAutoConfirm
-                ? '⚡ Đã đọc mã vé hợp lệ — đang tự động xác nhận soát vé...'
-                : 'Đã đọc mã vé hợp lệ! Vui lòng đối chiếu rồi bấm Xác nhận Soát vé.',
-              'success'
-            );
+            statusEl.innerHTML = `
+              <div style="color: #34d399; font-size: 12px; font-weight: 600; padding: 4px 0;">
+                ✓ Xác thực vé thành công từ máy chủ EventHub!
+              </div>
+            `;
+            displayTicket(resolvedTicket);
+            if (resolvedTicket.status === 'USED' || resolvedTicket.checked_in_at || resolvedTicket.checkedInAt) {
+              showAlert('⚠️ Vé này đã được check-in trước đó!', 'error');
+            } else {
+              const isAutoConfirm = Boolean(document.getElementById('auto-confirm')?.checked);
+              showAlert(
+                isAutoConfirm
+                  ? '⚡ Đã đọc mã vé hợp lệ — đang tự động xác nhận soát vé...'
+                  : 'Đã đọc mã vé hợp lệ! Vui lòng đối chiếu rồi bấm Xác nhận Soát vé.',
+                'success'
+              );
+            }
           }
-        } else if (res.status === 401) {
-          if (vf) vf.className = 'viewfinder active-error';
-          playBeep('error');
-          const fallbackTicket = buildFallbackTicket(rawValue, cleanCode);
-          displayTicket(fallbackTicket, false, { allowAutoConfirm: false });
-          const warningBox = document.getElementById('checkin-warning');
-          setCheckinBanner(
-            warningBox,
-            'danger',
-            `⚠️ <b>Phiên đăng nhập hết hạn (401):</b> Token Staff đã hết hạn hoặc không có quyền.<br>
-              <small style="color: #cbd5e1;">Mã vé: <b>${escapeHtmlText(cleanCode || rawValue)}</b>. Bạn vẫn có thể bấm [Xác nhận soát vé] để check-in offline.</small>`
-          );
+        } else if (res.status === 409 || resTag === 'USED') {
+          const usedTicket = data.data || data.ticket || buildTicketFromIotResponse(rawValue, cleanCode, { ...data, result: 'USED' });
+          usedTicket.status = 'USED';
+          displayTicket(usedTicket, false, { allowAutoConfirm: false });
           statusEl.innerHTML = `
             <div style="background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.35); border-radius: 8px; padding: 12px;">
               <div style="font-weight: 700; color: #f87171; font-size: 13px; margin-bottom: 4px;">
-                ⚠️ PHIÊN ĐĂNG NHẬP STAFF ĐÃ HẾT HẠN (Lỗi 401)
+                ⚠️ VÉ ĐÃ ĐƯỢC SỬ DỤNG (409 USED)
               </div>
-              <div style="color: #cbd5e1; font-size: 12px; margin-bottom: 10px;">
-                Mã QR đã đọc được: <span style="font-family: monospace; color: #38bdf8; font-weight: bold;">"${cleanCode || rawValue}"</span>.<br>
-                Token nhân sự của bạn đã hết hạn hoặc không có quyền soát vé sự kiện này.
-              </div>
-              <div style="display: flex; gap: 8px; flex-wrap: wrap;">
-                <button class="btn btn-primary" style="font-size: 12px; padding: 6px 12px;" onclick="handleLogout(); focusStaffLogin();">
-                  Đăng Nhập Lại
-                </button>
-                <button class="btn btn-success" style="font-size: 12px; padding: 6px 14px; font-weight: 700;" onclick="enableMockAndRecheck('${encodeURIComponent(rawValue)}')">
-                  🧪 Xem Vé Này Bằng Chế Độ Test Offline
-                </button>
+              <div style="color: #cbd5e1; font-size: 12px;">
+                ${escapeHtmlText(data.message || 'Vé này đã được check-in trước đó.')}
               </div>
             </div>
           `;
-          showAlert('Phiên đăng nhập hết hạn (401). Đã nạp thông tin vé, bấm [Xác Nhận Soát Vé] để check-in offline.', 'error');
-        } else if (res.status === 403) {
+        } else if (data.errorCode === 'IOT_NOT_PAIRED' || res.status === 401 || res.status === 403 || resTag === 'DEVICE_DISABLED' || resTag === 'WRONG_EVENT' || resTag === 'NO_EVENT_ASSIGNED') {
           if (vf) vf.className = 'viewfinder active-error';
           playBeep('error');
-          const errorMsg = data.message || 'Tài khoản chưa có quyền Staff cho sự kiện này (AUTH_FORBIDDEN).';
+          const errorMsg = data.message || 'Thiết bị IoT chưa ghép nối hoặc không hợp lệ với sự kiện này.';
           const fallbackTicket = buildFallbackTicket(rawValue, cleanCode);
           displayTicket(fallbackTicket, false, { allowAutoConfirm: false });
           const warningBox = document.getElementById('checkin-warning');
           setCheckinBanner(
             warningBox,
             'danger',
-            `⚠️ <b>Máy chủ 403 (Cấm quyền):</b> ${escapeHtmlText(errorMsg)}<br>
-              <small style="color: #cbd5e1;">Mã vé: <b>${escapeHtmlText(cleanCode || rawValue)}</b>. Tài khoản đang dùng chưa được phân công sự kiện này. Bạn có thể bấm [Xác nhận soát vé] để soát vé offline cho khách.</small>`
+            `⚠️ <b>Lỗi thiết bị IoT:</b> ${escapeHtmlText(errorMsg)}<br>
+              <small style="color: #cbd5e1;">Mã vé: <b>${escapeHtmlText(cleanCode || rawValue)}</b>. Kiểm tra mục Định Danh IoT bên dưới hoặc bấm [Xác nhận soát vé] để soát offline.</small>`
           );
           statusEl.innerHTML = `
             <div style="background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.35); border-radius: 8px; padding: 12px;">
               <div style="font-weight: 700; color: #f87171; font-size: 13px; margin-bottom: 4px;">
-                ⚠️ KHÔNG CÓ QUYỀN SOÁT VÉ SỰ KIỆN NÀY (LỖI 403 FORBIDDEN)
+                🔐 THIẾT BỊ IOT CHƯA SẴN SÀNG / SAI SỰ KIỆN
               </div>
               <div style="color: #cbd5e1; font-size: 12px; line-height: 1.5; margin-bottom: 10px;">
-                Mã vé đọc được: <span style="font-family: monospace; color: #38bdf8; font-weight: bold;">"${cleanCode || rawValue}"</span>.<br>
-                Tài khoản đang đăng nhập hiện tại <b>chưa có quyền STAFF</b> hoặc <b>chưa được phân công phụ trách sự kiện này</b>.
+                ${escapeHtmlText(errorMsg)}
               </div>
               <div style="display: flex; gap: 8px; flex-wrap: wrap;">
-                <button class="btn btn-primary" style="font-size: 12px; padding: 7px 14px; font-weight: 700;" onclick="handleLogout(); focusStaffLogin();">
-                  🔄 Đăng Xuất & Đăng Nhập Lại (Cập Nhật Quyền STAFF)
+                <button class="btn btn-primary" style="font-size: 12px; padding: 7px 14px; font-weight: 700;" onclick="document.getElementById('esp-iot-card')?.scrollIntoView({behavior:'smooth'});">
+                  🔗 Xem Trạng Thái Ghép Nối IoT
                 </button>
                 <button class="btn btn-success" style="font-size: 12px; padding: 7px 14px; font-weight: 700;" onclick="enableMockAndRecheck('${encodeURIComponent(rawValue)}')">
-                  🧪 Xem Thông Tin Vé Ngay (Test Offline)
+                  🧪 Xem Vé Bằng Test Offline
                 </button>
               </div>
             </div>
           `;
-          showAlert('Lỗi 403: Tài khoản chưa có quyền Staff sự kiện này. Đã nạp thông tin vé, bấm [Xác Nhận Soát Vé] để check-in offline!', 'error');
+          showAlert(errorMsg, 'error');
         } else if (res.status === 405) {
           if (vf) vf.className = 'viewfinder active-error';
           playBeep('error');
-          // Khôi phục URL API về chuẩn
+          // Khôi phục URL API về chuẩn từ .env
           const inputEl = document.getElementById('api-base-url');
-          if (inputEl) inputEl.value = 'https://api.eventhub.id.vn/api';
+          const stdApi = runtimeConfig.apiBaseUrl || 'http://localhost:3000/api';
+          if (inputEl) inputEl.value = stdApi;
           const fallbackTicket = buildFallbackTicket(rawValue, cleanCode);
           displayTicket(fallbackTicket, false, { allowAutoConfirm: false });
           const warningBox = document.getElementById('checkin-warning');
           setCheckinBanner(
             warningBox,
             'danger',
-            `⚠️ <b>Lỗi 405 Method Not Allowed:</b> Hệ thống đã tự động chỉnh Backend URL về <b>https://api.eventhub.id.vn/api</b>.<br>
+            `⚠️ <b>Lỗi 405 Method Not Allowed:</b> Hệ thống đã tự động chỉnh Backend URL về <b>${escapeHtmlText(stdApi)}</b>.<br>
               <small style="color: #cbd5e1;">Mã vé: <b>${escapeHtmlText(cleanCode || rawValue)}</b>. Bạn có thể bấm [Xác nhận soát vé] để soát vé ngay.</small>`
           );
           statusEl.innerHTML = `
@@ -2433,8 +2237,8 @@
               </div>
               <div style="color: #cbd5e1; font-size: 12px; line-height: 1.5; margin-bottom: 10px;">
                 Mã QR đã đọc: <span style="font-family: monospace; color: #38bdf8; font-weight: bold;">"${cleanCode || rawValue}"</span>.<br>
-                Yêu cầu gửi nhầm sang tên miền máy chủ web frontend (eventhub.id.vn).<br>
-                Hệ thống đã tự động chỉnh lại thành: <b style="color: #60a5fa;">https://api.eventhub.id.vn/api</b>.
+                Yêu cầu gửi nhầm sang tên miền máy chủ web frontend (${escapeHtmlText(runtimeConfig.frontendDomain || 'frontend')}).<br>
+                Hệ thống đã tự động chỉnh lại thành: <b style="color: #60a5fa;">${escapeHtmlText(stdApi)}</b>.
               </div>
               <div style="display: flex; gap: 8px; flex-wrap: wrap;">
                 <button class="btn btn-primary" style="font-size: 12px; padding: 7px 14px; font-weight: 700;" onclick="onQrDetected('${encodeURIComponent(rawValue)}')">
@@ -2446,7 +2250,7 @@
               </div>
             </div>
           `;
-          showAlert('Lỗi 405: Đã tự động đổi Backend URL về https://api.eventhub.id.vn/api. Đã nạp thông tin vé để soát!', 'error');
+          showAlert(`Lỗi 405: Đã tự động đổi Backend URL về ${stdApi}. Đã nạp thông tin vé để soát!`, 'error');
         } else if (data.errorCode === 'ESP32_WIFI_DISCONNECTED' || data.errorCode === 'ESP32_TIMEOUT') {
           if (vf) vf.className = 'viewfinder active-error';
           playBeep('error');
@@ -2852,8 +2656,7 @@
         const res = await fetch('/api/proxy/check-in', {
           method: 'POST',
           headers: {
-            'Content-Type': 'application/json',
-            'Authorization': staffToken ? 'Bearer ' + staffToken : ''
+            'Content-Type': 'application/json'
           },
           body: JSON.stringify({
             qrCode: currentQrRaw,
@@ -2974,6 +2777,10 @@
           document.getElementById('serial-badge').innerHTML = `<span class="badge-dot" style="background:#ef4444;"></span> USB Mất kết nối`;
         }
 
+        // Đồng bộ config môi trường từ backend Python (.env)
+        if (data.config) {
+          applyRuntimeConfig(data.config);
+        }
         // Cập nhật tình trạng Wi-Fi, Tín hiệu sóng & Độ trễ Server
         if (data.network) {
           updateNetworkUI(data.network);
@@ -3069,20 +2876,21 @@
         if (cardLatMs) cardLatMs.innerText = `${lat} ms`;
 
         let color = '#34d399';
-        let statusDesc = 'api.eventhub.id.vn • Cực nhanh';
+        const bHost = net.backend_host || runtimeConfig.backendHost || 'Backend';
+        let statusDesc = bHost + ' • Cực nhanh';
 
         if (lat < 100) {
           color = '#34d399';
-          statusDesc = 'api.eventhub.id.vn • Cực nhanh (<100ms)';
+          statusDesc = bHost + ' • Cực nhanh (<100ms)';
         } else if (lat < 300) {
           color = '#38bdf8';
-          statusDesc = 'api.eventhub.id.vn • Ổn định (' + lat + 'ms)';
+          statusDesc = bHost + ' • Ổn định (' + lat + 'ms)';
         } else if (lat < 800) {
           color = '#fbbf24';
-          statusDesc = 'api.eventhub.id.vn • Hơi chậm (' + lat + 'ms)';
+          statusDesc = bHost + ' • Hơi chậm (' + lat + 'ms)';
         } else {
           color = '#f87171';
-          statusDesc = 'api.eventhub.id.vn • Lag / Chậm (>800ms)';
+          statusDesc = bHost + ' • Lag / Chậm (>800ms)';
         }
 
         if (latencyDot) latencyDot.style.background = color;
@@ -3218,7 +3026,6 @@
 
     let isTogglingAutoConfirm = false;
     let lastAutoToggleAt = 0;
-    let lastEspTokenAttemptAt = 0;
     let lastWifiProfilesSyncAt = 0;
     let lastWifiProfilesSig = '';
 
@@ -3256,7 +3063,6 @@
         const data = await res.json();
         if (res.ok && data && data.success) {
           updateAutoConfirmEspBadge(true, isOn);
-          if (staffToken) syncStaffTokenToEsp32(staffToken);
           showAlert(
             isOn
               ? '✓ Đã BẬT & lưu Auto Check-in vào NVS ESP32! Rút USB khỏi PC vẫn tự động xác nhận vé.'
@@ -3273,17 +3079,6 @@
       } finally {
         isTogglingAutoConfirm = false;
       }
-    }
-
-    async function syncStaffTokenToEsp32(token) {
-      lastEspTokenAttemptAt = Date.now();
-      try {
-        await fetch('/api/esp32/staff-token', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ token: token || '' })
-        });
-      } catch (e) {}
     }
 
     function collectSavedWifiProfiles() {
@@ -3337,10 +3132,6 @@
         }
         localStorage.setItem('eventhub_auto_confirm', esp.auto_confirm ? '1' : '0');
         updateAutoConfirmEspBadge(true, esp.auto_confirm);
-      }
-
-      if (staffToken && esp.has_token === false && (esp.last_seen > 0 || isConnected) && (Date.now() - lastEspTokenAttemptAt > 5000)) {
-        syncStaffTokenToEsp32(staffToken);
       }
 
       if ((esp.last_seen > 0 || isConnected) && (Date.now() - lastWifiProfilesSyncAt > 12000)) {
@@ -3496,6 +3287,107 @@
         if (standLink) {
           standLink.style.display = 'none';
         }
+      }
+
+      updateEspIotCardUI(esp.iot);
+    }
+
+    let iotUrlInputInitialized = false;
+    function updateEspIotCardUI(iot) {
+      const badge = document.getElementById('esp-iot-badge');
+      const macEl = document.getElementById('esp-iot-mac');
+      const codeEl = document.getElementById('esp-iot-code');
+      const evtEl = document.getElementById('esp-iot-event');
+      const urlIn = document.getElementById('esp-iot-url-input');
+      if (!badge || !macEl || !codeEl || !evtEl) return;
+
+      if (!iot) {
+        badge.innerText = 'CHƯA ĐỒNG BỘ';
+        badge.style.background = 'rgba(100,116,139,0.25)';
+        badge.style.color = '#cbd5e1';
+        return;
+      }
+
+      macEl.innerText = iot.mac || '--:--:--:--:--:--';
+      const st = iot.state || 'UNPAIRED';
+      badge.innerText = st;
+      if (iot.paired) {
+        badge.style.background = 'rgba(16,185,129,0.2)';
+        badge.style.color = '#34d399';
+        const verTag = (iot.config_version !== undefined && iot.config_version !== null) ? `v${iot.config_version}` : '';
+        badge.innerText = iot.pending_auto_sync ? 'ĐANG ĐỒNG BỘ...' : (`ACTIVE ${verTag}`.trim());
+        codeEl.innerText = iot.device_name || iot.device_id || 'ACTIVE';
+        codeEl.style.color = '#34d399';
+        const syncNote = iot.pending_auto_sync
+          ? ' <span style="color:#fbbf24">• ⏳ Đang đẩy Auto Check-in lên Server</span>'
+          : (verTag ? ` <span style="color:#64748b">• ${verTag}</span>` : '');
+        if (iot.assigned_event_id || iot.event_code) {
+          const evLabel = iot.event_name ? `${iot.event_name} (${iot.event_code || ''})` : (iot.event_code || iot.assigned_event_id);
+          evtEl.innerHTML = `✅ Sự kiện được gán: <b style="color:#34d399">${escapeHtmlText(evLabel)}</b>${syncNote}`;
+        } else {
+          evtEl.innerHTML = `⚠️ Đã kích hoạt nhưng <b>chưa gán sự kiện</b> (vào Admin Web &rarr; Thiết bị để chọn sự kiện).${syncNote}`;
+        }
+      } else if (st === 'PENDING') {
+        badge.style.background = 'rgba(245,158,11,0.2)';
+        badge.style.color = '#fbbf24';
+        codeEl.innerText = iot.pairing_code || '--';
+        codeEl.style.color = '#fbbf24';
+        evtEl.innerHTML = `🔑 Nhập mã <b>${escapeHtmlText(iot.pairing_code || '--')}</b> trên trang <b>Admin &rarr; Thiết bị</b> để duyệt ESP32 này.`;
+      } else if (st === 'REPAIR_REQUIRED') {
+        badge.style.background = 'rgba(245,158,11,0.2)';
+        badge.style.color = '#fbbf24';
+        codeEl.innerText = 'CẦN RESET GHÉP';
+        codeEl.style.color = '#fbbf24';
+        evtEl.innerHTML = '⚠️ Thiết bị từng được ghép trước đó. Bấm <b>Reset ghép nối</b> trên Admin Web để cấp mã mới.';
+      } else if (st === 'DISABLED') {
+        badge.style.background = 'rgba(239,68,68,0.2)';
+        badge.style.color = '#f87171';
+        codeEl.innerText = 'BỊ KHÓA';
+        codeEl.style.color = '#f87171';
+        evtEl.innerHTML = '⛔ Thiết bị đang bị khóa hoặc thu hồi bởi Admin.';
+      } else {
+        badge.style.background = 'rgba(59,130,246,0.2)';
+        badge.style.color = '#93c5fd';
+        codeEl.innerText = iot.pairing_code || '--';
+        codeEl.style.color = '#93c5fd';
+        evtEl.innerText = iot.last_error || 'Đang kết nối Wi-Fi để tự đăng ký với máy chủ...';
+      }
+
+      if (urlIn && !iotUrlInputInitialized && iot.iot_base_url) {
+        urlIn.value = iot.iot_base_url;
+        iotUrlInputInitialized = true;
+      }
+    }
+
+    async function saveEspIotUrl() {
+      const urlIn = document.getElementById('esp-iot-url-input');
+      const u = urlIn ? urlIn.value.trim() : '';
+      if (!u) return showAlert('Vui lòng nhập IoT Base URL (ví dụ https://.../api/iot/v1).', 'error');
+      try {
+        const res = await fetch('/api/esp32/iot-config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ iot_base_url: u, sync: true })
+        });
+        const data = await res.json();
+        showAlert(data.message || (data.success ? 'Đã cập nhật IoT URL!' : 'Lỗi cập nhật IoT URL'), data.success ? 'success' : 'error');
+      } catch (e) {
+        showAlert('Lỗi gửi cấu hình IoT: ' + e.message, 'error');
+      }
+    }
+
+    async function resetEspIotPairing() {
+      if (!confirm('Xóa thông tin ghép nối trên ESP32 để thiết bị đăng ký lại?')) return;
+      try {
+        const res = await fetch('/api/esp32/iot-config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ reset: true })
+        });
+        const data = await res.json();
+        showAlert(data.message || (data.success ? 'Đã reset ghép nối IoT!' : 'Lỗi reset IoT'), data.success ? 'success' : 'error');
+      } catch (e) {
+        showAlert('Lỗi reset IoT: ' + e.message, 'error');
       }
     }
 

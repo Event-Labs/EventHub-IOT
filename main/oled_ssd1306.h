@@ -14,8 +14,19 @@ typedef enum {
     OLED_TICKET_OK,
     OLED_TICKET_USED,
     OLED_TICKET_NOT_FOUND,
+    OLED_TICKET_WRONG_EVENT,
     OLED_TICKET_NET_ERR,
 } oled_ticket_status_t;
+
+typedef enum {
+    OLED_IOT_NONE = 0,
+    OLED_IOT_UNPAIRED,
+    OLED_IOT_PENDING,
+    OLED_IOT_REPAIR_REQUIRED,
+    OLED_IOT_DISABLED,
+    OLED_IOT_NO_EVENT,
+    OLED_IOT_READY,
+} oled_iot_status_t;
 
 /**
  * @brief Initialize I2C master bus (GPIO SDA/SCL) and SSD1306 128x64 OLED display task.
@@ -40,9 +51,17 @@ void oled_update_network(bool wifi_connected,
                          bool has_token);
 
 /**
- * @brief Show a ticket verification / check-in result on the OLED (auto-returns to IDLE after ~4s).
+ * @brief Show a ticket verification / check-in result on the OLED.
  */
 void oled_show_ticket_status(oled_ticket_status_t status, const char *ticket_code, const char *sub_msg);
+
+/**
+ * @brief Update IoT device pairing / event assignment state shown on idle OLED screen.
+ */
+void oled_update_iot_status(oled_iot_status_t iot_status,
+                            const char *pairing_code,
+                            const char *event_code,
+                            const char *mac_short);
 
 #ifdef __cplusplus
 }
