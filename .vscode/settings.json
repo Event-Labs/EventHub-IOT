@@ -1,0 +1,46 @@
+{
+  "C_Cpp.intelliSenseEngine": "default",
+  "idf.extensionActivationMode": "always",
+  "cmake.configureOnOpen": false,
+  "cmake.configureOnEdit": false,
+  "cmake.automaticReconfigure": false,
+  "cmake.autoSelectActiveFolder": false,
+  "cmake.options.advanced": {
+    "build": {
+      "statusBarVisibility": "inherit",
+      "inheritDefault": "hidden"
+    },
+    "launch": {
+      "statusBarVisibility": "inherit",
+      "inheritDefault": "hidden"
+    },
+    "debug": {
+      "statusBarVisibility": "inherit",
+      "inheritDefault": "hidden"
+    }
+  },
+  "idf.espIdfPathWin": "E:\\IEM ESP32\\IEM\\.espressif\\v6.1\\esp-idf",
+  "idf.toolsPathWin": "E:\\IEM ESP32\\Espressif",
+  "idf.pythonBinPathWin": "E:\\IEM ESP32\\Espressif\\tools\\python\\v6.1\\venv\\Scripts\\python.exe",
+  "idf.customExtraPaths": "E:\\IEM ESP32\\Espressif\\tools\\xtensa-esp-elf-gdb\\17.1_20260402\\xtensa-esp-elf-gdb\\bin;E:\\IEM ESP32\\Espressif\\tools\\xtensa-esp-elf\\esp-15.2.0_20251204\\xtensa-esp-elf\\bin;E:\\IEM ESP32\\Espressif\\tools\\esp-clang\\esp-21.1.3_20260408\\esp-clang\\bin;E:\\IEM ESP32\\Espressif\\tools\\riscv32-esp-elf\\esp-15.2.0_20251204\\riscv32-esp-elf\\bin;E:\\IEM ESP32\\Espressif\\tools\\esp32ulp-elf\\2.38_20240113\\esp32ulp-elf\\bin;E:\\IEM ESP32\\Espressif\\tools\\cmake\\4.0.3\\bin;E:\\IEM ESP32\\Espressif\\tools\\openocd-esp32\\v0.12.0-esp32-20260703\\openocd-esp32\\bin;E:\\IEM ESP32\\Espressif\\tools\\ninja\\1.12.1;E:\\IEM ESP32\\Espressif\\tools\\idf-exe\\1.0.3;E:\\IEM ESP32\\Espressif\\tools\\ccache\\4.12.1\\ccache-4.12.1-windows-x86_64;E:\\IEM ESP32\\Espressif\\tools\\dfu-util\\0.11\\dfu-util-0.11-win64;E:\\IEM ESP32\\Espressif\\tools\\esp-clangd\\esp-21.1.3_20260408\\esp-clangd\\bin;E:\\IEM ESP32\\Espressif\\tools\\python\\v6.1\\venv\\Scripts;E:\\IEM ESP32\\IEM\\.espressif\\v6.1\\esp-idf\\tools",
+  "idf.customExtraVars": {
+    "OPENOCD_SCRIPTS": "E:\\IEM ESP32\\Espressif\\tools\\openocd-esp32\\v0.12.0-esp32-20260703\\openocd-esp32\\share\\openocd\\scripts",
+    "IDF_CCACHE_ENABLE": "1",
+    "ESP_ROM_ELF_DIR": "E:\\IEM ESP32\\Espressif\\tools\\esp-rom-elfs\\20241011\\",
+    "ESP_CLANG_LIBS_PATH": "E:\\IEM ESP32\\Espressif\\tools\\esp-clang-libs\\esp-21.1.3_20260408\\esp-clang\\lib",
+    "IDF_TARGET": "esp32s3"
+  },
+  "idf.openOcdConfigs": [
+    "board/esp32s3-builtin.cfg"
+  ],
+  "idf.port": "COM6",
+  "idf.flashType": "UART",
+  "idf.adapterTargetName": "esp32s3",
+  "idf.currentSetup": "E:\\IEM ESP32\\IEM\\.espressif\\v6.1\\esp-idf",
+  "clangd.path": "E:\\IEM ESP32\\Espressif\\tools\\esp-clangd\\esp-21.1.3_20260408\\esp-clangd\\bin\\clangd.exe",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**",
+    "--compile-commands-dir=e:\\ESP32\\Projects\\EventHub_QR_Checkin\\build"
+  ]
+}

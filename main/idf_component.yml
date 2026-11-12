@@ -1,0 +1,6 @@
+## IDF Component Manager Manifest File
+dependencies:
+  idf:
+    version: '>=4.1.0'
+  espressif/esp32-camera: '*'
+  espressif/quirc: '^1.2.0'

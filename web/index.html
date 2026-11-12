@@ -1,0 +1,3823 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>EventHub - Quét QR & Soát Vé USB (ESP32-S3 OV5640)</title>
+  <script src="/zxing.min.js"></script>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card-bg: #1e293b;
+      --card-border: #334155;
+      --primary: #3b82f6;
+      --primary-hover: #2563eb;
+      --success: #10b981;
+      --success-hover: #059669;
+      --warning: #f59e0b;
+      --danger: #ef4444;
+      --text: #f8fafc;
+      --text-muted: #94a3b8;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+    body { background-color: var(--bg); color: var(--text); min-height: 100vh; display: flex; flex-direction: column; }
+
+    /* Header */
+    header {
+      background: #111827;
+      border-bottom: 1px solid var(--card-border);
+      padding: 14px 24px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      position: sticky;
+      top: 0;
+      z-index: 50;
+    }
+    .brand { display: flex; align-items: center; gap: 12px; }
+    .brand-logo {
+      width: 38px; height: 38px; background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+      border-radius: 10px; display: flex; align-items: center; justify-content: center;
+      font-weight: 900; font-size: 20px; color: white;
+    }
+    .brand-title h1 { font-size: 18px; font-weight: 700; color: #fff; }
+    .brand-title p { font-size: 12px; color: var(--text-muted); }
+
+    .header-status { display: flex; align-items: center; gap: 14px; }
+    .badge {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 4px 10px; border-radius: 9999px; font-size: 12px; font-weight: 600;
+    }
+    .badge-usb { background: rgba(59, 130, 246, 0.15); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.3); }
+    .badge-live { background: rgba(16, 185, 129, 0.15); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.3); }
+    .badge-dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; animation: pulse 2s infinite; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+    /* Layout */
+    .container {
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+      padding: 16px 20px;
+      flex: 1;
+      max-width: 1560px;
+      margin: 0 auto;
+      width: 100%;
+    }
+    .checkin-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
+      gap: 20px;
+      align-items: start;
+    }
+    .bottom-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
+      gap: 20px;
+    }
+
+    @media (max-width: 768px) {
+      .checkin-row, .bottom-row { grid-template-columns: 1fr; }
+    }
+
+    /* Cards */
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 12px;
+      padding: 18px;
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+    }
+    .card-title {
+      font-size: 15px;
+      font-weight: 600;
+      color: #e2e8f0;
+      margin-bottom: 14px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 1px solid rgba(255,255,255,0.06);
+      padding-bottom: 10px;
+    }
+
+    /* Video Container */
+    .stream-wrapper {
+      position: relative;
+      width: 100%;
+      background: #000;
+      border-radius: 10px;
+      overflow: hidden;
+      aspect-ratio: 4 / 3;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: inset 0 0 40px rgba(0,0,0,0.8);
+    }
+    #stream-img {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      display: block;
+      transition: transform 0.2s ease-out;
+    }
+    #scan-canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+    }
+    .viewfinder {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      width: 65%;
+      height: 65%;
+      border: 2px dashed rgba(59, 130, 246, 0.5);
+      border-radius: 16px;
+      pointer-events: none;
+      box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.25);
+      transition: border-color 0.2s, box-shadow 0.2s;
+    }
+    .viewfinder.active-detected {
+      border: 3px solid #10b981 !important;
+      box-shadow: 0 0 25px rgba(16, 185, 129, 0.6), 0 0 0 9999px rgba(0, 0, 0, 0.25) !important;
+    }
+    .viewfinder.active-stabilizing {
+      border: 3px solid #f59e0b !important;
+      box-shadow: 0 0 25px rgba(245, 158, 11, 0.7), 0 0 0 9999px rgba(0, 0, 0, 0.25) !important;
+    }
+    .viewfinder.active-stabilizing .scan-laser {
+      background: linear-gradient(90deg, transparent, #f59e0b, #fbbf24, transparent) !important;
+      box-shadow: 0 0 12px #f59e0b !important;
+    }
+    .viewfinder.active-error {
+      border: 3px solid #ef4444 !important;
+      box-shadow: 0 0 25px rgba(239, 68, 68, 0.6), 0 0 0 9999px rgba(0, 0, 0, 0.25) !important;
+    }
+    .scan-laser {
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 2px;
+      background: linear-gradient(90deg, transparent, #3b82f6, #60a5fa, transparent);
+      box-shadow: 0 0 10px #3b82f6;
+      animation: scanAnim 2.5s ease-in-out infinite;
+    }
+    @keyframes scanAnim {
+      0% { top: 5%; opacity: 0; }
+      15% { opacity: 1; }
+      85% { opacity: 1; }
+      100% { top: 95%; opacity: 0; }
+    }
+
+    .stream-controls {
+      display: flex;
+      gap: 10px;
+      margin-top: 12px;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .checkbox-label {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 13px;
+      color: var(--text-muted);
+      cursor: pointer;
+    }
+    .checkbox-label input { cursor: pointer; accent-color: var(--primary); }
+
+    /* Button */
+    .btn {
+      padding: 9px 16px;
+      border-radius: 8px;
+      border: none;
+      font-weight: 600;
+      font-size: 13px;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: background 0.15s, transform 0.1s;
+    }
+    .btn:active { transform: scale(0.98); }
+    .btn-primary { background: var(--primary); color: white; }
+    .btn-primary:hover { background: var(--primary-hover); }
+    .btn-success { background: var(--success); color: white; font-size: 15px; padding: 14px 20px; }
+    .btn-success:hover { background: var(--success-hover); }
+    .btn-danger { background: var(--danger); color: white; }
+    .btn-ghost { background: #334155; color: #cbd5e1; }
+    .btn-ghost:hover { background: #475569; }
+    .btn-disabled { opacity: 0.5; cursor: not-allowed; pointer-events: none; }
+
+    /* Forms */
+    .form-group { margin-bottom: 12px; }
+    .form-group label { display: block; font-size: 12px; color: var(--text-muted); margin-bottom: 4px; }
+    .form-input {
+      width: 100%;
+      background: #0f172a;
+      border: 1px solid var(--card-border);
+      border-radius: 6px;
+      padding: 8px 12px;
+      color: white;
+      font-size: 13px;
+      outline: none;
+    }
+    .form-input:focus { border-color: var(--primary); }
+
+    /* Ticket Info Display */
+    .ticket-empty {
+      text-align: center;
+      padding: 30px 10px;
+      color: var(--text-muted);
+      font-size: 14px;
+    }
+    /* Ticket Info Display - Matching EventHub Portal Theme */
+    .eh-ticket-panel {
+      background: radial-gradient(circle at 85% 15%, rgba(30, 58, 138, 0.25), rgba(10, 18, 38, 0.95) 70%), #0a1024;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 24px;
+      padding: 24px;
+      box-shadow: 0 12px 36px rgba(0, 0, 0, 0.45);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      min-height: 520px;
+    }
+
+    .eh-ticket-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+
+    .eh-ticket-subtitle {
+      font-size: 11px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #64748b;
+      margin: 0 0 4px 0;
+    }
+
+    .eh-ticket-code {
+      font-size: 22px;
+      font-weight: 800;
+      color: #ffffff;
+      letter-spacing: 0.03em;
+      margin: 0;
+      line-height: 1.2;
+    }
+
+    .eh-status-pill {
+      display: inline-flex;
+      align-items: center;
+      padding: 4px 14px;
+      border-radius: 9999px;
+      font-size: 11.5px;
+      font-weight: 700;
+      white-space: nowrap;
+      transition: all 0.2s ease;
+    }
+    .eh-status-pill.valid {
+      background: rgba(59, 130, 246, 0.12);
+      border: 1px solid rgba(59, 130, 246, 0.4);
+      color: #60a5fa;
+    }
+    .eh-status-pill.confirmed {
+      background: rgba(16, 185, 129, 0.2);
+      border: 1px solid rgba(16, 185, 129, 0.55);
+      color: #34d399;
+    }
+    .eh-status-pill.used {
+      background: rgba(239, 68, 68, 0.15);
+      border: 1px solid rgba(239, 68, 68, 0.45);
+      color: #f87171;
+    }
+    .eh-status-pill.invalid {
+      background: rgba(239, 68, 68, 0.2);
+      border: 1px solid rgba(239, 68, 68, 0.5);
+      color: #fca5a5;
+    }
+
+    .eh-info-list {
+      margin-top: 4px;
+      margin-bottom: 16px;
+    }
+
+    .eh-info-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 14px;
+      padding: 10px 0;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+      font-size: 13.5px;
+    }
+    .eh-info-row:last-child {
+      border-bottom: none;
+    }
+
+    .eh-info-label {
+      color: #94a3b8;
+      font-weight: 500;
+      white-space: nowrap;
+      font-size: 13.5px;
+    }
+
+    .eh-info-value {
+      color: #ffffff;
+      font-weight: 700;
+      text-align: right;
+      max-width: 62%;
+      word-break: break-word;
+      font-size: 13.5px;
+    }
+    .eh-info-value.strong-success {
+      color: #34d399;
+      font-weight: 800;
+    }
+    .eh-info-value.strong-danger {
+      color: #f87171;
+      font-weight: 800;
+    }
+
+    .eh-action-group {
+      margin-top: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .eh-btn-primary {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      width: 100%;
+      padding: 13px 20px;
+      border-radius: 9999px;
+      background: linear-gradient(135deg, #e5a854, #d97706);
+      border: 1px solid rgba(230, 193, 122, 0.5);
+      color: #0b1329;
+      font-size: 14.5px;
+      font-weight: 800;
+      cursor: pointer;
+      box-shadow: 0 4px 20px rgba(217, 119, 6, 0.35);
+      transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+      user-select: none;
+    }
+    .eh-btn-primary:hover:not(:disabled) {
+      filter: brightness(1.1);
+      transform: translateY(-1px);
+      box-shadow: 0 6px 26px rgba(217, 119, 6, 0.5);
+      color: #0b1329;
+    }
+    .eh-btn-primary:active:not(:disabled) {
+      transform: scale(0.98);
+    }
+    .eh-btn-primary.btn-disabled, .eh-btn-primary:disabled {
+      opacity: 0.65;
+      cursor: not-allowed;
+      transform: none;
+      box-shadow: none;
+    }
+
+    .eh-btn-secondary {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      width: 100%;
+      padding: 11px 20px;
+      border-radius: 9999px;
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      color: #ffffff;
+      font-size: 14px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+      user-select: none;
+    }
+    .eh-btn-secondary:hover:not(:disabled) {
+      background: rgba(229, 168, 84, 0.12);
+      border-color: rgba(230, 193, 122, 0.4);
+      color: #e5a854;
+    }
+
+    .eh-ticket-empty {
+      background: radial-gradient(circle at 50% 30%, rgba(30, 58, 138, 0.15), rgba(11, 19, 41, 0.8) 70%), #0a1024;
+      border: 1px dashed rgba(255, 255, 255, 0.12);
+      border-radius: 24px;
+      padding: 40px 24px;
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+      text-align: center;
+      min-height: 520px;
+    }
+    .eh-empty-icon-wrap {
+      width: 68px;
+      height: 68px;
+      border-radius: 50%;
+      background: rgba(59, 130, 246, 0.1);
+      border: 1px solid rgba(59, 130, 246, 0.25);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin: 0 auto 16px;
+    }
+
+    /* Alert Banner */
+    .alert {
+      padding: 10px 14px;
+      border-radius: 8px;
+      font-size: 13px;
+      margin-bottom: 12px;
+      display: none;
+    }
+    .alert-success { background: rgba(16, 185, 129, 0.2); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.4); display: flex; }
+    .alert-error { background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.4); display: flex; }
+
+    /* History table */
+    .history-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+      margin-top: 8px;
+    }
+    .history-table th {
+      text-align: left;
+      padding: 8px 10px;
+      color: var(--text-muted);
+      border-bottom: 1px solid var(--card-border);
+      font-weight: 600;
+    }
+    .history-table td {
+      padding: 8px 10px;
+      border-bottom: 1px solid rgba(255,255,255,0.04);
+      color: #cbd5e1;
+    }
+  </style>
+</head>
+<body>
+
+  <header>
+    <div class="brand">
+      <div class="brand-logo">EH</div>
+      <div class="brand-title">
+        <h1>EventHub Check-in Station</h1>
+        <p>Hệ thống Soát vé Camera USB ESP32-S3 OV5640</p>
+      </div>
+    </div>
+    <div class="header-status">
+      <!-- Route Switcher Badge (Chuyển đổi Luồng PC ⇄ Wi-Fi ESP32) -->
+      <span class="badge" id="header-route-badge" style="cursor: pointer; background: rgba(59, 130, 246, 0.2); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.4);" onclick="toggleRequestRoute()" title="Bấm vào đây để chuyển đổi giữa Mạng PC và Wi-Fi ESP32">
+        <span id="header-route-icon">🌐</span> <span id="header-route-text">Luồng: Mạng PC (Cáp USB)</span>
+      </span>
+
+      <!-- ESP32 Wi-Fi & Latency Status Badge -->
+      <span class="badge" id="esp-header-badge" style="background: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3);" title="Tình trạng Wi-Fi và độ trễ trên bo mạch ESP32">
+        <span class="badge-dot" id="esp-header-dot" style="background: #f87171;"></span>
+        <span id="esp-header-icon">📡</span> <span id="esp-header-text">ESP32: Đang kiểm tra...</span>
+      </span>
+
+      <!-- Wi-Fi & Signal Badge -->
+      <span class="badge" id="wifi-badge" style="background: rgba(59, 130, 246, 0.15); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.3);" title="Mạng Wi-Fi của máy tính PC">
+        <span id="wifi-icon">📶</span> <span id="wifi-text">Đang dò Wi-Fi...</span>
+      </span>
+
+      <!-- Server Latency Badge -->
+      <span class="badge" id="latency-badge" style="background: rgba(16, 185, 129, 0.15); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.3);" title="Độ trễ từ PC tới Server EventHub">
+        <span class="badge-dot" id="latency-dot" style="background: #34d399;"></span> <span id="latency-text">Ping: -- ms</span>
+      </span>
+
+      <span class="badge badge-usb" id="serial-badge">
+        <span class="badge-dot"></span> USB COM6 @ 2Mbaud
+      </span>
+      <span class="badge badge-live">
+        <span class="badge-dot"></span> <span id="fps-counter">0 FPS</span>
+      </span>
+      <span class="badge" style="background:#334155;" id="staff-badge">
+        Chưa đăng nhập
+      </span>
+    </div>
+  </header>
+
+  <div class="container">
+    <!-- HÀNG 1: CAMERA SCANNER & THÔNG TIN VÉ (NGANG HÀNG NHAU) -->
+    <div class="checkin-row">
+
+      <!-- Ô CAMERA SCANNER (BÊN TRÁI) -->
+      <div class="card" id="camera-card">
+        <div class="card-title">
+          <span>Camera USB Trực Tiếp (OV5640 640x480)</span>
+          <span style="font-size:12px; color:var(--text-muted);" id="scan-status-text">Đang sẵn sàng quét...</span>
+        </div>
+
+        <div class="stream-wrapper">
+          <img id="stream-img" src="/stream" alt="USB Video Stream" crossorigin="anonymous">
+          <canvas id="scan-canvas"></canvas>
+          <div class="viewfinder" id="viewfinder-box">
+            <div class="scan-laser" id="laser"></div>
+          </div>
+          <div id="stream-zoom-tag" style="position: absolute; bottom: 10px; right: 12px; background: rgba(15, 23, 42, 0.75); border: 1px solid rgba(59, 130, 246, 0.4); padding: 2px 8px; border-radius: 6px; font-size: 11px; color: #38bdf8; font-weight: 600; pointer-events: none; z-index: 10;">Zoom: 1.0x</div>
+        </div>
+
+        <!-- BỘ CHỌN & HIỂN THỊ LUỒNG ĐỐI SOÁT (PC vs Wi-Fi ESP32) TRỰC TIẾP TRÊN CAMERA -->
+        <div style="display: flex; gap: 8px; margin-top: 10px; align-items: center; justify-content: space-between; flex-wrap: wrap; padding: 8px 12px; background: #0c172e; border-radius: 8px; border: 1px solid #1e3a8a;">
+          <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+            <span style="font-size: 12px; font-weight: 700; color: #93c5fd;">⚡ LUỒNG ĐỐI SOÁT:</span>
+            <button class="btn btn-primary" id="btn-route-pill-pc" style="padding: 4px 10px; font-size: 11px; font-weight: 700;" onclick="setRequestRoute('pc')">
+              🌐 Mạng Máy Tính (PC USB)
+            </button>
+            <button class="btn btn-ghost" id="btn-route-pill-esp32" style="padding: 4px 10px; font-size: 11px; font-weight: 700;" onclick="setRequestRoute('esp32')">
+              📡 Wi-Fi Bo Mạch ESP32
+            </button>
+          </div>
+          <div style="display: flex; align-items: center; gap: 6px; font-size: 11px;" id="cam-route-status-box">
+            <span class="badge-dot" id="cam-route-dot" style="background: #3b82f6;"></span>
+            <span id="cam-route-status-text" style="color: #60a5fa; font-weight: 600;">Máy tính PC gửi request</span>
+          </div>
+        </div>
+
+        <!-- ESP32 LIVE WI-FI & LATENCY STATUS BAR (CƯỜNG ĐỘ SÓNG & ĐỘ TRỄ MẠNG ESP32) -->
+        <div id="esp-wifi-live-bar" style="display: flex; gap: 8px; margin-top: 8px; align-items: center; justify-content: space-between; flex-wrap: wrap; padding: 7px 12px; background: #071527; border-radius: 8px; border: 1px solid #0e3b66;">
+          <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+            <span id="esp-live-status-pill" style="display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 700; background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.4);">
+              <span class="badge-dot" id="esp-live-dot" style="background: #f87171;"></span>
+              <span id="esp-live-status-text">ESP32: ĐANG KIỂM TRA...</span>
+            </span>
+            <span style="font-size: 11.5px; color: #cbd5e1;" id="esp-live-ssid-box">
+              📶 Mạng: <b id="esp-live-ssid" style="color: #67e8f9;">--</b>
+            </span>
+          </div>
+          <div style="display: flex; align-items: center; gap: 12px; font-size: 11.5px; flex-wrap: wrap;">
+            <span style="color: #94a3b8;" title="Cường độ sóng Wi-Fi bo mạch ESP32">
+              Sóng: <b id="esp-live-signal" style="color: #38bdf8;">--</b>
+            </span>
+            <span style="color: #94a3b8;" title="Độ trễ mạng tới bo mạch ESP32">
+              Độ trễ: <b id="esp-live-latency" style="color: #34d399;">--</b>
+            </span>
+            <span style="color: #64748b; font-family: monospace; font-size: 11px;" id="esp-live-ip" title="IP của ESP32 trong mạng LAN">
+              IP: 0.0.0.0
+            </span>
+          </div>
+        </div>
+
+        <!-- THANH CÔNG CỤ ĐIỀU KHIỂN NHANH (GỌN GÀNG, ĐỨNG THẲNG HÀNG VỚI THẺ VÉ) -->
+        <div style="display: flex; gap: 10px; margin-top: 8px; align-items: center; justify-content: space-between; flex-wrap: wrap; padding: 8px 12px; background: #0f172a; border-radius: 8px; border: 1px solid #1e293b;">
+          <div style="display: flex; align-items: center; gap: 6px; font-size: 12px;">
+            <span style="color: #94a3b8; font-weight: 600;">🔍 Zoom:</span>
+            <button class="btn btn-ghost" id="zoom-1" style="padding: 3px 8px; font-size: 11.5px; background: rgba(59,130,246,0.25); color: #60a5fa;" onclick="setDigitalZoom(1.0)">1.0x</button>
+            <button class="btn btn-ghost" id="zoom-15" style="padding: 3px 8px; font-size: 11.5px;" onclick="setDigitalZoom(1.5)">1.5x (Chuẩn)</button>
+            <button class="btn btn-ghost" id="zoom-2" style="padding: 3px 8px; font-size: 11.5px;" onclick="setDigitalZoom(2.0)">2.0x</button>
+            <span style="color: #475569; margin: 0 4px;">|</span>
+            <button class="btn btn-ghost" id="btn-mode-phone" style="padding: 3px 8px; font-size: 11px;" onclick="applyPhoneGlarePreset()">📱 ĐT (-3)</button>
+            <button class="btn btn-ghost" id="btn-mode-paper" style="padding: 3px 8px; font-size: 11px;" onclick="applyPaperTicketPreset()">📄 Giấy (-1)</button>
+          </div>
+          <div style="display: flex; align-items: center; gap: 10px; font-size: 12px;">
+            <label class="checkbox-label" style="color: #34d399; font-weight: 600; margin: 0; font-size: 12px;">
+              <input type="checkbox" id="auto-confirm" onchange="onToggleAutoConfirm(this.checked)"> ⚡ Auto Check-in <span id="auto-confirm-esp-badge" style="margin-left:4px;font-size:10px;padding:1px 6px;border-radius:4px;background:rgba(100,116,139,0.25);color:#94a3b8;font-weight:700;">NVS: --</span>
+            </label>
+            <label class="checkbox-label" style="margin: 0; font-size: 12px;">
+              <input type="checkbox" id="audio-beep" checked> 🔊 Beep
+            </label>
+            <button class="btn btn-ghost" style="padding: 3px 8px; font-size: 11px;" onclick="testQrDemo()">🧪 Test</button>
+            <button class="btn btn-ghost" style="padding: 3px 8px; font-size: 11px;" onclick="resetScanState()">Reset</button>
+          </div>
+        </div>
+
+        <!-- MỞ RỘNG: TÙY CHỈNH NÂNG CAO, THANH TRA MÃ QR & 3 BÍ QUYẾT LẤY NÉT -->
+        <details style="margin-top: 8px; font-size: 12px; border: 1px solid rgba(255,255,255,0.08); border-radius: 8px; padding: 6px 10px; background: rgba(15, 23, 42, 0.4);">
+          <summary style="cursor: pointer; color: #60a5fa; font-weight: 600; user-select: none;">
+            ⚙️ Tùy chỉnh camera nâng cao, thanh tra mã QR & bí quyết nét (Nhấn để mở/đóng)
+          </summary>
+          
+          <div style="margin-top: 10px; display: flex; flex-direction: column; gap: 8px;">
+            <!-- Checkbox cài đặt quét -->
+            <div class="stream-controls" style="margin: 0; padding: 6px 0; border: none; flex-wrap: wrap;">
+              <label class="checkbox-label" style="color: #60a5fa; font-weight: 600;">
+                <input type="checkbox" id="auto-scan" checked> 🔄 Quét liên tục
+              </label>
+              <label class="checkbox-label" style="color: #f59e0b; font-weight: 600;">
+                <input type="checkbox" id="stable-scan" checked> 🎯 Chờ ổn định (Chống rung)
+              </label>
+              <label class="checkbox-label">
+                <input type="checkbox" id="flip-v" onchange="updateVideoOrientation()"> ↕️ Lật Dọc
+              </label>
+              <label class="checkbox-label">
+                <input type="checkbox" id="flip-h" onchange="updateVideoOrientation()"> ↔️ Lật Ngang
+              </label>
+            </div>
+
+            <!-- Tần số quét & Tốc độ Camera -->
+            <div style="display: flex; gap: 10px; align-items: center; justify-content: space-between; flex-wrap: wrap; padding: 6px 10px; background: rgba(16, 185, 129, 0.08); border-radius: 6px; border: 1px solid rgba(16, 185, 129, 0.25);">
+              <div style="display: flex; align-items: center; gap: 8px; font-size: 12px;">
+                <span style="color: #34d399; font-weight: 700;">⚡ Tần số quét:</span>
+                <span class="badge badge-live" style="font-size: 11px;">40 lần/s</span>
+                <button class="btn btn-ghost" id="btn-fps-fast" style="padding: 2px 8px; font-size: 11px;" onclick="setCamQualityMode('fast')">Tăng tốc độ (Q18)</button>
+                <button class="btn btn-ghost" id="btn-fps-normal" style="padding: 2px 8px; font-size: 11px; background: rgba(16, 185, 129, 0.25); color: #34d399;" onclick="setCamQualityMode('normal')">Chuẩn nét (Q15)</button>
+              </div>
+            </div>
+
+            <!-- Slider Zoom & Phơi sáng -->
+            <div style="display: flex; gap: 12px; align-items: center; justify-content: space-between; flex-wrap: wrap; padding: 8px 10px; background: #0b1329; border-radius: 6px; border: 1px solid #1e3a8a;">
+              <div style="display: flex; align-items: center; gap: 6px;">
+                <span style="font-size: 11.5px; color: #94a3b8;">Zoom Slider:</span>
+                <input type="range" id="zoom-slider" min="1.0" max="2.5" step="0.1" value="1.0" oninput="setDigitalZoom(parseFloat(this.value))" style="width: 80px; accent-color: #3b82f6; cursor: pointer;">
+                <span id="zoom-slider-val" style="font-size: 11.5px; font-family: monospace; color: #60a5fa; width: 30px;">1.0x</span>
+              </div>
+              <div style="display: flex; align-items: center; gap: 6px;">
+                <label class="checkbox-label" style="color: #38bdf8; font-weight: 600; font-size: 11.5px; margin: 0;">
+                  <input type="checkbox" id="auto-adaptive-light" checked onchange="toggleAdaptiveLight()"> Tự cân sáng
+                </label>
+                <span id="adaptive-light-tag" style="font-size: 10.5px; padding: 1px 6px; border-radius: 4px; background: rgba(56, 189, 248, 0.15); color: #38bdf8;">Tự động</span>
+                <input type="range" id="ae-slider" min="-5" max="3" value="-2" step="1" oninput="changeExposureLevel(this.value)" style="width: 70px; accent-color: #38bdf8; cursor: pointer;">
+                <span id="ae-val" style="font-size: 11.5px; font-family: monospace; color: #38bdf8; width: 18px;">-2</span>
+              </div>
+            </div>
+
+            <!-- Khung hiển thị chi tiết mã QR vừa đọc được (Inspector) -->
+            <div id="scanned-qr-inspector" style="display: none; background: #0b132b; border: 1px solid #3b82f6; border-radius: 8px; padding: 10px 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.4);">
+              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; flex-wrap: wrap; gap: 6px;">
+                <span style="font-size: 12px; font-weight: 700; color: #60a5fa; display: flex; align-items: center; gap: 6px;">
+                  <span>🎯</span> MÃ QR VỪA NHẬN DIỆN THÀNH CÔNG:
+                </span>
+                <div style="display: flex; align-items: center; gap: 6px;">
+                  <span id="qr-format-badge" style="font-size: 10.5px; background: rgba(16,185,129,0.2); color: #34d399; padding: 1px 6px; border-radius: 4px; font-weight: 600;">Mã vé</span>
+                  <span id="qr-char-count" style="font-size: 10.5px; background: rgba(59,130,246,0.2); color: #93c5fd; padding: 1px 5px; border-radius: 4px;">0 ký tự</span>
+                  <button class="btn btn-ghost" style="padding: 1px 6px; font-size: 10.5px;" onclick="copyScannedQr()">📋 Sao chép</button>
+                </div>
+              </div>
+              <div id="raw-scanned-display" style="font-family: 'Consolas', 'Courier New', monospace; font-size: 12px; color: #34d399; background: #020617; padding: 6px 8px; border-radius: 4px; border: 1px solid #1e293b; word-break: break-all; max-height: 70px; overflow-y: auto; user-select: all; line-height: 1.4;">
+                --
+              </div>
+              <div id="qr-inspect-status" style="margin-top: 6px;">
+              </div>
+            </div>
+
+            <!-- Hướng dẫn điều chỉnh độ nét & cự ly quét chuẩn -->
+            <div style="padding: 10px 12px; background: rgba(59,130,246,0.08); border-radius: 6px; border: 1px solid rgba(59,130,246,0.25);">
+              <div style="font-size: 12.5px; font-weight: 700; color: #60a5fa; margin-bottom: 4px;">
+                🎯 3 Bí Quyết Quét Mã QR Sắc Nét Trong 0.1 Giây:
+              </div>
+              <div style="font-size: 11.5px; color: #cbd5e1; line-height: 1.5;">
+                1. <b>Cự ly chuẩn (25cm – 35cm):</b> Đừng dí sát điện thoại vào camera (dưới 15cm sẽ bị cận thị nhòe hình). Giữ cách khoảng 1 gang tay rưỡi!
+                <br>2. <b>Bật Zoom 1.5x:</b> Giúp mã QR to rõ ngay cả khi giữ điện thoại ở xa đúng tầm tiêu cự.
+                <br>3. <b>Nếu muốn quét siêu cận cảnh (10cm):</b> Vặn nhẹ vòng khía đầu camera ngược chiều kim đồng hồ 1/4 vòng để phá keo chống rung nhà máy.
+              </div>
+            </div>
+          </div>
+        </details>
+      </div>
+
+      <!-- Ô THÔNG TIN VÉ (BÊN PHẢI - ĐỨNG NGANG HÀNG TRỰC TIẾP VỚI CAMERA) -->
+      <div id="ticket-info-card" style="display: flex; flex-direction: column; min-width: 0; height: 100%;">
+        <!-- Banner thông báo nhanh -->
+        <div id="alert-box" class="alert"></div>
+
+        <!-- Trạng thái chờ quét (Empty State) -->
+        <div id="ticket-empty-state" class="eh-ticket-empty">
+          <div class="eh-empty-inner">
+            <div class="eh-empty-icon-wrap">
+              <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="color: #60a5fa;">
+                <rect x="3" y="4" width="18" height="16" rx="3"></rect>
+                <line x1="7" y1="8" x2="17" y2="8"></line>
+                <line x1="7" y1="12" x2="12" y2="12"></line>
+                <line x1="7" y1="16" x2="15" y2="16"></line>
+              </svg>
+            </div>
+            <p class="eh-ticket-subtitle">VÉ ĐANG CHỌN</p>
+            <h3 style="font-size: 17px; font-weight: 700; color: #f8fafc; margin-bottom: 8px;">Chưa Có Vé Nào Được Chọn</h3>
+            <p style="font-size: 13px; color: #94a3b8; max-width: 320px; line-height: 1.5; margin: 0 auto;">
+              Hướng mã QR của vé vào khung camera bên trái để nhận diện tự động và hiển thị toàn bộ thông tin đối soát tại đây.
+            </p>
+            <div style="display: flex; gap: 8px; justify-content: center; margin-top: 18px; flex-wrap: wrap;">
+              <button class="eh-btn-secondary" style="width: auto; padding: 7px 18px; font-size: 12px;" onclick="testQrDemo()">
+                🧪 Quét Thử Vé Mẫu (Porsche Đà Nẵng)
+              </button>
+              <button class="eh-btn-secondary" style="width: auto; padding: 7px 14px; font-size: 12px; border-color: rgba(239, 68, 68, 0.4); color: #fca5a5;" onclick="testUsedTicketDemo()">
+                ⚠️ Thử Vé Đã Soát (Đỏ)
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Thông tin chi tiết vé (Đầy đủ 100% như dự án chính EventHub) -->
+        <div id="ticket-detail-view" style="display: none; height: 100%;">
+          <div class="eh-ticket-panel">
+            <div>
+              <!-- Header vé -->
+              <div class="eh-ticket-header">
+                <div>
+                  <p class="eh-ticket-subtitle">VÉ ĐANG CHỌN</p>
+                  <h2 class="eh-ticket-code" id="t-code">EH-ABC04775ED</h2>
+                </div>
+                <span class="eh-status-pill valid" id="t-status-pill">Chưa soát vé</span>
+              </div>
+
+              <!-- Cảnh báo khi vé đã được soát trước đó -->
+              <div id="checkin-warning" style="display: none; background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.35); border-radius: 12px; padding: 10px 14px; margin-bottom: 12px; font-size: 12.5px; color: #fca5a5; line-height: 1.4;">
+                ⚠️ <b>Vé đã được check-in lúc:</b> <span id="warning-time">--</span> bởi <span id="warning-staff">--</span>
+              </div>
+
+              <!-- Danh sách thông tin vé chi tiết (8 hàng khớp chính xác ảnh mẫu) -->
+              <div class="eh-info-list">
+                <div class="eh-info-row">
+                  <span class="eh-info-label">Sự kiện</span>
+                  <span class="eh-info-value" id="t-event">Không gian Trải nghiệm Porsche tại Đà Nẵng</span>
+                </div>
+                <div class="eh-info-row">
+                  <span class="eh-info-label">Người mua</span>
+                  <span class="eh-info-value" id="t-buyer">kkk</span>
+                </div>
+                <div class="eh-info-row">
+                  <span class="eh-info-label">Email</span>
+                  <span class="eh-info-value" id="t-email">khanhbui0205@gmail.com</span>
+                </div>
+                <div class="eh-info-row">
+                  <span class="eh-info-label">Số điện thoại</span>
+                  <span class="eh-info-value" id="t-phone">0912345678</span>
+                </div>
+                <div class="eh-info-row">
+                  <span class="eh-info-label">Hạng vé</span>
+                  <span class="eh-info-value" id="t-type">Khu vực 1</span>
+                </div>
+                <div class="eh-info-row">
+                  <span class="eh-info-label">Ghế ngồi</span>
+                  <span class="eh-info-value" id="t-seat">B14</span>
+                </div>
+                <div class="eh-info-row">
+                  <span class="eh-info-label">Trạng thái vé</span>
+                  <span class="eh-info-value" id="t-status-text">Chưa soát vé</span>
+                </div>
+                <div class="eh-info-row">
+                  <span class="eh-info-label">Thời gian soát vé</span>
+                  <span class="eh-info-value" id="t-checkin-time">Chưa soát vé</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Nhóm nút bấm xác nhận & đổi vé (Mẫu nút vàng portal EventHub) -->
+            <div class="eh-action-group">
+              <button class="eh-btn-primary" id="btn-confirm-checkin" onclick="executeCheckIn()">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"></path>
+                  <circle cx="9" cy="7" r="4"></circle>
+                  <polyline points="16 11 18 13 22 9"></polyline>
+                </svg>
+                <span id="btn-confirm-text">Xác nhận soát vé</span>
+              </button>
+              <button class="eh-btn-secondary" onclick="resetScanState()">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"></path>
+                  <path d="M3 3v5h5"></path>
+                </svg>
+                <span>Quét vé khác</span>
+              </button>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- HÀNG 2: LỊCH SỬ SOÁT VÉ & CÀI ĐẶT HỆ THỐNG / WI-FI -->
+    <div class="bottom-row">
+
+      <!-- Lịch sử soát vé gần đây (Bên trái) -->
+      <div class="card" id="history-card">
+        <div class="card-title">
+          <span>Lịch Sử Soát Vé Vừa Xử Lý</span>
+          <span style="font-size: 12px; color: var(--text-muted);" id="history-count">0 vé</span>
+        </div>
+        <div style="max-height: 280px; overflow-y: auto;">
+          <table class="history-table">
+            <thead>
+              <tr>
+                <th>Thời Gian</th>
+                <th>Người Tham Gia</th>
+                <th>Mã Vé</th>
+                <th>Vị Trí / Hạng</th>
+                <th>Trạng Thái</th>
+              </tr>
+            </thead>
+            <tbody id="history-tbody">
+              <tr>
+                <td colspan="5" style="text-align: center; color: var(--text-muted); padding: 18px;">Chưa có lượt soát vé nào trong phiên này</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Cài đặt Hệ Thống, Wi-Fi & Tài Khoản Staff (Bên phải) -->
+      <div style="display: flex; flex-direction: column; gap: 16px;">
+
+        <!-- Mode Selector Card (Test Offline vs Live Production) -->
+        <div class="card" style="padding: 14px 16px; background: linear-gradient(135deg, #1e293b, #0f172a); border: 1px solid #3b82f6;">
+          <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
+            <div>
+              <div style="font-size: 13px; font-weight: 700; color: #fff; display: flex; align-items: center; gap: 8px;">
+                <span>⚡ CHẾ ĐỘ SOÁT VÉ:</span>
+                <span id="mode-badge" style="font-size: 11px; padding: 3px 10px; border-radius: 9999px; font-weight: 700; background: rgba(245, 158, 11, 0.2); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.4);">
+                  🧪 Test Offline (Xem Vé Tức Thì)
+                </span>
+              </div>
+              <div style="font-size: 11px; color: var(--text-muted); margin-top: 4px;" id="mode-desc">
+                Quét bất kỳ mã QR nào (vé giấy, điện thoại) để xem ngay thông tin vé & test check-in mà không lo lỗi 401.
+              </div>
+            </div>
+            <div style="display: flex; gap: 8px;">
+              <button id="btn-mode-test" class="btn" style="padding: 6px 14px; font-size: 12px; font-weight: 700; background: #d97706; color: #fff; border: 1px solid #f59e0b;" onclick="setOperatingMode('test')">
+                🧪 Test Offline
+              </button>
+              <button id="btn-mode-live" class="btn btn-ghost" style="padding: 6px 14px; font-size: 12px; font-weight: 600;" onclick="setOperatingMode('live')">
+                🌐 Server Thật
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Wi-Fi & Network Diagnostics Card -->
+        <div class="card" style="padding: 12px 16px; background: #0f172a; border: 1px solid var(--card-border);">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+            <span style="font-size: 13px; font-weight: 700; color: #e2e8f0; display: flex; align-items: center; gap: 6px;">
+              <span>📶</span> GIÁM SÁT WI-FI & ĐỘ TRỄ SERVER
+            </span>
+            <button class="btn btn-ghost" style="padding: 2px 8px; font-size: 11px;" onclick="recheckNetwork()">🔄 Đo lại</button>
+          </div>
+
+          <div style="display: grid; grid-template-columns: 1.25fr 1fr; gap: 10px;">
+            <!-- Wi-Fi Status Box -->
+            <div style="background: #1e293b; border-radius: 8px; padding: 8px 12px; border: 1px solid rgba(255,255,255,0.06);">
+              <div style="display: flex; justify-content: space-between; align-items: center;">
+                <span style="font-size: 11px; color: var(--text-muted);">Mạng Wi-Fi:</span>
+                <span id="card-wifi-bars" style="font-size: 13px; font-weight: 700; color: #34d399; letter-spacing: 1px;">--</span>
+              </div>
+              <div style="font-size: 13px; font-weight: 700; color: #fff; margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" id="card-wifi-ssid">
+                Đang dò mạng...
+              </div>
+              <div style="font-size: 11px; color: #94a3b8; margin-top: 2px;" id="card-wifi-signal">
+                Cường độ: --%
+              </div>
+            </div>
+
+            <!-- Server Latency Box -->
+            <div style="background: #1e293b; border-radius: 8px; padding: 8px 12px; border: 1px solid rgba(255,255,255,0.06);">
+              <div style="display: flex; justify-content: space-between; align-items: center;">
+                <span style="font-size: 11px; color: var(--text-muted);">Độ trễ Server:</span>
+                <span id="card-latency-dot" style="width: 8px; height: 8px; border-radius: 50%; background: #34d399; display: inline-block;"></span>
+              </div>
+              <div style="font-size: 16px; font-weight: 800; color: #34d399; margin-top: 1px;" id="card-latency-ms">
+                -- ms
+              </div>
+              <div style="font-size: 11px; color: #94a3b8;" id="card-latency-status">
+                api.eventhub.id.vn
+              </div>
+            </div>
+          </div>
+
+          <!-- Cảnh báo khi mạng yếu / mất Wi-Fi -->
+          <div id="network-warning-box" style="display: none; margin-top: 8px; padding: 8px 10px; background: rgba(245, 158, 11, 0.15); border: 1px solid rgba(245, 158, 11, 0.4); border-radius: 6px; font-size: 11px; color: #fbbf24; line-height: 1.4;">
+            ⚠️ <b>Khuyến nghị:</b> Wi-Fi tại địa điểm đang chập chờn hoặc chưa kết nối. Bạn nên bật <b>[🧪 Test Offline]</b> ở trên để soát vé liên tục không bị phụ thuộc vào mạng internet!
+          </div>
+        </div>
+
+        <!-- CẤU HÌNH LUỒNG ĐỐI SOÁT & WI-FI ESP32 CARD -->
+        <div class="card" style="padding: 14px 16px; background: #131d31; border: 1px solid #1e3a5f;">
+          <div class="card-title" style="margin-bottom: 10px;">
+            <span style="font-size: 13px; font-weight: 700; color: #93c5fd; display: flex; align-items: center; gap: 6px;">
+              <span>📡</span> CHẾ ĐỘ HOẠT ĐỘNG & WI-FI ESP32-S3
+            </span>
+            <span id="badge-esp-mode" class="badge" style="background: rgba(59, 130, 246, 0.2); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.4);">
+              USB Cắm Dây
+            </span>
+          </div>
+
+          <!-- 1. Bộ chọn Luồng Gửi Request (PC vs ESP32) -->
+          <div style="margin-bottom: 12px; background: #0b1120; padding: 10px 12px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.06);">
+            <div style="font-size: 11px; color: #94a3b8; margin-bottom: 6px; font-weight: 600; text-transform: uppercase;">
+              Đường truyền gửi đối soát vé (Khi cắm USB):
+            </div>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
+              <button id="btn-route-pc" class="btn btn-primary" style="padding: 8px; font-size: 12px; font-weight: 600; justify-content: center;" onclick="setRequestRoute('pc')">
+                🌐 Mạng Máy Tính (PC)
+              </button>
+              <button id="btn-route-esp32" class="btn btn-ghost" style="padding: 8px; font-size: 12px; font-weight: 600; justify-content: center;" onclick="setRequestRoute('esp32')">
+                📡 Wi-Fi ESP32-S3
+              </button>
+            </div>
+            <div id="route-desc" style="font-size: 11px; color: #60a5fa; margin-top: 6px;">
+              ✓ Mặc định: Máy tính gửi request đối soát tới EventHub và điều khiển còi bíp ESP32 qua cáp USB.
+            </div>
+          </div>
+
+          <!-- 2. Trạng thái Wi-Fi ESP32 -->
+          <div style="display: grid; grid-template-columns: 1.15fr 1fr; gap: 10px; margin-bottom: 12px;">
+            <!-- Khối 1: Tình trạng kết nối & SSID & IP -->
+            <div style="background: #0f172a; padding: 10px 12px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.06);">
+              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+                <span style="font-size: 11px; color: #94a3b8;">Tình trạng Wi-Fi ESP32:</span>
+                <span id="esp-card-status-badge" style="font-size: 10.5px; font-weight: 700; padding: 2px 7px; border-radius: 4px; background: rgba(239,68,68,0.2); color: #f87171;">Chưa kết nối</span>
+              </div>
+              <div id="esp-wifi-status-text" style="font-size: 13.5px; font-weight: 700; color: #cbd5e1; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+                Chưa kết nối Wi-Fi
+              </div>
+              <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 6px; font-size: 11px;">
+                <span id="esp-wifi-ip" style="color: #64748b; font-family: monospace;">IP: 0.0.0.0</span>
+                <a id="esp-standalone-link" href="#" target="_blank" style="display: none; color: #38bdf8; text-decoration: none; font-weight: 600;">
+                  🔗 Mở Web ESP32 &rarr;
+                </a>
+              </div>
+            </div>
+
+            <!-- Khối 2: Cường độ sóng & Độ trễ mạng (Ping) -->
+            <div style="background: #0f172a; padding: 10px 12px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.06); display: flex; flex-direction: column; justify-content: space-between;">
+              <div>
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                  <span style="font-size: 11px; color: #94a3b8;">Cường độ sóng:</span>
+                  <span id="esp-card-bars" style="font-size: 12px; font-weight: 700; color: #38bdf8; letter-spacing: 1px;">░░░░</span>
+                </div>
+                <div id="esp-card-signal-val" style="font-size: 12px; font-weight: 600; color: #38bdf8; margin-top: 2px;">
+                  Chưa có tín hiệu
+                </div>
+              </div>
+              <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 6px; font-size: 11px; border-top: 1px solid rgba(255,255,255,0.05); padding-top: 4px;">
+                <span style="color: #94a3b8;">Độ trễ mạng:</span>
+                <span id="esp-card-latency-val" style="font-weight: 700; color: #34d399;">--</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- 3. Form Cài Đặt & Quét Wi-Fi Cho ESP32 -->
+          <div style="background: #0f172a; border-radius: 8px; padding: 12px; border: 1px solid rgba(255,255,255,0.08);">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+              <span style="font-size: 11.5px; font-weight: 700; color: #93c5fd; text-transform: uppercase; display: flex; align-items: center; gap: 6px;">
+                <span>📶</span> Cài Đặt & Quét Wi-Fi Cho ESP32
+              </span>
+              <div style="display: flex; align-items: center; gap: 6px;">
+                <span id="wifi-scan-status" style="font-size: 11px; color: #38bdf8; display: none;"></span>
+                <button id="btn-scan-wifi" class="btn btn-ghost" style="padding: 3px 8px; font-size: 11px; font-weight: 600; color: #38bdf8;" onclick="scanNearbyWifi(true)">
+                  🔄 Quét Wi-Fi
+                </button>
+              </div>
+            </div>
+
+            <!-- Khối hiển thị mạng Wi-Fi xung quanh dạng danh sách thẻ trực quan -->
+            <div style="margin-bottom: 10px;">
+              <label style="font-size: 11px; color: #94a3b8; display: block; margin-bottom: 4px; font-weight: 600;">
+                Mạng Wi-Fi xung quanh tìm thấy (Bấm vào mạng để tự điền):
+              </label>
+
+              <!-- Danh sách thẻ Wi-Fi trực quan (Bấm vào thẻ là tự điền SSID) -->
+              <div id="wifi-cards-container" style="display: flex; flex-direction: column; gap: 6px; max-height: 165px; overflow-y: auto; padding: 4px; background: #070d19; border: 1px solid rgba(255,255,255,0.08); border-radius: 8px;">
+                <div style="text-align: center; color: #64748b; font-size: 11.5px; padding: 12px 6px;">
+                  ⏳ Đang tìm kiếm các mạng Wi-Fi khả dụng xung quanh...
+                </div>
+              </div>
+
+              <!-- Dropdown dự phòng -->
+              <div style="margin-top: 6px; display: flex; align-items: center; gap: 6px;">
+                <span style="font-size: 11px; color: #64748b; white-space: nowrap;">Hoặc menu:</span>
+                <select id="esp-wifi-select" class="form-input" style="flex: 1; font-size: 11.5px; padding: 4px 8px; background: #1e293b; color: #cbd5e1; border: 1px solid #334155; border-radius: 6px; cursor: pointer;" onchange="onSelectWifi(this.value)">
+                  <option value="">-- Danh sách Wi-Fi --</option>
+                </select>
+              </div>
+            </div>
+
+            <!-- Form Nhập Tên Wi-Fi & Mật khẩu -->
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 8px;">
+              <div>
+                <label style="font-size: 10.5px; color: #64748b; display: block; margin-bottom: 2px;">Tên Wi-Fi (SSID):</label>
+                <input type="text" id="esp-input-ssid" class="form-input" placeholder="Tên Wi-Fi (SSID)" style="font-size: 12px; padding: 6px 10px; width: 100%;">
+              </div>
+              <div>
+                <label style="font-size: 10.5px; color: #64748b; display: block; margin-bottom: 2px;">Mật khẩu Wi-Fi:</label>
+                <div style="position: relative;">
+                  <input type="password" id="esp-input-pass" class="form-input" placeholder="Mật khẩu" style="font-size: 12px; padding: 6px 28px 6px 10px; width: 100%;">
+                  <button type="button" onclick="toggleWifiPassVisibility()" style="position: absolute; right: 6px; top: 50%; transform: translateY(-50%); background: none; border: none; cursor: pointer; color: #94a3b8; font-size: 13px;" title="Hiện/ẩn mật khẩu">👁️</button>
+                </div>
+              </div>
+            </div>
+
+            <button id="btn-save-esp-wifi" class="btn btn-primary" style="width: 100%; font-size: 12.5px; padding: 8px 12px; justify-content: center; font-weight: 700;" onclick="saveEspWifiConfig()">
+              💾 Lưu & Kết Nối Wi-Fi Cho ESP32
+            </button>
+
+            <!-- Hộp Thông Báo Kết Quả Kết Nối (Thành công / Sai mật khẩu / Lỗi) -->
+            <div id="esp-wifi-msg" style="margin-top: 8px; padding: 10px 12px; border-radius: 6px; font-size: 12px; line-height: 1.5; display: none;"></div>
+          </div>
+
+          <div style="margin-top: 8px; font-size: 11px; color: #94a3b8; line-height: 1.4;">
+            💡 <i><b>Cách dùng độc lập:</b> Bạn chỉ cần nhập Wi-Fi một lần. Sau đó rút cáp USB cắm vào sạc dự phòng, ESP32 sẽ tự bắt Wi-Fi, chạy web stream tại địa chỉ IP của nó và tự đối soát vé.</i>
+          </div>
+        </div>
+
+        <!-- Staff Auth Card -->
+        <div class="card" id="staff-auth-card">
+          <div class="card-title">
+            <span>Tài Khoản Nhân Sự (Staff Auth)</span>
+            <button class="btn btn-ghost" style="padding: 4px 8px; font-size: 11px;" onclick="toggleConfig()">Cài đặt API</button>
+          </div>
+
+          <!-- API Settings (Ẩn mặc định) -->
+          <div id="api-config" style="display: none; margin-bottom: 14px; padding: 12px; background: #0f172a; border-radius: 8px;">
+            <div class="form-group">
+              <label>Backend API Base URL:</label>
+              <input type="text" id="api-base-url" class="form-input" value="https://api.eventhub.id.vn/api">
+            </div>
+            <div style="display: flex; gap: 8px; margin-bottom: 8px;">
+              <button class="btn btn-ghost" style="font-size: 11px;" onclick="setApiUrl('https://api.eventhub.id.vn/api')">Production</button>
+              <button class="btn btn-ghost" style="font-size: 11px;" onclick="setApiUrl('http://localhost:3000/api')">Localhost:3000</button>
+            </div>
+            <label class="checkbox-label" style="color: #fbbf24; font-size: 12px;">
+              <input type="checkbox" id="mock-api-toggle"> Bật chế độ Test Offline (Tự động giả lập dữ liệu vé khi server Cloudflare 502)
+            </label>
+          </div>
+
+          <div id="login-section">
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+              <div class="form-group">
+                <label>Email Staff:</label>
+                <input type="email" id="staff-email" class="form-input" placeholder="staff@eventhub.com">
+              </div>
+              <div class="form-group">
+                <label>Mật khẩu:</label>
+                <input type="password" id="staff-password" class="form-input" placeholder="••••••••">
+              </div>
+            </div>
+            <div style="display: flex; gap: 10px; align-items: center; margin-top: 4px;">
+              <button class="btn btn-primary" onclick="handleStaffLogin()" id="btn-login">Đăng Nhập Staff</button>
+              <span style="font-size: 12px; color: var(--text-muted);">Hoặc dán Token trực tiếp:</span>
+            </div>
+
+            <!-- Khung nhập OTP khi tài khoản có 2FA -->
+            <div id="otp-section" style="display: none; margin-top: 12px; padding: 12px; background: #0f172a; border-radius: 8px; border: 1px solid #3b82f6;">
+              <div style="font-size: 13px; font-weight: 600; color: #60a5fa; margin-bottom: 6px;">🔐 Nhập mã OTP xác thực (2FA)</div>
+              <div style="font-size: 12px; color: var(--text-muted); margin-bottom: 8px;">Mã OTP đã được gửi về email của bạn. Vui lòng nhập mã 6 số:</div>
+              <div style="display: flex; gap: 8px;">
+                <input type="text" id="staff-otp" class="form-input" placeholder="VD: 123456" maxlength="6" style="font-size: 16px; letter-spacing: 0.2em; text-align: center; width: 140px;">
+                <button class="btn btn-primary" onclick="handleVerifyOtp()" id="btn-verify-otp">Xác Nhận OTP</button>
+                <button class="btn btn-ghost" onclick="cancelOtp()">Hủy</button>
+              </div>
+            </div>
+
+            <div style="margin-top: 10px;">
+              <input type="text" id="manual-token" class="form-input" placeholder="Dán Bearer JWT token vào đây nếu đã đăng nhập trên web..." onchange="handleManualToken()">
+            </div>
+          </div>
+
+          <div id="logged-section" style="display: none;">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+              <div>
+                <div style="font-size: 14px; font-weight: 700; color: #fff;" id="logged-name">Nhân viên EventHub</div>
+                <div style="font-size: 12px; color: var(--text-muted);" id="logged-email">staff@eventhub.com</div>
+              </div>
+              <button class="btn btn-danger" style="padding: 6px 12px; font-size: 12px;" onclick="handleLogout()">Đăng Xuất</button>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // State
+    let staffToken = localStorage.getItem('eventhub_staff_token') || '';
+    let staffUser = JSON.parse(localStorage.getItem('eventhub_staff_user') || 'null');
+    let currentTicket = null;
+    let currentQrRaw = '';
+    let isVerifying = false;
+    let isCheckingIn = false;
+    let checkinHistory = [];
+    let lastScannedCode = '';
+    let lastScannedTime = 0;
+    let autoConfirmTimer = null;
+    let recentlyConfirmedQr = '';
+    let recentlyConfirmedAt = 0;
+
+    // Dedicated QR Code Reader (Chuẩn tương tự @zxing/browser trên dự án web EventHub)
+    const decodeHints = new Map();
+    decodeHints.set(ZXing.DecodeHintType.TRY_HARDER, true);
+    decodeHints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [ZXing.BarcodeFormat.QR_CODE]);
+    decodeHints.set(ZXing.DecodeHintType.CHARACTER_SET, 'UTF-8');
+    const qrReader = new ZXing.QRCodeReader();
+
+    // Init
+    window.addEventListener('DOMContentLoaded', () => {
+      initAuthStatus();
+      updateOperatingModeUI();
+      initVideoOrientation();
+      startQrScanningLoop();
+      pollStatus();
+
+      // Keyboard Shortcut: Space / Enter to Check-in, Escape to Reset/Scan Next
+      window.addEventListener('keydown', (e) => {
+        if ((e.code === 'Space' || e.code === 'Enter') && currentTicket && !isCheckingIn) {
+          const btn = document.getElementById('btn-confirm-checkin');
+          if (btn && !btn.classList.contains('btn-disabled')) {
+            e.preventDefault();
+            executeCheckIn();
+          }
+        }
+        if (e.code === 'Escape') {
+          e.preventDefault();
+          resetScanState();
+        }
+      });
+    });
+
+    function toggleConfig() {
+      const el = document.getElementById('api-config');
+      el.style.display = el.style.display === 'none' ? 'block' : 'none';
+    }
+
+    function setApiUrl(url) {
+      document.getElementById('api-base-url').value = url;
+    }
+
+    function getApiBaseUrl() {
+      let inputEl = document.getElementById('api-base-url');
+      let url = (inputEl ? inputEl.value : '').trim().replace(/\/+$/, '');
+      if (!url) url = 'https://api.eventhub.id.vn/api';
+      if (url.includes('/api/')) {
+        url = url.split('/api/')[0] + '/api';
+      }
+      if (url.includes('eventhub.id.vn') && !url.includes('api.eventhub.id.vn')) {
+        url = url.replace('eventhub.id.vn', 'api.eventhub.id.vn');
+      }
+      if (!url.endsWith('/api') && !url.includes('localhost') && !url.includes(':3000')) {
+        url += '/api';
+      } else if (url.includes(':3000') && !url.endsWith('/api')) {
+        url += '/api';
+      }
+      if (inputEl && inputEl.value !== url) inputEl.value = url;
+      return url;
+    }
+
+    function initAuthStatus() {
+      if (staffToken) {
+        document.getElementById('login-section').style.display = 'none';
+        document.getElementById('logged-section').style.display = 'block';
+
+        let roles = [];
+        if (staffUser && Array.isArray(staffUser.roles)) {
+          roles = staffUser.roles.map(r => String(r).toUpperCase());
+        }
+        const isStaff = roles.includes('STAFF');
+        const roleLabel = roles.length > 0 ? roles.join(', ') : (isStaff ? 'STAFF' : 'USER');
+        const displayName = staffUser?.name || staffUser?.full_name || 'Nhân sự EventHub';
+
+        const badge = document.getElementById('staff-badge');
+        if (badge) {
+          if (isStaff) {
+            badge.innerText = `✓ ${displayName} (${roleLabel})`;
+            badge.style.background = 'rgba(16, 185, 129, 0.2)';
+            badge.style.color = '#34d399';
+            badge.style.border = '1px solid rgba(16, 185, 129, 0.4)';
+          } else {
+            badge.innerText = `⚠️ ${displayName} (${roleLabel} - Chưa có quyền STAFF)`;
+            badge.style.background = 'rgba(245, 158, 11, 0.2)';
+            badge.style.color = '#fbbf24';
+            badge.style.border = '1px solid rgba(245, 158, 11, 0.4)';
+          }
+        }
+        if (staffUser) {
+          document.getElementById('logged-name').innerText = displayName + (isStaff ? ' [STAFF CHÍNH THỨC]' : ' [CHƯA CÓ QUYỀN STAFF]');
+          document.getElementById('logged-email').innerText = (staffUser.email || '') + ` • Vai trò: ${roleLabel}`;
+        }
+      } else {
+        document.getElementById('login-section').style.display = 'block';
+        document.getElementById('logged-section').style.display = 'none';
+        const badge = document.getElementById('staff-badge');
+        if (badge) {
+          badge.innerText = 'Chưa đăng nhập';
+          badge.style.background = '#334155';
+          badge.style.color = '#cbd5e1';
+          badge.style.border = 'none';
+        }
+      }
+    }
+
+    let currentChallengeId = '';
+
+    async function handleStaffLogin() {
+      const email = document.getElementById('staff-email').value.trim();
+      const password = document.getElementById('staff-password').value;
+      const apiBase = getApiBaseUrl();
+
+      if (!email || !password) {
+        showAlert('Vui lòng nhập email và mật khẩu.', 'error');
+        return;
+      }
+
+      const btn = document.getElementById('btn-login');
+      btn.innerText = 'Đang đăng nhập...';
+      btn.classList.add('btn-disabled');
+
+      try {
+        const res = await fetch('/api/proxy/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email, password, apiBase })
+        });
+        const data = await res.json();
+        console.log('[Login Response]', res.status, data);
+
+        if (res.ok && data.success) {
+          if (data.data?.requiresTwoFactor && data.data?.challengeId) {
+            currentChallengeId = data.data.challengeId;
+            document.getElementById('otp-section').style.display = 'block';
+            document.getElementById('staff-otp').focus();
+            showAlert('Tài khoản yêu cầu OTP 2FA. Đã gửi mã OTP đến email ' + (data.data.email || email), 'success');
+          } else if (data.data?.accessToken) {
+            staffToken = data.data.accessToken;
+            staffUser = data.data.user;
+            localStorage.setItem('eventhub_staff_token', staffToken);
+            localStorage.setItem('eventhub_staff_user', JSON.stringify(staffUser));
+            document.getElementById('otp-section').style.display = 'none';
+            initAuthStatus();
+            syncStaffTokenToEsp32(staffToken);
+
+            const roles = Array.isArray(staffUser?.roles) ? staffUser.roles.map(r => String(r).toUpperCase()) : [];
+            if (!roles.includes('STAFF')) {
+              showAlert('⚠️ Đăng nhập thành công với vai trò (' + roles.join(', ') + '), nhưng chưa có quyền STAFF trên EventHub!', 'error');
+            } else {
+              showAlert('Đăng nhập thành công! Chào mừng Staff ' + (staffUser?.name || staffUser?.full_name || ''), 'success');
+            }
+          } else {
+            showAlert(data.message || 'Không nhận được mã truy cập.', 'error');
+          }
+        } else {
+          if (res.status === 401) {
+            showAlert('❌ Email hoặc mật khẩu Staff không chính xác (401). Vui lòng kiểm tra lại!', 'error');
+          } else if (res.status === 504) {
+            showAlert('⚠️ Mạng bị quá thời gian / Timeout (504). Hãy kiểm tra tín hiệu Wi-Fi hoặc dùng [🧪 Test Offline] để soát vé ngay.', 'error');
+          } else {
+            showAlert(data.message || 'Đăng nhập thất bại. Kiểm tra lại email/mật khẩu hoặc API URL.', 'error');
+          }
+        }
+      } catch (err) {
+        showAlert('⚠️ Lỗi kết nối mạng: ' + err.message + '. Hãy kiểm tra lại kết nối Wi-Fi hoặc dùng Test Offline.', 'error');
+      } finally {
+        btn.innerText = 'Đăng Nhập Staff';
+        btn.classList.remove('btn-disabled');
+      }
+    }
+
+    async function handleVerifyOtp() {
+      const otp = document.getElementById('staff-otp').value.trim();
+      const apiBase = getApiBaseUrl();
+
+      if (!otp || !currentChallengeId) {
+        showAlert('Vui lòng nhập mã OTP 6 số.', 'error');
+        return;
+      }
+
+      const btn = document.getElementById('btn-verify-otp');
+      btn.innerText = 'Đang kiểm tra...';
+      btn.classList.add('btn-disabled');
+
+      try {
+        const res = await fetch('/api/proxy/verify-login-otp', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ challengeId: currentChallengeId, otp, apiBase })
+        });
+        const data = await res.json();
+        console.log('[OTP Response]', res.status, data);
+
+        if (res.ok && data.success && data.data?.accessToken) {
+          staffToken = data.data.accessToken;
+          staffUser = data.data.user;
+          localStorage.setItem('eventhub_staff_token', staffToken);
+          localStorage.setItem('eventhub_staff_user', JSON.stringify(staffUser));
+          document.getElementById('otp-section').style.display = 'none';
+          initAuthStatus();
+          syncStaffTokenToEsp32(staffToken);
+          showAlert('Xác thực OTP thành công! Đã đăng nhập.', 'success');
+        } else {
+          showAlert(data.message || 'Mã OTP không chính xác hoặc đã hết hạn.', 'error');
+        }
+      } catch (err) {
+        showAlert('Lỗi kết nối OTP: ' + err.message, 'error');
+      } finally {
+        btn.innerText = 'Xác Nhận OTP';
+        btn.classList.remove('btn-disabled');
+      }
+    }
+
+    function cancelOtp() {
+      currentChallengeId = '';
+      document.getElementById('otp-section').style.display = 'none';
+      document.getElementById('staff-otp').value = '';
+    }
+
+    async function handleManualToken() {
+      let token = document.getElementById('manual-token').value.trim();
+      if (!token) return;
+
+      if (token.toLowerCase().startsWith('bearer ')) {
+        token = token.slice(7).trim();
+      }
+
+      staffToken = token;
+      localStorage.setItem('eventhub_staff_token', staffToken);
+
+      try {
+        const apiBase = getApiBaseUrl();
+        const res = await fetch('/api/proxy/profile', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + staffToken
+          },
+          body: JSON.stringify({ apiBase })
+        });
+        const data = await res.json();
+        if (res.ok && data.success && data.data) {
+          staffUser = data.data;
+          localStorage.setItem('eventhub_staff_user', JSON.stringify(staffUser));
+        }
+      } catch(e) {}
+
+      initAuthStatus();
+      syncStaffTokenToEsp32(staffToken);
+      showAlert('Đã lưu Token thành công!', 'success');
+    }
+
+    function handleLogout() {
+      staffToken = '';
+      staffUser = null;
+      localStorage.removeItem('eventhub_staff_token');
+      localStorage.removeItem('eventhub_staff_user');
+      initAuthStatus();
+      syncStaffTokenToEsp32('');
+      showAlert('Đã đăng xuất.', 'success');
+    }
+
+    // Camera Tuning functions
+    let camSettingsTimer = null;
+    function updateCamParam(name, val) {
+      val = parseInt(val);
+      if (name === 'ae') document.getElementById('val-ae').innerText = (val > 0 ? '+' : '') + val;
+      if (name === 'contrast') document.getElementById('val-contrast').innerText = (val > 0 ? '+' : '') + val;
+      if (name === 'sharpness') document.getElementById('val-sharp').innerText = (val > 0 ? '+' : '') + val;
+      if (name === 'brightness') document.getElementById('val-bright').innerText = (val > 0 ? '+' : '') + val;
+
+      clearTimeout(camSettingsTimer);
+      camSettingsTimer = setTimeout(() => {
+        fetch('/api/cam-settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ [name]: val })
+        }).catch(() => {});
+      }, 100);
+    }
+
+    function applyCamPreset(preset) {
+      if (preset === 'phone') {
+        document.getElementById('slider-ae').value = -2;
+        document.getElementById('slider-contrast').value = 2;
+        document.getElementById('slider-sharp').value = 2;
+        document.getElementById('slider-bright').value = 0;
+        document.getElementById('val-ae').innerText = '-2';
+        document.getElementById('val-contrast').innerText = '+2';
+        document.getElementById('val-sharp').innerText = '+2';
+        document.getElementById('val-bright').innerText = '0';
+        fetch('/api/cam-settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ae: -2, contrast: 2, sharpness: 2, brightness: 0 })
+        }).catch(() => {});
+        showAlert('Đã bật chế độ Quét Màn hình ĐT (Chống lóa/chói sáng)', 'success');
+      } else if (preset === 'paper') {
+        document.getElementById('slider-ae').value = 0;
+        document.getElementById('slider-contrast').value = 1;
+        document.getElementById('slider-sharp').value = 1;
+        document.getElementById('slider-bright').value = 0;
+        document.getElementById('val-ae').innerText = '0';
+        document.getElementById('val-contrast').innerText = '+1';
+        document.getElementById('val-sharp').innerText = '+1';
+        document.getElementById('val-bright').innerText = '0';
+        fetch('/api/cam-settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ae: 0, contrast: 1, sharpness: 1, brightness: 0 })
+        }).catch(() => {});
+        showAlert('Đã bật chế độ Quét Vé Giấy tiêu chuẩn', 'success');
+      }
+    }
+
+    function triggerAutoFocus() {
+      fetch('/api/cam-settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ af: true })
+      }).then(() => {
+        showAlert('Đã gửi lệnh kích hoạt Lấy nét (Auto-Focus)', 'success');
+      }).catch(() => {});
+    }
+
+    let currentZoom = 1.0;
+    let clientDimFactor = 0.85;
+
+    function applyPhoneGlarePreset() {
+      document.getElementById('ae-slider').value = -3;
+      document.getElementById('ae-val').innerText = '-3';
+      document.getElementById('btn-mode-phone').style.background = '#2563eb';
+      document.getElementById('btn-mode-paper').style.background = '';
+      clientDimFactor = 0.8;
+      fetch('/api/cam-settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ae: -3, contrast: 0, brightness: 0, sharpness: 0 })
+      }).catch(() => {});
+      showAlert('📱 Đã bật Chế Độ Điện Thoại: Cân bằng sáng & chống lóa màn hình 100%', 'success');
+    }
+
+    function applyPaperTicketPreset() {
+      document.getElementById('ae-slider').value = 0;
+      document.getElementById('ae-val').innerText = '0';
+      document.getElementById('btn-mode-paper').style.background = 'rgba(59,130,246,0.25)';
+      document.getElementById('btn-mode-phone').style.background = '';
+      clientDimFactor = 1.0;
+      fetch('/api/cam-settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ae: 0, contrast: 0, brightness: 0, sharpness: 0 })
+      }).catch(() => {});
+      showAlert('📄 Đã chuyển sang Chế Độ Vé Giấy: Độ sáng phòng chuẩn', 'success');
+    }
+
+    let aeDebounceTimer = null;
+    function changeExposureLevel(val) {
+      val = parseInt(val);
+      document.getElementById('ae-val').innerText = (val > 0 ? '+' : '') + val;
+      clientDimFactor = Math.max(0.7, 1.0 + (val * 0.07));
+      clearTimeout(aeDebounceTimer);
+      aeDebounceTimer = setTimeout(() => {
+        fetch('/api/cam-settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ae: val })
+        }).catch(() => {});
+      }, 100);
+    }
+
+    let autoAdaptiveLightEnabled = true;
+    let currentAdaptiveState = 'neutral';
+    let lastAdaptiveCheckTime = 0;
+
+    function toggleAdaptiveLight() {
+      autoAdaptiveLightEnabled = document.getElementById('auto-adaptive-light').checked;
+      const tag = document.getElementById('adaptive-light-tag');
+      if (!autoAdaptiveLightEnabled) {
+        if (tag) {
+          tag.innerText = 'Đã tắt tự cân sáng';
+          tag.style.color = '#94a3b8';
+          tag.style.borderColor = 'rgba(148, 163, 184, 0.3)';
+        }
+      } else {
+        currentAdaptiveState = '';
+        if (tag) {
+          tag.innerText = 'Đang tự cân sáng...';
+          tag.style.color = '#38bdf8';
+          tag.style.borderColor = 'rgba(56, 189, 248, 0.4)';
+        }
+      }
+    }
+
+    function setCamQualityMode(mode) {
+      const q = (mode === 'fast') ? 18 : 15;
+      const btnFast = document.getElementById('btn-fps-fast');
+      const btnNormal = document.getElementById('btn-fps-normal');
+      if (mode === 'fast') {
+        if (btnFast) {
+          btnFast.style.background = 'rgba(16, 185, 129, 0.25)';
+          btnFast.style.color = '#34d399';
+        }
+        if (btnNormal) {
+          btnNormal.style.background = '';
+          btnNormal.style.color = '';
+        }
+        showAlert('⚡ Đã bật Chế độ Tăng Tốc Độ (Q18): Giảm dung lượng ảnh, tăng tần số khung hình', 'success');
+      } else {
+        if (btnNormal) {
+          btnNormal.style.background = 'rgba(16, 185, 129, 0.25)';
+          btnNormal.style.color = '#34d399';
+        }
+        if (btnFast) {
+          btnFast.style.background = '';
+          btnFast.style.color = '';
+        }
+        showAlert('📷 Đã chuyển Chế độ Chuẩn Nét (Q15): Giữ nét chi tiết tối đa', 'success');
+      }
+      fetch('/api/cam-settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ quality: q })
+      }).catch(() => {});
+    }
+
+    function checkAdaptiveExposure(ctx, w, h) {
+      if (!autoAdaptiveLightEnabled) return;
+      const now = Date.now();
+      if (now - lastAdaptiveCheckTime < 280) return;
+      lastAdaptiveCheckTime = now;
+
+      try {
+        const cw = Math.floor(w * 0.45);
+        const ch = Math.floor(h * 0.45);
+        const cx = Math.floor((w - cw) / 2);
+        const cy = Math.floor((h - ch) / 2);
+        const imgData = ctx.getImageData(cx, cy, cw, ch);
+        const d = imgData.data;
+
+        let sumLuma = 0;
+        let whiteGlareCount = 0;
+        const totalSampled = Math.floor(d.length / 64);
+        if (totalSampled <= 0) return;
+
+        for (let i = 0; i < d.length; i += 64) {
+          const luma = 0.299 * d[i] + 0.587 * d[i+1] + 0.114 * d[i+2];
+          sumLuma += luma;
+          if (luma > 232) whiteGlareCount++;
+        }
+
+        const avgLuma = sumLuma / totalSampled;
+        const glarePercent = (whiteGlareCount / totalSampled) * 100;
+        const tag = document.getElementById('adaptive-light-tag');
+
+        // Phát hiện màn hình điện thoại phát sáng chói
+        if (glarePercent > 10 || avgLuma > 165) {
+          if (currentAdaptiveState !== 'glare') {
+            currentAdaptiveState = 'glare';
+            clientDimFactor = 0.75;
+            document.getElementById('ae-slider').value = -3;
+            document.getElementById('ae-val').innerText = '-3';
+            fetch('/api/cam-settings', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ ae: -3 })
+            }).catch(() => {});
+            if (tag) {
+              tag.innerText = '📱 ĐT phát sáng → Chống lóa (-3)';
+              tag.style.color = '#38bdf8';
+              tag.style.borderColor = 'rgba(56, 189, 248, 0.4)';
+            }
+          }
+        } else if (avgLuma >= 60 && avgLuma <= 145 && glarePercent < 4) {
+          // Ánh sáng phòng / Vé giấy bình thường
+          if (currentAdaptiveState !== 'normal') {
+            currentAdaptiveState = 'normal';
+            clientDimFactor = 0.95;
+            document.getElementById('ae-slider').value = -1;
+            document.getElementById('ae-val').innerText = '-1';
+            fetch('/api/cam-settings', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ ae: -1 })
+            }).catch(() => {});
+            if (tag) {
+              tag.innerText = '💡 Ánh sáng phòng / Vé giấy (-1)';
+              tag.style.color = '#34d399';
+              tag.style.borderColor = 'rgba(52, 211, 153, 0.4)';
+            }
+          }
+        } else if (avgLuma < 55) {
+          // Môi trường tối
+          if (currentAdaptiveState !== 'dark') {
+            currentAdaptiveState = 'dark';
+            clientDimFactor = 1.0;
+            document.getElementById('ae-slider').value = 1;
+            document.getElementById('ae-val').innerText = '+1';
+            fetch('/api/cam-settings', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ ae: 1 })
+            }).catch(() => {});
+            if (tag) {
+              tag.innerText = '🌙 Phòng tối → Bù sáng (+1)';
+              tag.style.color = '#f59e0b';
+              tag.style.borderColor = 'rgba(245, 158, 11, 0.4)';
+            }
+          }
+        }
+      } catch (err) {}
+    }
+
+    function setDigitalZoom(zoom) {
+      currentZoom = Math.round(zoom * 10) / 10;
+      const slider = document.getElementById('zoom-slider');
+      if (slider) slider.value = currentZoom;
+      const sliderVal = document.getElementById('zoom-slider-val');
+      if (sliderVal) sliderVal.innerText = currentZoom.toFixed(1) + 'x';
+      const tag = document.getElementById('stream-zoom-tag');
+      if (tag) tag.innerText = 'Zoom: ' + currentZoom.toFixed(1) + 'x';
+
+      ['zoom-1', 'zoom-15', 'zoom-2'].forEach(id => {
+        const btn = document.getElementById(id);
+        if (btn) {
+          btn.style.background = '';
+          btn.style.color = '';
+        }
+      });
+      if (currentZoom === 1.0) {
+        document.getElementById('zoom-1')?.style.setProperty('background', 'rgba(59,130,246,0.25)');
+        document.getElementById('zoom-1')?.style.setProperty('color', '#60a5fa');
+      } else if (currentZoom === 1.5) {
+        document.getElementById('zoom-15')?.style.setProperty('background', 'rgba(59,130,246,0.25)');
+        document.getElementById('zoom-15')?.style.setProperty('color', '#60a5fa');
+      } else if (currentZoom === 2.0) {
+        document.getElementById('zoom-2')?.style.setProperty('background', 'rgba(59,130,246,0.25)');
+        document.getElementById('zoom-2')?.style.setProperty('color', '#60a5fa');
+      }
+      updateVideoOrientation();
+    }
+
+    function updateVideoOrientation() {
+      const flipV = document.getElementById('flip-v').checked;
+      const flipH = document.getElementById('flip-h').checked;
+      const scaleX = (flipH ? -1 : 1) * currentZoom;
+      const scaleY = (flipV ? -1 : 1) * currentZoom;
+      const img = document.getElementById('stream-img');
+      if (img) {
+        img.style.transform = `scale(${scaleX}, ${scaleY})`;
+      }
+      localStorage.setItem('cam_flip_v_v2', flipV ? '1' : '0');
+      localStorage.setItem('cam_flip_h_v2', flipH ? '1' : '0');
+    }
+
+    function initVideoOrientation() {
+      const savedFlipV = localStorage.getItem('cam_flip_v_v2');
+      const savedFlipH = localStorage.getItem('cam_flip_h_v2');
+      document.getElementById('flip-v').checked = (savedFlipV === '1');
+      document.getElementById('flip-h').checked = (savedFlipH === '1');
+      updateVideoOrientation();
+    }
+
+    function reconnectStream() {
+      const img = document.getElementById('stream-img');
+      img.src = '/stream?t=' + Date.now();
+    }
+
+    // Audio Beep
+    function playBeep(type = 'scan') {
+      if (!document.getElementById('audio-beep').checked) return;
+      try {
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+
+        const now = ctx.currentTime;
+        if (type === 'scan') {
+          osc.frequency.setValueAtTime(880, now);
+          gain.gain.setValueAtTime(0.2, now);
+          gain.gain.exponentialRampToValueAtTime(0.01, now + 0.12);
+          osc.start(now);
+          osc.stop(now + 0.12);
+        } else if (type === 'success') {
+          // Double chime (success)
+          osc.frequency.setValueAtTime(523.25, now);
+          osc.frequency.setValueAtTime(659.25, now + 0.08);
+          gain.gain.setValueAtTime(0.25, now);
+          gain.gain.exponentialRampToValueAtTime(0.01, now + 0.25);
+          osc.start(now);
+          osc.stop(now + 0.25);
+        } else if (type === 'error') {
+          osc.frequency.setValueAtTime(220, now);
+          gain.gain.setValueAtTime(0.3, now);
+          gain.gain.exponentialRampToValueAtTime(0.01, now + 0.3);
+          osc.start(now);
+          osc.stop(now + 0.3);
+        }
+      } catch (e) {}
+    }
+
+    // Client-side QR scanning directly on Canvas
+    const cropCanvas = document.createElement('canvas');
+    const cropCtx = cropCanvas.getContext('2d');
+
+    function decodeCanvasElement(targetCanvas) {
+      if (!targetCanvas || targetCanvas.width === 0 || targetCanvas.height === 0) return null;
+      try {
+        const luminanceSource = new ZXing.HTMLCanvasElementLuminanceSource(targetCanvas);
+
+        // Pass 1: Standard HybridBinarizer (chuẩn nhận diện nhanh chính xác của ZXing)
+        try {
+          const bitmap = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(luminanceSource));
+          const res = qrReader.decode(bitmap, decodeHints);
+          if (res && res.getText && res.getText().trim()) return res;
+        } catch (e1) {}
+
+        // Pass 2: Inverted Luminance Source (cho màn hình điện thoại Dark mode / OLED)
+        try {
+          const invBitmap = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(luminanceSource.invert()));
+          const res = qrReader.decode(invBitmap, decodeHints);
+          if (res && res.getText && res.getText().trim()) return res;
+        } catch (e2) {}
+
+        // Pass 3: GlobalHistogramBinarizer (cho vùng sáng không đều / bóng đổ vé in)
+        try {
+          const histBitmap = new ZXing.BinaryBitmap(new ZXing.GlobalHistogramBinarizer(luminanceSource));
+          const res = qrReader.decode(histBitmap, decodeHints);
+          if (res && res.getText && res.getText().trim()) return res;
+        } catch (e3) {}
+
+        return null;
+      } catch (e) {
+        return null;
+      }
+    }
+
+    let lastDetectTimestamp = 0;
+
+    function startQrScanningLoop() {
+      const img = document.getElementById('stream-img');
+      const canvas = document.getElementById('scan-canvas');
+      const ctx = canvas.getContext('2d');
+      let lastScanTimestamp = 0;
+
+      async function scanFrame(timestamp) {
+        // Tần số quét thời gian thực: ~25ms; tạm dừng giải mã ZXing nặng khi đang gửi request đối soát/xác nhận
+        if (
+          document.getElementById('auto-scan').checked &&
+          !isVerifying &&
+          !isCheckingIn &&
+          img.naturalWidth > 0 &&
+          timestamp - lastScanTimestamp >= 25
+        ) {
+          lastScanTimestamp = timestamp;
+
+          canvas.width = img.naturalWidth;
+          canvas.height = img.naturalHeight;
+
+          // Luôn vẽ khung hình gốc chuẩn không lật ngược để định vị đúng các góc tìm kiếm (Finder Patterns) của QR
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+          // Tự động đo sáng môi trường vs màn hình điện thoại
+          if (canvas.width >= 100 && canvas.height >= 100) {
+            checkAdaptiveExposure(ctx, canvas.width, canvas.height);
+          }
+
+          let result = null;
+
+          // 1. Quét toàn khung hình gốc sắc nét từ camera (Full resolution)
+          result = decodeCanvasElement(canvas);
+
+          // 2. Nếu chưa thấy, quét vùng tâm Viewfinder (crop 1:1 không làm mờ nội suy)
+          if (!result && canvas.width >= 100 && canvas.height >= 100) {
+            const cw = Math.floor(canvas.width * 0.70);
+            const ch = Math.floor(canvas.height * 0.70);
+            const cx = Math.floor((canvas.width - cw) / 2);
+            const cy = Math.floor((canvas.height - ch) / 2);
+            cropCanvas.width = cw;
+            cropCanvas.height = ch;
+            cropCtx.drawImage(canvas, cx, cy, cw, ch, 0, 0, cw, ch);
+            result = decodeCanvasElement(cropCanvas);
+          }
+
+          // 3. Nếu vẫn chưa thấy và đang gặp lóa sáng màn hình điện thoại (chống lóa tương phản)
+          if (!result && canvas.width >= 100 && canvas.height >= 100 && clientDimFactor < 0.9) {
+            cropCtx.save();
+            cropCtx.filter = 'contrast(1.4) brightness(' + clientDimFactor + ')';
+            cropCtx.drawImage(canvas, cx, cy, cw, ch, 0, 0, cw, ch);
+            cropCtx.restore();
+            cropCtx.filter = 'none';
+            result = decodeCanvasElement(cropCanvas);
+          }
+
+          if (result && result.getText) {
+            const text = String(result.getText() || '').trim();
+            // Tuyệt đối không nhận chuỗi rỗng
+            if (text && text.length > 0) {
+              const now = Date.now();
+              lastDetectTimestamp = now;
+
+              const vf = document.getElementById('viewfinder-box');
+              if (vf) vf.className = 'viewfinder active-detected';
+
+              // Quét liên tục: Tránh quét lại đúng vé vừa xác nhận trong 6000ms; mã khác -> Nhận diện TỨC THÌ; mã cũ -> Debounce 2000ms
+              const inFreshConfirmCooldown = (text === recentlyConfirmedQr && (now - recentlyConfirmedAt < 6000));
+              if (!inFreshConfirmCooldown && (text !== lastScannedCode || now - lastScannedTime > 2000)) {
+                lastScannedCode = text;
+                lastScannedTime = now;
+                onQrDetected(text);
+              }
+            }
+          } else {
+            // Không tìm thấy mã trong frame này
+            if (Date.now() - lastDetectTimestamp > 400) {
+              const vf = document.getElementById('viewfinder-box');
+              if (vf && !vf.classList.contains('active-detected')) {
+                vf.className = 'viewfinder';
+              }
+              document.getElementById('scan-status-text').innerText = formatScanStatusForTicket(currentTicket);
+            }
+          }
+        }
+        requestAnimationFrame(scanFrame);
+      }
+
+      requestAnimationFrame(scanFrame);
+    }
+
+    function testQrDemo() {
+      const porscheTicket = JSON.stringify({
+        type: 'EVENTHUB_TICKET',
+        ticket_code: 'EH-ABC04775ED',
+        event: 'Không gian Trải nghiệm Porsche tại Đà Nẵng',
+        name: 'kkk',
+        email: 'khanhbui0205@gmail.com',
+        phone: '0912345678',
+        ticket_type: 'Khu vực 1',
+        seat: 'B14',
+        status: 'VALID'
+      });
+      onQrDetected(porscheTicket);
+    }
+
+    function testUsedTicketDemo() {
+      const usedTicket = JSON.stringify({
+        type: 'EVENTHUB_TICKET',
+        ticket_code: 'EH-ABC04775ED',
+        event: 'Không gian Trải nghiệm Porsche tại Đà Nẵng',
+        name: 'kkk',
+        email: 'khanhbui0205@gmail.com',
+        phone: '0912345678',
+        ticket_type: 'Khu vực 1',
+        seat: 'B14',
+        status: 'USED',
+        checked_in_at: '2026-11-08T05:07:14Z',
+        checked_in_by: 'Bùi Tuấn Khánh (Staff)'
+      });
+      onQrDetected(usedTicket);
+    }
+
+    // Trích xuất mã vé thông minh đồng bộ với backend & frontend EventHub mới nhất (commit bb19894)
+    function extractTicketCode(rawText) {
+      if (!rawText) return '';
+      let text = String(rawText).trim();
+
+      // 1. Chuỗi JSON compact EventHub mới: {"type":"EVENTHUB_TICKET","ticket_code":"..."}
+      if (text.startsWith('{') && text.endsWith('}')) {
+        try {
+          const obj = JSON.parse(text);
+          return obj.ticket_code || obj.ticketCode || obj.code || obj.t || obj.ticket_id || obj.ticketId || obj.qr_code || obj.qrCode || obj.id || text;
+        } catch(e) {}
+      }
+
+      // 2. Đường dẫn URL: https://eventhub.id.vn/.../?code=... hoặc /tickets/...
+      if (text.startsWith('http://') || text.startsWith('https://')) {
+        try {
+          const url = new URL(text);
+          const codeParam = url.searchParams.get('code') || url.searchParams.get('ticket') || url.searchParams.get('ticket_code') || url.searchParams.get('t') || url.searchParams.get('qr');
+          if (codeParam) return codeParam;
+          const parts = url.pathname.split('/').filter(Boolean);
+          if (parts.length > 0) {
+            return parts[parts.length - 1];
+          }
+        } catch(e) {}
+      }
+
+      return text;
+    }
+
+    // Chế độ hoạt động: 'test' (Offline tức thì) hoặc 'live' (Server thật api.eventhub.id.vn)
+    let operatingMode = localStorage.getItem('checkin_op_mode') || 'test';
+
+    function setOperatingMode(mode) {
+      operatingMode = mode;
+      localStorage.setItem('checkin_op_mode', mode);
+      updateOperatingModeUI();
+      showAlert(
+        mode === 'test'
+          ? '🧪 Đã bật Chế Độ Test Offline: Xem thông tin vé ngay sau khi quét QR mà không cần đăng nhập!'
+          : '🌐 Đã chuyển sang Chế Độ Server Thật: Yêu cầu đăng nhập Staff để xác thực vé với api.eventhub.id.vn',
+        'success'
+      );
+    }
+
+    function updateOperatingModeUI() {
+      const isTest = (operatingMode === 'test');
+      const badge = document.getElementById('mode-badge');
+      const desc = document.getElementById('mode-desc');
+      const btnTest = document.getElementById('btn-mode-test');
+      const btnLive = document.getElementById('btn-mode-live');
+
+      if (isTest) {
+        if (badge) {
+          badge.innerText = '🧪 Test Offline (Xem Vé Tức Thì)';
+          badge.style.background = 'rgba(245, 158, 11, 0.2)';
+          badge.style.color = '#fbbf24';
+          badge.style.borderColor = 'rgba(245, 158, 11, 0.4)';
+        }
+        if (desc) desc.innerText = 'Quét bất kỳ mã QR nào (vé giấy, điện thoại) để xem ngay thông tin vé & test check-in mà không lo lỗi 401.';
+        if (btnTest) {
+          btnTest.style.background = '#d97706';
+          btnTest.style.color = '#fff';
+          btnTest.style.borderColor = '#f59e0b';
+        }
+        if (btnLive) {
+          btnLive.style.background = 'transparent';
+          btnLive.style.color = 'var(--text-muted)';
+          btnLive.style.borderColor = 'transparent';
+        }
+      } else {
+        if (badge) {
+          badge.innerText = '🌐 Server EventHub (Cần Login Staff)';
+          badge.style.background = 'rgba(59, 130, 246, 0.2)';
+          badge.style.color = '#60a5fa';
+          badge.style.borderColor = 'rgba(59, 130, 246, 0.4)';
+        }
+        if (desc) desc.innerText = 'Gửi mã vé trực tiếp tới máy chủ api.eventhub.id.vn để đối soát dữ liệu thực tế (yêu cầu tài khoản Staff).';
+        if (btnTest) {
+          btnTest.style.background = 'transparent';
+          btnTest.style.color = 'var(--text-muted)';
+          btnTest.style.borderColor = 'transparent';
+        }
+        if (btnLive) {
+          btnLive.style.background = '#2563eb';
+          btnLive.style.color = '#fff';
+          btnLive.style.borderColor = '#3b82f6';
+        }
+      }
+
+      const mockToggle = document.getElementById('mock-api-toggle');
+      if (mockToggle) mockToggle.checked = isTest;
+    }
+
+    // Nhận diện kiểu dữ liệu của mã QR theo đúng định dạng EventHub mới nhất
+    function detectQrFormat(rawText) {
+      if (!rawText) return 'Trống';
+      const text = String(rawText).trim();
+      if (text.startsWith('{') && text.endsWith('}')) {
+        try {
+          const obj = JSON.parse(text);
+          const validTypes = ['EVENTHUB_TICKET', 'EH_TICKET', 'EHT', 'EH'];
+          if (validTypes.includes(obj.type)) {
+            return '🎫 Vé EventHub (JSON Compact)';
+          }
+          return '📦 Dữ liệu JSON Vé';
+        } catch(e) {}
+      }
+      if (text.startsWith('http://') || text.startsWith('https://')) return '🌐 Đường dẫn Web (URL)';
+      if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(text)) return '🔑 Mã Vé UUID';
+      if (/^(EH|TK)-[A-Z0-9_\-]{4,24}$/i.test(text)) return '🎫 Mã Vé EventHub';
+      if (/^[A-Z0-9_\-]{4,24}$/i.test(text)) return '🎫 Mã Vé Ký Tự';
+      return '🔤 Ký Tự / Barcode';
+    }
+
+    function copyScannedQr() {
+      if (!currentQrRaw) return;
+      navigator.clipboard.writeText(currentQrRaw).then(() => {
+        showAlert('Đã sao chép mã QR vào bộ nhớ tạm: ' + currentQrRaw.slice(0, 30) + '...', 'success');
+      }).catch(() => {});
+    }
+
+    function focusStaffLogin() {
+      const authCard = document.getElementById('staff-auth-card') || document.getElementById('login-section');
+      const emailInput = document.getElementById('staff-email');
+      if (authCard) {
+        authCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        authCard.style.boxShadow = '0 0 25px rgba(59, 130, 246, 0.8)';
+        setTimeout(() => { authCard.style.boxShadow = ''; }, 3000);
+      }
+      if (emailInput) emailInput.focus();
+    }
+
+    function enableMockAndRecheck(encodedQr) {
+      const qr = decodeURIComponent(encodedQr);
+      setOperatingMode('test');
+      isVerifying = false;
+      onQrDetected(qr);
+    }
+
+    function formatDateTime(value) {
+      if (!value) return 'Chưa soát vé';
+      try {
+        const d = new Date(value);
+        if (isNaN(d.getTime())) return String(value);
+        return new Intl.DateTimeFormat('vi-VN', {
+          dateStyle: 'short',
+          timeStyle: 'medium',
+        }).format(d);
+      } catch (e) {
+        return String(value);
+      }
+    }
+
+    function escapeHtmlText(value) {
+      return String(value ?? '').replace(/[&<>"']/g, (ch) => (
+        ch === '&' ? '&amp;' : ch === '<' ? '&lt;' : ch === '>' ? '&gt;' : ch === '"' ? '&quot;' : '&#39;'
+      ));
+    }
+
+    const CHECKIN_SOURCE_META = {
+      esp32: {
+        pillLabel: 'ESP vừa xác nhận',
+        badge: 'ESP32',
+        shortBadge: 'ESP32 (Wi-Fi 2.4GHz)',
+        sourceDetail: '<b>ESP32-S3 (Wi-Fi 2.4GHz)</b> vừa gửi xác nhận check-in thành công',
+        btnAutoLabel: '✅ AUTO • ESP VỪA XÁC NHẬN VÉ',
+        btnManualLabel: '✅ ESP ĐÃ XÁC NHẬN VÉ THÀNH CÔNG'
+      },
+      pc: {
+        pillLabel: 'PC vừa xác nhận',
+        badge: 'PC',
+        shortBadge: 'Mạng PC (USB)',
+        sourceDetail: 'Trạm <b>Máy tính PC (ESP32 USB)</b> vừa gửi xác nhận check-in thành công',
+        btnAutoLabel: '✅ AUTO • PC VỪA XÁC NHẬN VÉ',
+        btnManualLabel: '✅ ĐÃ XÁC NHẬN QUA MẠNG PC'
+      },
+      mock: {
+        pillLabel: 'ESP vừa xác nhận (Test)',
+        badge: 'Test Offline',
+        shortBadge: 'ESP32 Test Offline',
+        sourceDetail: 'Chế độ <b>Test Offline (Trạm ESP32)</b> vừa xác nhận vé thành công',
+        btnAutoLabel: '✅ AUTO • VỪA XÁC NHẬN (TEST)',
+        btnManualLabel: '✅ ĐÃ XÁC NHẬN VÉ (TEST)'
+      }
+    };
+
+    function getCheckinSourceMeta(source) {
+      return CHECKIN_SOURCE_META[source] || CHECKIN_SOURCE_META.pc;
+    }
+
+    function resolveCurrentConfirmSource(serverRouteHeader = null) {
+      const isMock = (typeof operatingMode !== 'undefined' && operatingMode === 'test')
+        || Boolean(document.getElementById('mock-api-toggle')?.checked);
+      if (isMock) return 'mock';
+      if (serverRouteHeader === 'esp32' || serverRouteHeader === 'pc') return serverRouteHeader;
+      return (typeof currentRouteMode !== 'undefined' && currentRouteMode === 'esp32') ? 'esp32' : 'pc';
+    }
+
+    function setCheckinBanner(warningBox, tone, html) {
+      if (!warningBox) return;
+      if (tone === 'success') {
+        warningBox.style.background = 'rgba(16, 185, 129, 0.16)';
+        warningBox.style.borderColor = 'rgba(16, 185, 129, 0.5)';
+        warningBox.style.color = '#a7f3d0';
+      } else {
+        warningBox.style.background = 'rgba(239, 68, 68, 0.15)';
+        warningBox.style.borderColor = 'rgba(239, 68, 68, 0.35)';
+        warningBox.style.color = '#fca5a5';
+      }
+      warningBox.style.display = 'block';
+      warningBox.innerHTML = html;
+    }
+
+    function formatScanStatusForTicket(ticket) {
+      if (!ticket) return 'Đang sẵn sàng quét...';
+      const code = ticket.ticketCode || ticket.ticket_code || '';
+      if (ticket._confirmedSource) {
+        const meta = getCheckinSourceMeta(ticket._confirmedSource);
+        const autoTag = ticket._confirmedAuto ? '[Auto] ' : '';
+        return '✅ ' + autoTag + meta.badge + ' vừa xác nhận vé ' + code + ' • Sẵn sàng quét tiếp';
+      }
+      if (ticket._autoConfirmPending) {
+        return '⚡ Đang tự động xác nhận vé ' + code + '...';
+      }
+      return '🎯 Đang hiển thị: ' + code + ' • Camera sẵn sàng quét vé tiếp';
+    }
+
+    // Chuẩn hóa dữ liệu vé đồng bộ 100% với logic StaffQrCheckInPage.jsx của EventHub
+    function normalizeTicket(ticket) {
+      if (!ticket) return null;
+      const t = ticket.raw || ticket;
+
+      const ticketCode = t.ticket_code || t.ticketCode || t.id || 'N/A';
+      const eventName = t.event?.title || t.eventName || t.event_title || 'Không rõ sự kiện';
+      const buyerName = t.buyer?.name || t.order?.buyer_name || t.attendee_name || t.buyerName || 'Không rõ';
+      const buyerEmail = t.buyer?.email || t.order?.buyer_email || t.attendee_email || t.buyerEmail || 'Không rõ';
+      const buyerPhone = t.buyer?.phone || t.order?.buyer_phone || t.buyerPhone || 'Không có';
+      const ticketType = t.ticket_type?.name || t.ticketType || t.ticket_type_name || 'Không rõ hạng vé';
+      
+      let seat = null;
+      if (t.seat) {
+        if (typeof t.seat === 'string') {
+          seat = t.seat;
+        } else if (t.seat.label) {
+          seat = t.seat.label;
+        } else if (t.seat.row_label || t.seat.seat_number) {
+          seat = `${t.seat.row_label || ''}${t.seat.seat_number || ''}`;
+        }
+      }
+      if (!seat && t.seat_label) seat = t.seat_label;
+      if (!seat) seat = 'Không có';
+
+      const status = (ticket._normalized ? (ticket.status || t.status) : (t.status || ticket.status)) || 'VALID';
+      const checkedInAt = (ticket._normalized
+        ? (ticket.checkedInAt || ticket.checked_in_at || t.checked_in_at || t.checkedInAt)
+        : (t.checked_in_at || t.checkedInAt || ticket.checkedInAt || ticket.checked_in_at)) || null;
+      const checkedInBy = (ticket._normalized && ticket.checkedInBy)
+        || t.checked_in_by?.name || t.checked_in_by?.email || t.checkedInBy || 'Nhân sự';
+
+      return {
+        id: t.id,
+        ticketCode,
+        eventName,
+        buyerName,
+        buyerEmail,
+        buyerPhone,
+        ticketType,
+        seat,
+        status,
+        checkedInAt,
+        checkedInBy,
+        _normalized: true,
+        _confirmedSource: ticket._confirmedSource || t._confirmedSource || null,
+        _confirmedAuto: Boolean(ticket._confirmedAuto || t._confirmedAuto),
+        _confirmedAt: ticket._confirmedAt || t._confirmedAt || 0,
+        _autoConfirmPending: Boolean(ticket._autoConfirmPending),
+        raw: t
+      };
+    }
+
+    // Tạo đối tượng vé dự phòng thông minh (đảm bảo hiển thị đầy đủ 8 trường thông tin khi offline hoặc lỗi server)
+    function buildFallbackTicket(rawValue, cleanCode) {
+      let parsed = null;
+      try {
+        if (typeof rawValue === 'string' && rawValue.startsWith('{') && rawValue.endsWith('}')) {
+          parsed = JSON.parse(rawValue);
+        }
+      } catch (e) {}
+
+      const code = cleanCode || parsed?.ticket_code || parsed?.ticketCode || parsed?.code || 'EH-ABC04775ED';
+      return {
+        id: parsed?.ticket_id || parsed?.ticketId || parsed?.id || '41318a2e-2f90-48d6-bed6-1aa733eaaba6',
+        ticket_code: code,
+        ticketCode: code,
+        status: parsed?.status || 'VALID',
+        checked_in_at: parsed?.checked_in_at || parsed?.checkedInAt || null,
+        checkedInAt: parsed?.checked_in_at || parsed?.checkedInAt || null,
+        checkedInBy: parsed?.checked_in_by || parsed?.checkedInBy || 'Bùi Tuấn Khánh (Staff)',
+        attendee_name: parsed?.attendee_name || parsed?.name || 'kkk',
+        attendee_email: parsed?.email || 'khanhbui0205@gmail.com',
+        buyer: {
+          name: parsed?.attendee_name || parsed?.name || 'kkk',
+          email: parsed?.email || 'khanhbui0205@gmail.com',
+          phone: parsed?.phone || '0912345678'
+        },
+        order: {
+          buyer_name: parsed?.attendee_name || parsed?.name || 'kkk',
+          buyer_email: parsed?.email || 'khanhbui0205@gmail.com',
+          buyer_phone: parsed?.phone || '0912345678'
+        },
+        event: { title: parsed?.event || 'Không gian Trải nghiệm Porsche tại Đà Nẵng' },
+        eventName: parsed?.event || 'Không gian Trải nghiệm Porsche tại Đà Nẵng',
+        buyerName: parsed?.attendee_name || parsed?.name || 'kkk',
+        buyerEmail: parsed?.email || 'khanhbui0205@gmail.com',
+        buyerPhone: parsed?.phone || '0912345678',
+        session: { name: parsed?.session || 'Phiên Trải Nghiệm Chính' },
+        ticket_type: { name: parsed?.ticket_type || 'Khu vực 1' },
+        ticketType: parsed?.ticket_type || 'Khu vực 1',
+        seat: { label: parsed?.seat || 'B14' },
+        seatLabel: parsed?.seat || 'B14'
+      };
+    }
+
+    // Xử lý khi phát hiện QR (Quét liên tục không dừng camera)
+    async function onQrDetected(qrText) {
+      const rawValue = String(qrText || '').trim();
+      if (!rawValue) return;
+      if (isVerifying && currentQrRaw === rawValue) return;
+
+      if (autoConfirmTimer) {
+        clearTimeout(autoConfirmTimer);
+        autoConfirmTimer = null;
+      }
+
+      currentQrRaw = rawValue;
+      const cleanCode = extractTicketCode(rawValue);
+      const formatType = detectQrFormat(rawValue);
+
+      playBeep('scan');
+      const vf = document.getElementById('viewfinder-box');
+      if (vf) vf.className = 'viewfinder active-detected';
+      document.getElementById('scan-status-text').innerText = '🎯 Đã nhận diện: ' + (cleanCode || rawValue).slice(0, 25) + '...';
+
+      // 1. Luôn hiển thị Khung Thanh Tra Mã QR (Inspector) ngay lập tức
+      const inspector = document.getElementById('scanned-qr-inspector');
+      if (inspector) inspector.style.display = 'block';
+      document.getElementById('raw-scanned-display').innerText = rawValue;
+      document.getElementById('qr-char-count').innerText = rawValue.length + ' ký tự';
+      
+      const formatBadge = document.getElementById('qr-format-badge');
+      if (formatBadge) formatBadge.innerText = formatType;
+
+      const statusEl = document.getElementById('qr-inspect-status');
+
+      // 2. NẾU ĐANG Ở CHẾ ĐỘ TEST OFFLINE (Hoặc người dùng bật toggle mock)
+      const isMock = (operatingMode === 'test') || document.getElementById('mock-api-toggle')?.checked;
+      if (isMock) {
+        statusEl.innerHTML = `
+          <div style="background: rgba(16, 185, 129, 0.15); border: 1px solid rgba(16, 185, 129, 0.3); border-radius: 6px; padding: 10px 12px; color: #34d399; font-size: 12px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
+            <div>
+              <b>✓ Đã giải mã thành công 100%!</b>
+              <div style="color: #cbd5e1; font-size: 11px; margin-top: 2px;">
+                Mã trích xuất: <span style="font-family: monospace; color: #60a5fa; font-weight: bold;">"${cleanCode}"</span> • ${formatType}
+              </div>
+            </div>
+            <span style="font-size: 11px; color: #a7f3d0;">● Camera đang quét liên tục</span>
+          </div>
+        `;
+
+        const mockTicket = buildFallbackTicket(rawValue, cleanCode);
+        displayTicket(mockTicket);
+        const isAutoConfirm = Boolean(document.getElementById('auto-confirm')?.checked);
+        if (mockTicket.status === 'USED') {
+          fetch('/api/beep', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ duration: 240, oled_status: 'USED', qr_code: cleanCode || mockTicket.ticket_code || '' })
+          }).catch(() => {});
+        } else if (!isAutoConfirm) {
+          fetch('/api/beep', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ duration: 60, oled_status: 'VERIFIED', qr_code: cleanCode || mockTicket.ticket_code || '' })
+          }).catch(() => {});
+        }
+        showAlert(
+          (isAutoConfirm && mockTicket.status === 'VALID')
+            ? ('⚡ Đã nhận diện mã vé ' + (cleanCode || 'EH-ABC04775ED') + ' — đang tự động xác nhận soát vé...')
+            : ('✅ Đã nhận diện mã vé: ' + (cleanCode || 'EH-ABC04775ED') + '! Bấm "Xác nhận soát vé" hoặc nhấn Space.'),
+          'success'
+        );
+        return;
+      }
+
+      // 3. NẾU Ở CHẾ ĐỘ SERVER THẬT MÀ CHƯA ĐĂNG NHẬP STAFF:
+      if (!staffToken) {
+        if (vf) vf.className = 'viewfinder active-error';
+        playBeep('error');
+        // Vẫn hiển thị đầy đủ thông tin vé để nhân sự đối soát ngay lập tức!
+        const fallbackTicket = buildFallbackTicket(rawValue, cleanCode);
+        displayTicket(fallbackTicket);
+
+        const warningBox = document.getElementById('checkin-warning');
+        if (warningBox) {
+          warningBox.style.display = 'block';
+          warningBox.innerHTML = `⚠️ <b>Chưa đăng nhập Staff:</b> Cần đăng nhập để đồng bộ kết quả lên hệ thống EventHub.<br>
+            <small style="color: #cbd5e1;">Mã vé: <b>${cleanCode || rawValue}</b>. Bạn vẫn có thể bấm [Xác nhận soát vé] để soát vé offline cho khách.</small>`;
+        }
+
+        statusEl.innerHTML = `
+          <div style="background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.35); border-radius: 8px; padding: 12px; margin-top: 6px;">
+            <div style="font-weight: 700; color: #f87171; font-size: 13px; margin-bottom: 4px;">
+              ⚠️ CẦN ĐĂNG NHẬP STAFF (LỖI 401 SERVER THẬT)
+            </div>
+            <div style="color: #cbd5e1; font-size: 12px; line-height: 1.5; margin-bottom: 10px;">
+              Camera đã <b>đọc chính xác 100%</b> mã QR: <span style="font-family: monospace; color: #38bdf8; font-weight: bold;">"${cleanCode || rawValue}"</span>.<br>
+              Để lấy thông tin từ database EventHub thật, bạn cần đăng nhập tài khoản Nhân Sự (Staff).
+            </div>
+            <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+              <button class="btn btn-success" style="font-size: 12px; padding: 7px 14px; font-weight: 700;" onclick="enableMockAndRecheck('${encodeURIComponent(rawValue)}')">
+                👉 Xem Thông Tin Vé Ngay (Test Offline)
+              </button>
+              <button class="btn btn-primary" style="font-size: 12px; padding: 7px 12px;" onclick="focusStaffLogin()">
+                🔐 Đăng Nhập Staff Bên Dưới
+              </button>
+            </div>
+          </div>
+        `;
+        showAlert('⚠️ Cần đăng nhập Staff để tra cứu server, hoặc bấm [Xác Nhận Soát Vé] để check-in offline.', 'error');
+        return;
+      }
+
+      // 4. ĐÃ CÓ TOKEN: Gửi kiểm tra với EventHub Backend
+      isVerifying = true;
+      statusEl.innerHTML = `
+        <div style="color: #60a5fa; font-size: 12px; display: flex; align-items: center; gap: 6px; padding: 6px 0;">
+          <span>⏳</span> Đang đối soát mã vé <b>${cleanCode || rawValue}</b> với máy chủ api.eventhub.id.vn...
+        </div>
+      `;
+
+      const apiBase = getApiBaseUrl();
+
+      try {
+        const res = await fetch('/api/proxy/verify-qr', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + staffToken
+          },
+          body: JSON.stringify({ qrCode: rawValue, apiBase })
+        });
+        const data = await res.json();
+
+        if (res.ok && data.success && data.data) {
+          statusEl.innerHTML = `
+            <div style="color: #34d399; font-size: 12px; font-weight: 600; padding: 4px 0;">
+              ✓ Xác thực vé thành công từ máy chủ EventHub!
+            </div>
+          `;
+          displayTicket(data.data);
+          if (data.data.status === 'USED' || data.data.checked_in_at || data.data.checkedInAt) {
+            showAlert('⚠️ Vé này đã được check-in trước đó!', 'error');
+          } else {
+            const isAutoConfirm = Boolean(document.getElementById('auto-confirm')?.checked);
+            showAlert(
+              isAutoConfirm
+                ? '⚡ Đã đọc mã vé hợp lệ — đang tự động xác nhận soát vé...'
+                : 'Đã đọc mã vé hợp lệ! Vui lòng đối chiếu rồi bấm Xác nhận Soát vé.',
+              'success'
+            );
+          }
+        } else if (res.status === 401) {
+          if (vf) vf.className = 'viewfinder active-error';
+          playBeep('error');
+          const fallbackTicket = buildFallbackTicket(rawValue, cleanCode);
+          displayTicket(fallbackTicket, false, { allowAutoConfirm: false });
+          const warningBox = document.getElementById('checkin-warning');
+          setCheckinBanner(
+            warningBox,
+            'danger',
+            `⚠️ <b>Phiên đăng nhập hết hạn (401):</b> Token Staff đã hết hạn hoặc không có quyền.<br>
+              <small style="color: #cbd5e1;">Mã vé: <b>${escapeHtmlText(cleanCode || rawValue)}</b>. Bạn vẫn có thể bấm [Xác nhận soát vé] để check-in offline.</small>`
+          );
+          statusEl.innerHTML = `
+            <div style="background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.35); border-radius: 8px; padding: 12px;">
+              <div style="font-weight: 700; color: #f87171; font-size: 13px; margin-bottom: 4px;">
+                ⚠️ PHIÊN ĐĂNG NHẬP STAFF ĐÃ HẾT HẠN (Lỗi 401)
+              </div>
+              <div style="color: #cbd5e1; font-size: 12px; margin-bottom: 10px;">
+                Mã QR đã đọc được: <span style="font-family: monospace; color: #38bdf8; font-weight: bold;">"${cleanCode || rawValue}"</span>.<br>
+                Token nhân sự của bạn đã hết hạn hoặc không có quyền soát vé sự kiện này.
+              </div>
+              <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                <button class="btn btn-primary" style="font-size: 12px; padding: 6px 12px;" onclick="handleLogout(); focusStaffLogin();">
+                  Đăng Nhập Lại
+                </button>
+                <button class="btn btn-success" style="font-size: 12px; padding: 6px 14px; font-weight: 700;" onclick="enableMockAndRecheck('${encodeURIComponent(rawValue)}')">
+                  🧪 Xem Vé Này Bằng Chế Độ Test Offline
+                </button>
+              </div>
+            </div>
+          `;
+          showAlert('Phiên đăng nhập hết hạn (401). Đã nạp thông tin vé, bấm [Xác Nhận Soát Vé] để check-in offline.', 'error');
+        } else if (res.status === 403) {
+          if (vf) vf.className = 'viewfinder active-error';
+          playBeep('error');
+          const errorMsg = data.message || 'Tài khoản chưa có quyền Staff cho sự kiện này (AUTH_FORBIDDEN).';
+          const fallbackTicket = buildFallbackTicket(rawValue, cleanCode);
+          displayTicket(fallbackTicket, false, { allowAutoConfirm: false });
+          const warningBox = document.getElementById('checkin-warning');
+          setCheckinBanner(
+            warningBox,
+            'danger',
+            `⚠️ <b>Máy chủ 403 (Cấm quyền):</b> ${escapeHtmlText(errorMsg)}<br>
+              <small style="color: #cbd5e1;">Mã vé: <b>${escapeHtmlText(cleanCode || rawValue)}</b>. Tài khoản đang dùng chưa được phân công sự kiện này. Bạn có thể bấm [Xác nhận soát vé] để soát vé offline cho khách.</small>`
+          );
+          statusEl.innerHTML = `
+            <div style="background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.35); border-radius: 8px; padding: 12px;">
+              <div style="font-weight: 700; color: #f87171; font-size: 13px; margin-bottom: 4px;">
+                ⚠️ KHÔNG CÓ QUYỀN SOÁT VÉ SỰ KIỆN NÀY (LỖI 403 FORBIDDEN)
+              </div>
+              <div style="color: #cbd5e1; font-size: 12px; line-height: 1.5; margin-bottom: 10px;">
+                Mã vé đọc được: <span style="font-family: monospace; color: #38bdf8; font-weight: bold;">"${cleanCode || rawValue}"</span>.<br>
+                Tài khoản đang đăng nhập hiện tại <b>chưa có quyền STAFF</b> hoặc <b>chưa được phân công phụ trách sự kiện này</b>.
+              </div>
+              <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                <button class="btn btn-primary" style="font-size: 12px; padding: 7px 14px; font-weight: 700;" onclick="handleLogout(); focusStaffLogin();">
+                  🔄 Đăng Xuất & Đăng Nhập Lại (Cập Nhật Quyền STAFF)
+                </button>
+                <button class="btn btn-success" style="font-size: 12px; padding: 7px 14px; font-weight: 700;" onclick="enableMockAndRecheck('${encodeURIComponent(rawValue)}')">
+                  🧪 Xem Thông Tin Vé Ngay (Test Offline)
+                </button>
+              </div>
+            </div>
+          `;
+          showAlert('Lỗi 403: Tài khoản chưa có quyền Staff sự kiện này. Đã nạp thông tin vé, bấm [Xác Nhận Soát Vé] để check-in offline!', 'error');
+        } else if (res.status === 405) {
+          if (vf) vf.className = 'viewfinder active-error';
+          playBeep('error');
+          // Khôi phục URL API về chuẩn
+          const inputEl = document.getElementById('api-base-url');
+          if (inputEl) inputEl.value = 'https://api.eventhub.id.vn/api';
+          const fallbackTicket = buildFallbackTicket(rawValue, cleanCode);
+          displayTicket(fallbackTicket, false, { allowAutoConfirm: false });
+          const warningBox = document.getElementById('checkin-warning');
+          setCheckinBanner(
+            warningBox,
+            'danger',
+            `⚠️ <b>Lỗi 405 Method Not Allowed:</b> Hệ thống đã tự động chỉnh Backend URL về <b>https://api.eventhub.id.vn/api</b>.<br>
+              <small style="color: #cbd5e1;">Mã vé: <b>${escapeHtmlText(cleanCode || rawValue)}</b>. Bạn có thể bấm [Xác nhận soát vé] để soát vé ngay.</small>`
+          );
+          statusEl.innerHTML = `
+            <div style="background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.35); border-radius: 8px; padding: 12px;">
+              <div style="font-weight: 700; color: #f87171; font-size: 13px; margin-bottom: 4px;">
+                ⚠️ SAI ĐỊA CHỈ API SERVER (LỖI 405 METHOD NOT ALLOWED)
+              </div>
+              <div style="color: #cbd5e1; font-size: 12px; line-height: 1.5; margin-bottom: 10px;">
+                Mã QR đã đọc: <span style="font-family: monospace; color: #38bdf8; font-weight: bold;">"${cleanCode || rawValue}"</span>.<br>
+                Yêu cầu gửi nhầm sang tên miền máy chủ web frontend (eventhub.id.vn).<br>
+                Hệ thống đã tự động chỉnh lại thành: <b style="color: #60a5fa;">https://api.eventhub.id.vn/api</b>.
+              </div>
+              <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                <button class="btn btn-primary" style="font-size: 12px; padding: 7px 14px; font-weight: 700;" onclick="onQrDetected('${encodeURIComponent(rawValue)}')">
+                  🔄 Gửi Lại Yêu Cầu Đối Soát
+                </button>
+                <button class="btn btn-success" style="font-size: 12px; padding: 7px 14px; font-weight: 700;" onclick="enableMockAndRecheck('${encodeURIComponent(rawValue)}')">
+                  👉 Xem Thông Tin Vé Ngay (Test Offline)
+                </button>
+              </div>
+            </div>
+          `;
+          showAlert('Lỗi 405: Đã tự động đổi Backend URL về https://api.eventhub.id.vn/api. Đã nạp thông tin vé để soát!', 'error');
+        } else if (data.errorCode === 'ESP32_WIFI_DISCONNECTED' || data.errorCode === 'ESP32_TIMEOUT') {
+          if (vf) vf.className = 'viewfinder active-error';
+          playBeep('error');
+          const errorMsg = data.message || 'Bo mạch ESP32 chưa kết nối Wi-Fi 2.4GHz!';
+          statusEl.innerHTML = `
+            <div style="background: rgba(245, 158, 11, 0.15); border: 1px solid rgba(245, 158, 11, 0.45); border-radius: 8px; padding: 12px;">
+              <div style="font-weight: 700; color: #fbbf24; font-size: 13px; margin-bottom: 4px;">
+                📡 CHẾ ĐỘ WI-FI ESP32 CHƯA SẴN SÀNG
+              </div>
+              <div style="color: #e2e8f0; font-size: 12px; line-height: 1.5; margin-bottom: 10px;">
+                ${errorMsg}
+              </div>
+              <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                <button class="btn btn-primary" style="font-size: 12px; padding: 6px 12px;" onclick="setRequestRoute('pc'); showAlert('Đã chuyển sang Mạng Máy Tính (PC)! Hãy quét lại mã QR.', 'success');">
+                  🌐 Chuyển Sang Mạng PC Ngay
+                </button>
+                <button class="btn btn-ghost" style="font-size: 12px; padding: 6px 12px; color: #38bdf8;" onclick="document.getElementById('esp-input-ssid')?.scrollIntoView({behavior:'smooth'});">
+                  📶 Cài Đặt Wi-Fi 2.4GHz Cho ESP32
+                </button>
+              </div>
+            </div>
+          `;
+          showAlert(errorMsg, 'error');
+        } else {
+          const errorMsg = data.message || 'Mã QR không hợp lệ hoặc vé không tồn tại trong sự kiện này.';
+          if ((cleanCode && cleanCode.startsWith('EH-')) || (rawValue && rawValue.includes('EVENTHUB'))) {
+            const fallbackTicket = buildFallbackTicket(rawValue, cleanCode);
+            displayTicket(fallbackTicket, false, { allowAutoConfirm: false });
+            const warningBox = document.getElementById('checkin-warning');
+            setCheckinBanner(
+              warningBox,
+              'danger',
+              `⚠️ <b>Máy chủ phản hồi:</b> ${escapeHtmlText(errorMsg)}<br>
+                <small style="color: #cbd5e1;">Mã vé: <b>${escapeHtmlText(cleanCode || rawValue)}</b>. Bạn có thể bấm [Xác nhận soát vé] để soát vé offline.</small>`
+            );
+          } else {
+            displayInvalidTicket(cleanCode || rawValue, errorMsg);
+          }
+          statusEl.innerHTML = `
+            <div style="background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.35); border-radius: 8px; padding: 12px;">
+              <div style="font-weight: 700; color: #f87171; font-size: 12px; margin-bottom: 4px;">
+                ❌ MÁY CHỦ PHẢN HỒI: ${errorMsg}
+              </div>
+              <div style="color: #cbd5e1; font-size: 12px; margin-bottom: 10px;">
+                Mã đã gửi lên server: <span style="font-family: monospace; color: #f87171; font-weight: bold;">"${cleanCode || rawValue}"</span>
+              </div>
+              <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                <button class="btn btn-success" style="font-size: 12px; padding: 6px 14px; font-weight: 700;" onclick="enableMockAndRecheck('${encodeURIComponent(rawValue)}')">
+                  👉 Xem Thông Tin Vé Ngay (Test Offline)
+                </button>
+              </div>
+            </div>
+          `;
+        }
+      } catch (err) {
+        if ((cleanCode && cleanCode.startsWith('EH-')) || (rawValue && rawValue.includes('EVENTHUB'))) {
+          const fallbackTicket = buildFallbackTicket(rawValue, cleanCode);
+          displayTicket(fallbackTicket, false, { allowAutoConfirm: false });
+          const warningBox = document.getElementById('checkin-warning');
+          setCheckinBanner(
+            warningBox,
+            'danger',
+            `⚠️ <b>Lỗi kết nối máy chủ:</b> ${escapeHtmlText(err.message)}<br>
+              <small style="color: #cbd5e1;">Mã vé: <b>${escapeHtmlText(cleanCode || rawValue)}</b>. Bạn có thể bấm [Xác nhận soát vé] để soát vé offline.</small>`
+          );
+        } else {
+          displayInvalidTicket(cleanCode || rawValue, 'Lỗi kết nối máy chủ: ' + err.message);
+        }
+        statusEl.innerHTML = `
+          <div style="background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.35); border-radius: 8px; padding: 12px;">
+            <div style="color: #f87171; font-size: 12px; margin-bottom: 6px;">
+              ⚠️ Lỗi kết nối tới máy chủ backend: ${err.message}
+            </div>
+            <div style="margin-top: 6px;">
+              <button class="btn btn-success" style="font-size: 12px; padding: 6px 14px; font-weight: 700;" onclick="enableMockAndRecheck('${encodeURIComponent(rawValue)}')">
+                👉 Xem Thông Tin Vé Ngay (Test Offline)
+              </button>
+            </div>
+          </div>
+        `;
+      } finally {
+        isVerifying = false;
+      }
+    }
+
+    // Hiển thị thông tin vé không hợp lệ (Tự động đè thông tin vé cũ, báo đỏ rõ ràng)
+    function displayInvalidTicket(rawCode, errorMsg = 'Mã QR không hợp lệ hoặc không tồn tại trong hệ thống EventHub.') {
+      currentTicket = null;
+      document.getElementById('ticket-empty-state').style.display = 'none';
+      document.getElementById('ticket-detail-view').style.display = 'block';
+
+      document.getElementById('t-code').innerText = rawCode || 'KHÔNG RÕ MÃ';
+      document.getElementById('t-event').innerText = 'Không tồn tại';
+      document.getElementById('t-buyer').innerText = 'Không xác định';
+      document.getElementById('t-email').innerText = '--';
+      document.getElementById('t-phone').innerText = '--';
+      document.getElementById('t-type').innerText = 'Vé không hợp lệ';
+      document.getElementById('t-seat').innerText = 'Không có';
+
+      const statusPill = document.getElementById('t-status-pill');
+      statusPill.className = 'eh-status-pill invalid';
+      statusPill.innerText = 'Không hợp lệ';
+
+      const statusText = document.getElementById('t-status-text');
+      statusText.innerText = 'Không hợp lệ';
+      statusText.className = 'eh-info-value strong-danger';
+      statusText.style.color = '';
+      statusText.style.fontWeight = '';
+
+      const checkinTimeEl = document.getElementById('t-checkin-time');
+      checkinTimeEl.innerText = '--';
+      checkinTimeEl.className = 'eh-info-value';
+      checkinTimeEl.style.color = '';
+      checkinTimeEl.style.fontWeight = '';
+
+      const warningBox = document.getElementById('checkin-warning');
+      setCheckinBanner(
+        warningBox,
+        'danger',
+        `
+        ❌ <b>Lỗi đối soát:</b> ${escapeHtmlText(errorMsg)}
+        <div style="margin-top: 8px;">
+          <button class="btn btn-success" style="font-size: 12px; padding: 6px 14px; font-weight: 700; width: 100%;" onclick="enableMockAndRecheck('${encodeURIComponent(rawCode)}')">
+            👉 Bấm Vào Đây Để Xem Chi Tiết Vé Ngay (Test Offline)
+          </button>
+        </div>
+      `
+      );
+
+      const btnConfirm = document.getElementById('btn-confirm-checkin');
+      btnConfirm.classList.add('btn-disabled');
+      btnConfirm.disabled = true;
+      btnConfirm.style.background = '#991b1b';
+      btnConfirm.style.color = '#fee2e2';
+      btnConfirm.style.borderColor = '';
+      const btnText = document.getElementById('btn-confirm-text');
+      if (btnText) btnText.innerText = '❌ MÃ VÉ KHÔNG HỢP LỆ';
+
+      const vf = document.getElementById('viewfinder-box');
+      if (vf) vf.className = 'viewfinder active-error';
+      playBeep('error');
+
+      showAlert('❌ ' + errorMsg, 'error');
+      document.getElementById('scan-status-text').innerText = '❌ Không hợp lệ: ' + (rawCode || '').slice(0, 20) + ' • Sẵn sàng quét tiếp';
+    }
+
+    // Hiển thị thông tin vé chi tiết (Tự động đè thông tin vé cũ khi quét vé mới thành công)
+    function displayTicket(rawTicket, isFreshCheckin = false, options = {}) {
+      const ticket = normalizeTicket(rawTicket) || rawTicket;
+      currentTicket = ticket;
+      document.getElementById('ticket-empty-state').style.display = 'none';
+      document.getElementById('ticket-detail-view').style.display = 'block';
+
+      // 1. Mã vé
+      document.getElementById('t-code').innerText = ticket.ticketCode || 'N/A';
+
+      // 2. Điền chính xác 8 trường theo giao diện EventHub chính thức
+      document.getElementById('t-event').innerText = ticket.eventName || 'Không rõ sự kiện';
+      document.getElementById('t-buyer').innerText = ticket.buyerName || 'Không rõ';
+      document.getElementById('t-email').innerText = ticket.buyerEmail || 'Không rõ';
+      document.getElementById('t-phone').innerText = ticket.buyerPhone || 'Không có';
+      document.getElementById('t-type').innerText = ticket.ticketType || 'Không rõ hạng vé';
+      document.getElementById('t-seat').innerText = ticket.seat || 'Không có';
+
+      const isChecked = ticket.status === 'USED' || Boolean(ticket.checkedInAt) || Boolean(ticket.checked_in_at);
+      const statusPill = document.getElementById('t-status-pill');
+      const statusText = document.getElementById('t-status-text');
+      const checkinTimeEl = document.getElementById('t-checkin-time');
+      const warningBox = document.getElementById('checkin-warning');
+      const btnConfirm = document.getElementById('btn-confirm-checkin');
+      const btnText = document.getElementById('btn-confirm-text');
+      const vf = document.getElementById('viewfinder-box');
+
+      // Đặt lại kiểu inline tránh rò màu trạng thái giữa các lượt quét
+      statusText.style.color = '';
+      statusText.style.fontWeight = '';
+      checkinTimeEl.style.color = '';
+      checkinTimeEl.style.fontWeight = '';
+      btnConfirm.style.borderColor = '';
+
+      if (isChecked) {
+        const checkedTime = ticket.checkedInAt || ticket.checked_in_at;
+        const timeStr = checkedTime ? formatDateTime(checkedTime) : 'Đã soát vé';
+
+        if (isFreshCheckin) {
+          const confirmSource = options.confirmedSource || ticket._confirmedSource || resolveCurrentConfirmSource();
+          const isAuto = Boolean(options.confirmedAuto !== undefined ? options.confirmedAuto : ticket._confirmedAuto);
+          ticket._confirmedSource = confirmSource;
+          ticket._confirmedAuto = isAuto;
+          ticket._autoConfirmPending = false;
+
+          const meta = getCheckinSourceMeta(confirmSource);
+
+          statusPill.className = 'eh-status-pill confirmed';
+          statusPill.innerText = isAuto ? ('✓ Auto • ' + meta.pillLabel) : ('✓ ' + meta.pillLabel);
+
+          statusText.className = 'eh-info-value';
+          statusText.style.color = '#34d399';
+          statusText.style.fontWeight = '700';
+          statusText.innerText = isAuto
+            ? ('Vừa tự động xác nhận (' + meta.badge + ')')
+            : ('Vừa xác nhận (' + meta.badge + ')');
+
+          checkinTimeEl.className = 'eh-info-value';
+          checkinTimeEl.style.color = '#34d399';
+          checkinTimeEl.style.fontWeight = '700';
+          checkinTimeEl.innerText = timeStr + ' (Vừa xong)';
+
+          setCheckinBanner(
+            warningBox,
+            'success',
+            `✅ <b>${isAuto ? 'AUTO SOÁT VÉ — VỪA XÁC NHẬN THÀNH CÔNG' : 'VỪA XÁC NHẬN SOÁT VÉ THÀNH CÔNG'}</b><br>
+             <small style="color: #d1fae5;">${meta.sourceDetail} cho vé <b>${escapeHtmlText(ticket.ticketCode || '')}</b> lúc <b>${escapeHtmlText(timeStr)}</b>.</small>`
+          );
+
+          btnConfirm.classList.add('btn-disabled');
+          btnConfirm.disabled = true;
+          btnConfirm.style.background = '#059669';
+          btnConfirm.style.color = '#ffffff';
+          btnConfirm.style.borderColor = '#10b981';
+          if (btnText) btnText.innerText = isAuto ? meta.btnAutoLabel : meta.btnManualLabel;
+
+          if (vf) vf.className = 'viewfinder active-detected';
+        } else {
+          // ĐÃ SOÁT VÉ TRƯỚC ĐÓ (Hiển thị trạng thái cảnh báo đỏ)
+          ticket._confirmedSource = null;
+          ticket._confirmedAuto = false;
+          ticket._autoConfirmPending = false;
+
+          statusPill.className = 'eh-status-pill used';
+          statusPill.innerText = 'Đã soát vé';
+
+          statusText.innerText = 'Đã soát vé';
+          statusText.className = 'eh-info-value strong-danger';
+
+          checkinTimeEl.innerText = timeStr;
+          checkinTimeEl.className = 'eh-info-value strong-danger';
+
+          const staffStr = ticket.checkedInBy || 'Nhân sự';
+          setCheckinBanner(
+            warningBox,
+            'danger',
+            `⚠️ <b>Vé đã được check-in lúc:</b> <b>${escapeHtmlText(timeStr)}</b> bởi <b>${escapeHtmlText(staffStr)}</b>.`
+          );
+
+          btnConfirm.classList.add('btn-disabled');
+          btnConfirm.disabled = true;
+          btnConfirm.style.background = '#dc2626';
+          btnConfirm.style.color = '#ffffff';
+          btnConfirm.style.borderColor = '#ef4444';
+          if (btnText) btnText.innerText = '⚠️ VÉ ĐÃ ĐƯỢC SOÁT TRƯỚC ĐÓ';
+
+          playBeep('error');
+          if (vf) vf.className = 'viewfinder active-error';
+          showAlert('⚠️ Vé này đã được check-in trước đó!', 'error');
+        }
+      } else if (ticket.status === 'VALID') {
+        // CHƯA SOÁT VÉ (HỢP LỆ)
+        ticket._confirmedSource = null;
+        ticket._confirmedAuto = false;
+
+        statusPill.className = 'eh-status-pill valid';
+        statusPill.innerText = 'Chưa soát vé';
+
+        statusText.innerText = 'Chưa soát vé';
+        statusText.className = 'eh-info-value';
+
+        checkinTimeEl.innerText = 'Chưa soát vé';
+        checkinTimeEl.className = 'eh-info-value';
+
+        if (warningBox) warningBox.style.display = 'none';
+
+        btnConfirm.classList.remove('btn-disabled');
+        btnConfirm.disabled = false;
+        btnConfirm.style.background = '';
+        btnConfirm.style.color = '';
+        btnConfirm.style.borderColor = '';
+        if (btnText) btnText.innerText = 'Xác nhận soát vé';
+
+        if (vf) vf.className = 'viewfinder active-detected';
+
+        // Tự động Check-in ngay nếu bật chế độ Auto Check-in (Hands-free)
+        const shouldAutoConfirm = !isFreshCheckin
+          && Boolean(document.getElementById('auto-confirm')?.checked)
+          && (options.allowAutoConfirm !== false);
+        ticket._autoConfirmPending = shouldAutoConfirm;
+
+        if (shouldAutoConfirm) {
+          if (btnText) btnText.innerText = '⚡ Đang tự động xác nhận...';
+          if (autoConfirmTimer) clearTimeout(autoConfirmTimer);
+          const targetCode = ticket.ticketCode;
+          autoConfirmTimer = setTimeout(() => {
+            autoConfirmTimer = null;
+            if (currentTicket && currentTicket.ticketCode === targetCode && currentTicket.status === 'VALID') {
+              executeCheckIn();
+            }
+          }, 60);
+        }
+      } else {
+        // VÉ BỊ HỦY HOẶC KHÔNG HỢP LỆ
+        ticket._confirmedSource = null;
+        ticket._confirmedAuto = false;
+        ticket._autoConfirmPending = false;
+
+        statusPill.className = 'eh-status-pill invalid';
+        statusPill.innerText = ticket.status === 'CANCELLED' ? 'Đã hủy' : (ticket.status || 'Không hợp lệ');
+
+        statusText.innerText = ticket.status === 'CANCELLED' ? 'Đã hủy' : (ticket.status || 'Không hợp lệ');
+        statusText.className = 'eh-info-value strong-danger';
+
+        checkinTimeEl.innerText = '--';
+        checkinTimeEl.className = 'eh-info-value';
+
+        setCheckinBanner(
+          warningBox,
+          'danger',
+          `❌ <b>Trạng thái vé:</b> ${escapeHtmlText(ticket.status || 'Không thể soát vé này')}`
+        );
+
+        btnConfirm.classList.add('btn-disabled');
+        btnConfirm.disabled = true;
+        btnConfirm.style.background = '#475569';
+        btnConfirm.style.color = '#ffffff';
+        if (btnText) btnText.innerText = '❌ VÉ KHÔNG THỂ SOÁT';
+        if (vf) vf.className = 'viewfinder active-error';
+      }
+
+      document.getElementById('scan-status-text').innerText = formatScanStatusForTicket(ticket);
+    }
+
+    function completeCheckinConfirmation(confirmSource, isAuto) {
+      if (!currentTicket) return;
+      const nowMs = Date.now();
+      const nowIso = new Date(nowMs).toISOString();
+      const meta = getCheckinSourceMeta(confirmSource);
+
+      currentTicket.status = 'USED';
+      currentTicket.checkedInAt = nowIso;
+      currentTicket.checked_in_at = nowIso;
+      if (currentTicket.raw) {
+        currentTicket.raw.status = 'USED';
+        currentTicket.raw.checked_in_at = nowIso;
+        currentTicket.raw.checkedInAt = nowIso;
+      }
+      currentTicket._confirmedSource = confirmSource;
+      currentTicket._confirmedAuto = isAuto;
+      currentTicket._confirmedAt = nowMs;
+      currentTicket._autoConfirmPending = false;
+
+      if (currentQrRaw) {
+        recentlyConfirmedQr = currentQrRaw;
+        recentlyConfirmedAt = nowMs;
+      }
+
+      playBeep('success');
+      showAlert(
+        '✅ ' + (isAuto ? '[Auto] ' : '') + meta.shortBadge + ' vừa xác nhận check-in thành công cho ' + (currentTicket.buyerName || currentTicket.attendee_name || 'khách'),
+        'success'
+      );
+      addCheckinHistory(currentTicket, confirmSource, isAuto);
+      displayTicket(currentTicket, true, { confirmedSource: confirmSource, confirmedAuto: isAuto });
+    }
+
+    // Thực hiện xác nhận Check-in
+    async function executeCheckIn() {
+      if (!currentTicket || isCheckingIn || currentTicket.status === 'USED') return;
+      if (autoConfirmTimer) {
+        clearTimeout(autoConfirmTimer);
+        autoConfirmTimer = null;
+      }
+      isCheckingIn = true;
+      const isAuto = Boolean(document.getElementById('auto-confirm')?.checked);
+
+      const btn = document.getElementById('btn-confirm-checkin');
+      const btnText = document.getElementById('btn-confirm-text');
+      if (btnText) btnText.innerText = isAuto ? '⚡ Đang tự động xác nhận soát vé...' : 'Đang xác nhận soát vé...';
+      btn.classList.add('btn-disabled');
+      btn.disabled = true;
+
+      const isMock = (operatingMode === 'test') || document.getElementById('mock-api-toggle')?.checked;
+      if (isMock) {
+        setTimeout(() => {
+          // Kích hoạt còi chíp (GPIO 1) & màn hình OLED trên phần cứng ESP32
+          fetch('/api/beep', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              duration: 90,
+              oled_status: 'OK',
+              qr_code: currentTicket.ticket_code || currentTicket.code || currentQrRaw || ''
+            })
+          }).catch(() => {});
+
+          completeCheckinConfirmation('mock', isAuto);
+          isCheckingIn = false;
+        }, 300);
+        return;
+      }
+
+      const apiBase = getApiBaseUrl();
+
+      try {
+        const res = await fetch('/api/proxy/check-in', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': staffToken ? 'Bearer ' + staffToken : ''
+          },
+          body: JSON.stringify({
+            qrCode: currentQrRaw,
+            ticketId: currentTicket.id,
+            apiBase
+          })
+        });
+        const serverRoute = res.headers?.get ? res.headers.get('X-Checkin-Route') : null;
+        const confirmSource = resolveCurrentConfirmSource(serverRoute);
+        const data = await res.json();
+
+        if (res.ok && data.success) {
+          completeCheckinConfirmation(confirmSource, isAuto);
+        } else {
+          if (currentTicket) currentTicket._autoConfirmPending = false;
+          playBeep('error');
+          showAlert(data.message || 'Xác nhận check-in thất bại.', 'error');
+          btn.classList.remove('btn-disabled');
+          btn.disabled = false;
+          if (btnText) btnText.innerText = 'Xác nhận soát vé';
+          document.getElementById('scan-status-text').innerText = formatScanStatusForTicket(currentTicket);
+        }
+      } catch (err) {
+        if (currentTicket) currentTicket._autoConfirmPending = false;
+        showAlert('Lỗi kết nối check-in: ' + err.message, 'error');
+        btn.classList.remove('btn-disabled');
+        btn.disabled = false;
+        if (btnText) btnText.innerText = 'Xác nhận soát vé';
+        document.getElementById('scan-status-text').innerText = formatScanStatusForTicket(currentTicket);
+      } finally {
+        isCheckingIn = false;
+      }
+    }
+
+    function addCheckinHistory(ticket, confirmSource = null, isAuto = false) {
+      const sourceKey = confirmSource || ticket._confirmedSource || resolveCurrentConfirmSource();
+      const meta = getCheckinSourceMeta(sourceKey);
+      const autoUsed = Boolean(isAuto || ticket._confirmedAuto);
+      const seatValue = (typeof ticket.seat === 'string') ? ticket.seat : (ticket.seat?.label || ticket.seatLabel);
+
+      checkinHistory.unshift({
+        time: new Date().toLocaleTimeString('vi-VN'),
+        name: ticket.buyerName || ticket.attendee_name || ticket.buyer?.name || 'Khách',
+        code: ticket.ticketCode || ticket.ticket_code || 'N/A',
+        seat: seatValue || 'Tự do',
+        status: '✓ ' + (autoUsed ? 'Auto • ' : '') + meta.badge + ' vừa xác nhận'
+      });
+
+      const tbody = document.getElementById('history-tbody');
+      tbody.innerHTML = checkinHistory.slice(0, 15).map(item => `
+        <tr>
+          <td>${escapeHtmlText(item.time)}</td>
+          <td style="font-weight: 600; color: #fff;">${escapeHtmlText(item.name)}</td>
+          <td style="font-family: monospace; color: #60a5fa;">${escapeHtmlText(item.code)}</td>
+          <td>${escapeHtmlText(item.seat)}</td>
+          <td><span style="color: #34d399; font-weight: 700;">${escapeHtmlText(item.status)}</span></td>
+        </tr>
+      `).join('');
+
+      document.getElementById('history-count').innerText = checkinHistory.length + ' vé';
+    }
+
+    function resetScanState() {
+      if (autoConfirmTimer) {
+        clearTimeout(autoConfirmTimer);
+        autoConfirmTimer = null;
+      }
+      currentTicket = null;
+      currentQrRaw = '';
+      lastScannedCode = '';
+      recentlyConfirmedQr = '';
+      recentlyConfirmedAt = 0;
+      isVerifying = false;
+      isCheckingIn = false;
+      const vf = document.getElementById('viewfinder-box');
+      if (vf) vf.className = 'viewfinder';
+      const inspector = document.getElementById('scanned-qr-inspector');
+      if (inspector) inspector.style.display = 'none';
+      const warningBox = document.getElementById('checkin-warning');
+      if (warningBox) warningBox.style.display = 'none';
+      document.getElementById('ticket-empty-state').style.display = 'block';
+      document.getElementById('ticket-detail-view').style.display = 'none';
+      const btnConfirm = document.getElementById('btn-confirm-checkin');
+      if (btnConfirm) {
+        btnConfirm.classList.remove('btn-disabled');
+        btnConfirm.disabled = false;
+        btnConfirm.style.background = '';
+        btnConfirm.style.color = '';
+        btnConfirm.style.borderColor = '';
+      }
+      const btnText = document.getElementById('btn-confirm-text');
+      if (btnText) btnText.innerText = 'Xác nhận soát vé';
+      document.getElementById('scan-status-text').innerText = 'Đang sẵn sàng quét...';
+      hideAlert();
+    }
+
+    function showAlert(msg, type) {
+      const box = document.getElementById('alert-box');
+      box.className = 'alert ' + (type === 'success' ? 'alert-success' : 'alert-error');
+      box.innerText = msg;
+    }
+
+    function hideAlert() {
+      const box = document.getElementById('alert-box');
+      box.style.display = 'none';
+    }
+
+    // Poll USB status & FPS & Real-time Network
+    async function pollStatus() {
+      try {
+        const res = await fetch('/status');
+        const data = await res.json();
+        const fpsText = data.fps + ' FPS';
+        document.getElementById('fps-counter').innerText = fpsText;
+        if (data.serial_connected) {
+          document.getElementById('serial-badge').innerHTML = `<span class="badge-dot"></span> USB ${data.port} @ ${(data.baud/1000000).toFixed(1)}Mbaud`;
+        } else {
+          document.getElementById('serial-badge').innerHTML = `<span class="badge-dot" style="background:#ef4444;"></span> USB Mất kết nối`;
+        }
+
+        // Cập nhật tình trạng Wi-Fi, Tín hiệu sóng & Độ trễ Server
+        if (data.network) {
+          updateNetworkUI(data.network);
+        }
+        if (data.esp32_device) {
+          updateEsp32UI(data.esp32_device, data.route_mode);
+        }
+      } catch (e) {}
+      setTimeout(pollStatus, 1500);
+    }
+
+    // Hiển thị trạng thái Wi-Fi & Độ trễ lên giao diện
+    function updateNetworkUI(net) {
+      if (!net) return;
+
+      const wifiBadge = document.getElementById('wifi-badge');
+      const wifiText = document.getElementById('wifi-text');
+      const wifiIcon = document.getElementById('wifi-icon');
+
+      const latencyBadge = document.getElementById('latency-badge');
+      const latencyText = document.getElementById('latency-text');
+      const latencyDot = document.getElementById('latency-dot');
+
+      const cardSsid = document.getElementById('card-wifi-ssid');
+      const cardSignal = document.getElementById('card-wifi-signal');
+      const cardBars = document.getElementById('card-wifi-bars');
+
+      const cardLatMs = document.getElementById('card-latency-ms');
+      const cardLatStatus = document.getElementById('card-latency-status');
+      const cardLatDot = document.getElementById('card-latency-dot');
+      const warnBox = document.getElementById('network-warning-box');
+
+      // 1. Tình trạng Wi-Fi / Mạng
+      if (net.wifi_connected) {
+        const ssid = net.ssid || 'Wi-Fi Đã Bắt Được';
+        const sig = net.signal || 0;
+        const barSymbols = ['░░░░', '▂░░░', '▂▄░░', '▂▄▆░', '▂▄▆█'];
+        const bars = barSymbols[net.signal_level || 0];
+
+        if (wifiText) wifiText.innerText = `${ssid} (${sig}%)`;
+        if (wifiBadge) {
+          wifiBadge.style.background = 'rgba(16, 185, 129, 0.15)';
+          wifiBadge.style.color = '#34d399';
+          wifiBadge.style.borderColor = 'rgba(16, 185, 129, 0.3)';
+        }
+        if (wifiIcon) wifiIcon.innerText = '📶';
+
+        if (cardSsid) cardSsid.innerText = ssid;
+        if (cardSignal) cardSignal.innerText = `Cường độ sóng: ${net.signal_text || sig + '%'}`;
+        if (cardBars) {
+          cardBars.innerText = bars;
+          cardBars.style.color = sig >= 60 ? '#34d399' : (sig >= 35 ? '#fbbf24' : '#f87171');
+        }
+      } else {
+        // Chưa kết nối Wi-Fi: Kiểm tra xem có đang dùng mạng dây Ethernet không
+        if (net.connection_type === 'ethernet' || net.server_reachable) {
+          if (wifiText) wifiText.innerText = 'Mạng Cáp (Ethernet)';
+          if (wifiBadge) {
+            wifiBadge.style.background = 'rgba(59, 130, 246, 0.15)';
+            wifiBadge.style.color = '#60a5fa';
+            wifiBadge.style.borderColor = 'rgba(59, 130, 246, 0.3)';
+          }
+          if (wifiIcon) wifiIcon.innerText = '🔌';
+
+          if (cardSsid) cardSsid.innerText = 'Mạng Cáp LAN / Ethernet';
+          if (cardSignal) cardSignal.innerText = 'Đang dùng mạng dây (Chưa kết nối Wi-Fi)';
+          if (cardBars) {
+            cardBars.innerText = 'LAN';
+            cardBars.style.color = '#60a5fa';
+          }
+        } else {
+          if (wifiText) wifiText.innerText = 'Chưa bắt được Wi-Fi';
+          if (wifiBadge) {
+            wifiBadge.style.background = 'rgba(239, 68, 68, 0.15)';
+            wifiBadge.style.color = '#f87171';
+            wifiBadge.style.borderColor = 'rgba(239, 68, 68, 0.3)';
+          }
+          if (wifiIcon) wifiIcon.innerText = '⚠️';
+
+          if (cardSsid) cardSsid.innerText = 'Chưa bắt được Wi-Fi';
+          if (cardSignal) cardSignal.innerText = 'Mất kết nối Wi-Fi & Internet';
+          if (cardBars) {
+            cardBars.innerText = '░░░░';
+            cardBars.style.color = '#f87171';
+          }
+        }
+      }
+
+      // 2. Độ trễ (Ping latency ms)
+      const lat = net.latency_ms;
+      if (lat >= 0 && net.server_reachable) {
+        if (latencyText) latencyText.innerText = `Ping: ${lat}ms`;
+        if (cardLatMs) cardLatMs.innerText = `${lat} ms`;
+
+        let color = '#34d399';
+        let statusDesc = 'api.eventhub.id.vn • Cực nhanh';
+
+        if (lat < 100) {
+          color = '#34d399';
+          statusDesc = 'api.eventhub.id.vn • Cực nhanh (<100ms)';
+        } else if (lat < 300) {
+          color = '#38bdf8';
+          statusDesc = 'api.eventhub.id.vn • Ổn định (' + lat + 'ms)';
+        } else if (lat < 800) {
+          color = '#fbbf24';
+          statusDesc = 'api.eventhub.id.vn • Hơi chậm (' + lat + 'ms)';
+        } else {
+          color = '#f87171';
+          statusDesc = 'api.eventhub.id.vn • Lag / Chậm (>800ms)';
+        }
+
+        if (latencyDot) latencyDot.style.background = color;
+        if (cardLatDot) cardLatDot.style.background = color;
+        if (cardLatMs) cardLatMs.style.color = color;
+        if (cardLatStatus) cardLatStatus.innerText = statusDesc;
+
+        if (warnBox) {
+          warnBox.style.display = (lat > 600 || !net.wifi_connected) ? 'block' : 'none';
+        }
+      } else {
+        if (latencyText) latencyText.innerText = 'Ping: Timeout';
+        if (cardLatMs) {
+          cardLatMs.innerText = 'Timeout';
+          cardLatMs.style.color = '#f87171';
+        }
+        if (latencyDot) latencyDot.style.background = '#f87171';
+        if (cardLatDot) cardLatDot.style.background = '#f87171';
+        if (cardLatStatus) cardLatStatus.innerText = 'Không kết nối được server';
+        if (warnBox) warnBox.style.display = 'block';
+      }
+    }
+
+    async function recheckNetwork() {
+      const cardLatStatus = document.getElementById('card-latency-status');
+      if (cardLatStatus) cardLatStatus.innerText = 'Đang đo lại độ trễ...';
+      try {
+        const res = await fetch('/api/network-status?t=' + Date.now());
+        const data = await res.json();
+        updateNetworkUI(data);
+      } catch(e) {}
+    }
+
+    let currentRouteMode = 'pc';
+    let isSwitchingRoute = false;
+    let lastRouteSwitchAt = 0;
+    let lastEspConnected = false;
+
+    function updateRouteUI(mode) {
+      currentRouteMode = mode || 'pc';
+      const isEsp = (currentRouteMode === 'esp32');
+
+      // 1. Cấu hình bảng cài đặt (Settings Card)
+      const btnPc = document.getElementById('btn-route-pc');
+      const btnEsp = document.getElementById('btn-route-esp32');
+      const desc = document.getElementById('route-desc');
+
+      if (btnPc) btnPc.className = isEsp ? 'btn btn-ghost' : 'btn btn-primary';
+      if (btnEsp) btnEsp.className = isEsp ? 'btn btn-primary' : 'btn btn-ghost';
+
+      if (desc) {
+        if (isEsp) {
+          desc.innerHTML = '✓ <b>Đang dùng Wi-Fi ESP32 (2.4GHz):</b> ESP32-S3 dùng sóng Wi-Fi 2.4GHz của chính nó gửi trực tiếp HTTPS đối soát vé.';
+          desc.style.color = '#34d399';
+        } else {
+          desc.innerHTML = '✓ <b>Đang dùng Mạng Máy Tính (PC):</b> Máy tính gửi request đối soát vé qua mạng PC và điều khiển còi bíp ESP32 qua cáp USB.';
+          desc.style.color = '#60a5fa';
+        }
+      }
+
+      // 2. Nút bấm trên thanh điều khiển Camera (Quick Switcher Pills)
+      const pillPc = document.getElementById('btn-route-pill-pc');
+      const pillEsp = document.getElementById('btn-route-pill-esp32');
+      const camDot = document.getElementById('cam-route-dot');
+      const camText = document.getElementById('cam-route-status-text');
+
+      if (pillPc) pillPc.className = isEsp ? 'btn btn-ghost' : 'btn btn-primary';
+      if (pillEsp) pillEsp.className = isEsp ? 'btn btn-primary' : 'btn btn-ghost';
+
+      if (camDot) camDot.style.background = isEsp ? '#10b981' : '#3b82f6';
+      if (camText) {
+        camText.innerText = isEsp ? 'ESP32 Wi-Fi 2.4G tự gửi HTTPS' : 'Máy tính PC gửi request (USB)';
+        camText.style.color = isEsp ? '#34d399' : '#60a5fa';
+      }
+
+      // 3. Huy hiệu trên thanh Header trên đỉnh trang
+      const headerBadge = document.getElementById('header-route-badge');
+      if (headerBadge) {
+        if (isEsp) {
+          headerBadge.innerHTML = '<span class="badge-dot" style="background: #10b981;"></span> Luồng: Wi-Fi ESP32 (2.4G)';
+          headerBadge.style.background = 'rgba(16, 185, 129, 0.2)';
+          headerBadge.style.color = '#34d399';
+          headerBadge.style.border = '1px solid rgba(16, 185, 129, 0.4)';
+        } else {
+          headerBadge.innerHTML = '<span class="badge-dot" style="background: #3b82f6;"></span> Luồng: Mạng PC (USB)';
+          headerBadge.style.background = 'rgba(59, 130, 246, 0.2)';
+          headerBadge.style.color = '#60a5fa';
+          headerBadge.style.border = '1px solid rgba(59, 130, 246, 0.4)';
+        }
+      }
+    }
+
+    function toggleRequestRoute() {
+      const nextMode = (currentRouteMode === 'esp32') ? 'pc' : 'esp32';
+      setRequestRoute(nextMode);
+    }
+
+    async function setRequestRoute(mode, silent = false) {
+      isSwitchingRoute = true;
+      lastRouteSwitchAt = Date.now();
+      updateRouteUI(mode);
+      try {
+        const res = await fetch('/api/config-route', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ mode: mode })
+        });
+        const data = await res.json();
+        if (data && data.success) {
+          localStorage.setItem('eventhub_route_mode', mode);
+          if (!silent) {
+            if (mode === 'esp32') {
+              if (!lastEspConnected) {
+                showAlert('⚠️ Đã chuyển sang Wi-Fi ESP32. Hiện tại ESP32 chưa kết nối Wi-Fi 2.4GHz — vui lòng chọn Wi-Fi bên dưới để kết nối!', 'error');
+              } else {
+                showAlert('✓ Đã chuyển sang luồng Wi-Fi 2.4GHz của ESP32! Mọi request đối soát sẽ do ESP32 trực tiếp gửi HTTPS.', 'success');
+              }
+            } else {
+              showAlert('✓ Đã chuyển sang luồng Mạng Máy Tính (PC)!', 'success');
+            }
+          }
+        }
+      } catch (e) {
+        console.error('Error changing route:', e);
+        if (!silent) showAlert('❌ Lỗi khi chuyển chế độ mạng: ' + e.message, 'error');
+      } finally {
+        isSwitchingRoute = false;
+      }
+      if (mode === 'esp32' && !silent) {
+        scanNearbyWifi(true);
+      }
+    }
+
+    let isTogglingAutoConfirm = false;
+    let lastAutoToggleAt = 0;
+    let lastEspTokenAttemptAt = 0;
+    let lastWifiProfilesSyncAt = 0;
+    let lastWifiProfilesSig = '';
+
+    function updateAutoConfirmEspBadge(synced, enabled) {
+      const badge = document.getElementById('auto-confirm-esp-badge');
+      if (!badge) return;
+      if (synced === true) {
+        badge.innerText = enabled ? 'ESP NVS: BẬT' : 'ESP NVS: TẮT';
+        badge.style.background = enabled ? 'rgba(16, 185, 129, 0.2)' : 'rgba(100, 116, 139, 0.25)';
+        badge.style.color = enabled ? '#34d399' : '#cbd5e1';
+      } else if (synced === false) {
+        badge.innerText = 'Chờ lưu ESP';
+        badge.style.background = 'rgba(245, 158, 11, 0.2)';
+        badge.style.color = '#fbbf24';
+      } else {
+        badge.innerText = 'NVS: --';
+        badge.style.background = 'rgba(100, 116, 139, 0.25)';
+        badge.style.color = '#94a3b8';
+      }
+    }
+
+    async function onToggleAutoConfirm(enabled) {
+      const isOn = Boolean(enabled);
+      isTogglingAutoConfirm = true;
+      lastAutoToggleAt = Date.now();
+      localStorage.setItem('eventhub_auto_confirm', isOn ? '1' : '0');
+      updateAutoConfirmEspBadge(false, isOn);
+
+      try {
+        const res = await fetch('/api/esp32/auto-confirm', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ enabled: isOn })
+        });
+        const data = await res.json();
+        if (res.ok && data && data.success) {
+          updateAutoConfirmEspBadge(true, isOn);
+          if (staffToken) syncStaffTokenToEsp32(staffToken);
+          showAlert(
+            isOn
+              ? '✓ Đã BẬT & lưu Auto Check-in vào NVS ESP32! Rút USB khỏi PC vẫn tự động xác nhận vé.'
+              : '✓ Đã TẮT & lưu cấu hình Auto Check-in vào NVS ESP32!',
+            'success'
+          );
+        } else {
+          updateAutoConfirmEspBadge(false, isOn);
+          showAlert('⚠️ ' + (data?.message || 'Chưa kết nối ESP32 để lưu cấu hình vào NVS.'), 'error');
+        }
+      } catch (e) {
+        updateAutoConfirmEspBadge(false, isOn);
+        showAlert('❌ Lỗi khi lưu Auto Check-in xuống ESP32: ' + e.message, 'error');
+      } finally {
+        isTogglingAutoConfirm = false;
+      }
+    }
+
+    async function syncStaffTokenToEsp32(token) {
+      lastEspTokenAttemptAt = Date.now();
+      try {
+        await fetch('/api/esp32/staff-token', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token: token || '' })
+        });
+      } catch (e) {}
+    }
+
+    function collectSavedWifiProfiles() {
+      const profiles = [];
+      try {
+        for (let i = 0; i < localStorage.length; i++) {
+          const key = localStorage.key(i);
+          if (!key || !key.startsWith('wifi_pass_')) continue;
+          const ssid = key.slice(10).trim();
+          const password = localStorage.getItem(key) || '';
+          if (ssid) profiles.push({ ssid, password });
+        }
+      } catch (e) {}
+      return profiles.slice(0, 4);
+    }
+
+    async function syncSavedWifiProfilesToEsp32(force = false) {
+      const profiles = collectSavedWifiProfiles();
+      if (!profiles.length) return;
+      const sig = JSON.stringify(profiles);
+      if (!force && sig === lastWifiProfilesSig) return;
+      lastWifiProfilesSyncAt = Date.now();
+      try {
+        const res = await fetch('/api/esp32/wifi-profiles', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ profiles })
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (data && data.success) {
+            lastWifiProfilesSig = sig;
+          }
+        }
+      } catch (e) {}
+    }
+
+    function updateEsp32UI(esp, routeMode) {
+      if (!esp) return;
+      const isConnected = !!(esp.wifi_connected && esp.ip && esp.ip !== '0.0.0.0');
+      lastEspConnected = isConnected;
+
+      if (routeMode && routeMode !== currentRouteMode && !isSwitchingRoute && (Date.now() - lastRouteSwitchAt > 2500)) {
+        updateRouteUI(routeMode);
+      }
+
+      if (typeof esp.auto_confirm === 'boolean' && !isTogglingAutoConfirm && (Date.now() - lastAutoToggleAt > 2500)) {
+        const autoBox = document.getElementById('auto-confirm');
+        if (autoBox && autoBox.checked !== esp.auto_confirm) {
+          autoBox.checked = esp.auto_confirm;
+        }
+        localStorage.setItem('eventhub_auto_confirm', esp.auto_confirm ? '1' : '0');
+        updateAutoConfirmEspBadge(true, esp.auto_confirm);
+      }
+
+      if (staffToken && esp.has_token === false && (esp.last_seen > 0 || isConnected) && (Date.now() - lastEspTokenAttemptAt > 5000)) {
+        syncStaffTokenToEsp32(staffToken);
+      }
+
+      if ((esp.last_seen > 0 || isConnected) && (Date.now() - lastWifiProfilesSyncAt > 12000)) {
+        const saved = collectSavedWifiProfiles();
+        const sig = JSON.stringify(saved);
+        if (saved.length > 0 && (sig !== lastWifiProfilesSig || (esp.wifi_profiles_count || 0) < saved.length)) {
+          syncSavedWifiProfilesToEsp32(sig !== lastWifiProfilesSig);
+        }
+      }
+
+      // 1. Header Badge: ESP32 Wi-Fi & Latency
+      const hBadge = document.getElementById('esp-header-badge');
+      const hDot = document.getElementById('esp-header-dot');
+      const hText = document.getElementById('esp-header-text');
+      if (hBadge && hText) {
+        if (isConnected) {
+          hBadge.style.background = 'rgba(16, 185, 129, 0.15)';
+          hBadge.style.color = '#34d399';
+          hBadge.style.borderColor = 'rgba(16, 185, 129, 0.35)';
+          if (hDot) hDot.style.background = '#34d399';
+          const latPart = esp.latency_ms > 0 ? ` • ${esp.latency_ms}ms` : '';
+          const sigPart = esp.signal_pct > 0 ? ` • ${esp.signal_pct}%` : '';
+          hText.innerText = `ESP32 Wi-Fi: ${esp.ssid || 'Đã kết nối'}${sigPart}${latPart}`;
+        } else {
+          hBadge.style.background = 'rgba(239, 68, 68, 0.15)';
+          hBadge.style.color = '#f87171';
+          hBadge.style.borderColor = 'rgba(239, 68, 68, 0.35)';
+          if (hDot) hDot.style.background = '#f87171';
+          hText.innerText = 'ESP32: Chưa kết nối Wi-Fi';
+        }
+      }
+
+      // 2. Camera Card Live Bar: Tình trạng tự kết nối, Tên mạng, Cường độ sóng, Độ trễ
+      const livePill = document.getElementById('esp-live-status-pill');
+      const liveDot = document.getElementById('esp-live-dot');
+      const liveStatusText = document.getElementById('esp-live-status-text');
+      const liveSsid = document.getElementById('esp-live-ssid');
+      const liveSignal = document.getElementById('esp-live-signal');
+      const liveLatency = document.getElementById('esp-live-latency');
+      const liveIp = document.getElementById('esp-live-ip');
+
+      if (isConnected) {
+        if (livePill) {
+          livePill.style.background = 'rgba(16, 185, 129, 0.2)';
+          livePill.style.color = '#34d399';
+          livePill.style.borderColor = 'rgba(16, 185, 129, 0.4)';
+        }
+        if (liveDot) liveDot.style.background = '#34d399';
+        if (liveStatusText) liveStatusText.innerText = 'ESP32: ĐÃ TỰ KẾT NỐI WI-FI';
+        if (liveSsid) liveSsid.innerText = esp.ssid || 'Đã kết nối';
+        if (liveSignal) {
+          const bars = esp.signal_bars || '';
+          const pct = (esp.signal_pct !== undefined) ? esp.signal_pct : 0;
+          const rssi = esp.rssi || 0;
+          liveSignal.innerText = `${pct}% (${rssi} dBm ${bars})`;
+          liveSignal.style.color = pct >= 60 ? '#38bdf8' : (pct >= 40 ? '#facc15' : '#f87171');
+        }
+        if (liveLatency) {
+          if (esp.latency_ms > 0) {
+            liveLatency.innerText = `${esp.latency_ms} ms ⚡`;
+            liveLatency.style.color = esp.latency_ms < 60 ? '#34d399' : (esp.latency_ms < 200 ? '#facc15' : '#f87171');
+          } else {
+            liveLatency.innerText = esp.latency_text || 'Đang đo...';
+            liveLatency.style.color = '#94a3b8';
+          }
+        }
+        if (liveIp) liveIp.innerText = `IP: ${esp.ip}`;
+      } else {
+        if (livePill) {
+          livePill.style.background = 'rgba(239, 68, 68, 0.2)';
+          livePill.style.color = '#f87171';
+          livePill.style.borderColor = 'rgba(239, 68, 68, 0.4)';
+        }
+        if (liveDot) liveDot.style.background = '#f87171';
+        if (liveStatusText) liveStatusText.innerText = 'ESP32: CHƯA KẾT NỐI WI-FI';
+        if (liveSsid) liveSsid.innerText = 'Chưa kết nối';
+        if (liveSignal) {
+          liveSignal.innerText = '--';
+          liveSignal.style.color = '#64748b';
+        }
+        if (liveLatency) {
+          liveLatency.innerText = '--';
+          liveLatency.style.color = '#64748b';
+        }
+        if (liveIp) liveIp.innerText = 'IP: 0.0.0.0';
+      }
+
+      // 3. Settings Card Section
+      const statusText = document.getElementById('esp-wifi-status-text');
+      const ipText = document.getElementById('esp-wifi-ip');
+      const cardBadge = document.getElementById('esp-card-status-badge');
+      const cardBars = document.getElementById('esp-card-bars');
+      const cardSignal = document.getElementById('esp-card-signal-val');
+      const cardLatency = document.getElementById('esp-card-latency-val');
+      const standLink = document.getElementById('esp-standalone-link');
+
+      if (isConnected) {
+        if (statusText) {
+          statusText.innerText = `📶 ${esp.ssid || 'Đã kết nối Wi-Fi'}`;
+          statusText.style.color = '#34d399';
+        }
+        if (ipText) {
+          ipText.innerText = `IP: ${esp.ip}`;
+          ipText.style.color = '#38bdf8';
+        }
+        if (cardBadge) {
+          cardBadge.innerText = '✓ Đã tự kết nối';
+          cardBadge.style.background = 'rgba(16, 185, 129, 0.2)';
+          cardBadge.style.color = '#34d399';
+        }
+        if (cardBars) {
+          cardBars.innerText = esp.signal_bars || '▂▄▆█';
+          cardBars.style.color = (esp.signal_pct || 0) >= 60 ? '#34d399' : '#facc15';
+        }
+        if (cardSignal) {
+          cardSignal.innerText = esp.signal_text || `${esp.signal_pct || 0}% (${esp.rssi || 0} dBm)`;
+          cardSignal.style.color = (esp.signal_pct || 0) >= 60 ? '#38bdf8' : '#facc15';
+        }
+        if (cardLatency) {
+          cardLatency.innerText = esp.latency_text || (esp.latency_ms > 0 ? `${esp.latency_ms} ms` : '--');
+          cardLatency.style.color = (esp.latency_ms > 0 && esp.latency_ms < 100) ? '#34d399' : '#38bdf8';
+        }
+        if (standLink) {
+          standLink.href = `http://${esp.ip}`;
+          standLink.style.display = 'inline-block';
+        }
+      } else {
+        if (statusText) {
+          statusText.innerText = 'Chưa kết nối Wi-Fi';
+          statusText.style.color = '#cbd5e1';
+        }
+        if (ipText) {
+          ipText.innerText = 'IP: 0.0.0.0';
+          ipText.style.color = '#64748b';
+        }
+        if (cardBadge) {
+          cardBadge.innerText = 'Chưa kết nối';
+          cardBadge.style.background = 'rgba(239, 68, 68, 0.2)';
+          cardBadge.style.color = '#f87171';
+        }
+        if (cardBars) {
+          cardBars.innerText = '░░░░';
+          cardBars.style.color = '#64748b';
+        }
+        if (cardSignal) {
+          cardSignal.innerText = 'Chưa có tín hiệu';
+          cardSignal.style.color = '#64748b';
+        }
+        if (cardLatency) {
+          cardLatency.innerText = '--';
+          cardLatency.style.color = '#64748b';
+        }
+        if (standLink) {
+          standLink.style.display = 'none';
+        }
+      }
+    }
+
+    let isScanningWifi = false;
+    let currentScannedNetworks = [];
+
+    // Hiển thị danh sách thẻ Wi-Fi trực quan (Bấm vào thẻ là tự điền SSID và nạp lại mật khẩu cũ)
+    function renderWifiCards(networks, selectedSsid = '') {
+      const container = document.getElementById('wifi-cards-container');
+      const sel = document.getElementById('esp-wifi-select');
+      if (!container) return;
+
+      if (!networks || networks.length === 0) {
+        container.innerHTML = `
+          <div style="text-align: center; color: #94a3b8; font-size: 11.5px; padding: 12px 8px;">
+            ⚠️ Chưa phát hiện mạng Wi-Fi nào. Bấm <b>[🔄 Quét Wi-Fi]</b> để dùng ăng-ten ESP32 quét lại.
+          </div>
+        `;
+        if (sel) sel.innerHTML = '<option value="">-- Chưa tìm thấy Wi-Fi --</option>';
+        return;
+      }
+
+      currentScannedNetworks = networks;
+
+      container.innerHTML = networks.map(net => {
+        const isSelected = (selectedSsid && net.ssid === selectedSsid);
+        const is24g = (net.is_24g !== false) && !(net.band || '').includes('5');
+        const sig = net.signal || 0;
+        let sigColor = '#34d399';
+        if (sig < 45) sigColor = '#f87171';
+        else if (sig < 65) sigColor = '#fbbf24';
+
+        const borderStyle = isSelected
+          ? 'border: 1px solid #38bdf8; background: #0c2340; box-shadow: 0 0 10px rgba(56, 189, 248, 0.25);'
+          : (is24g ? 'border: 1px solid rgba(16, 185, 129, 0.25); background: #0b1426;' : 'border: 1px solid rgba(255, 255, 255, 0.08); background: #0b1426; opacity: 0.72;');
+
+        const bandTag = is24g
+          ? `<span style="font-size: 10px; color: #34d399; background: rgba(16,185,129,0.14); border: 1px solid rgba(16,185,129,0.3); padding: 1px 6px; border-radius: 4px; font-weight: 700;">✓ 2.4 GHz (Hỗ trợ ESP32)</span>`
+          : `<span style="font-size: 10px; color: #f87171; background: rgba(239,68,68,0.14); border: 1px solid rgba(239,68,68,0.3); padding: 1px 6px; border-radius: 4px; font-weight: 600;">⚠️ 5 GHz (ESP32 không hỗ trợ)</span>`;
+        const srcTag = net.badge
+          ? `<span style="font-size: 10px; color: #38bdf8; background: rgba(56,189,248,0.12); padding: 1px 5px; border-radius: 3px;">📡 ${net.badge}</span>`
+          : '';
+        const authTag = net.auth ? `<span style="font-size: 10px; color: #64748b;">${net.auth}</span>` : '';
+
+        const safeEncSsid = encodeURIComponent(net.ssid).replace(/'/g, '%27');
+        return `
+          <div class="wifi-card-item" onclick="onSelectWifi('${safeEncSsid}', true)" style="display: flex; justify-content: space-between; align-items: center; padding: 7px 10px; border-radius: 6px; cursor: pointer; transition: all 0.15s; ${borderStyle}">
+            <div style="display: flex; align-items: center; gap: 8px; min-width: 0;">
+              <span style="font-size: 14px; flex-shrink: 0;">${is24g ? '📶' : '🚫'}</span>
+              <div style="min-width: 0;">
+                <div style="font-size: 12px; font-weight: 700; color: #ffffff; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+                  ${net.ssid} ${isSelected ? '<span style="color: #38bdf8; font-size: 10.5px; font-weight: bold;">(Đang chọn)</span>' : ''}
+                </div>
+                <div style="font-size: 10px; display: flex; gap: 5px; align-items: center; flex-wrap: wrap; margin-top: 3px;">
+                  ${bandTag}
+                  ${srcTag}
+                  ${authTag}
+                </div>
+              </div>
+            </div>
+            <div style="display: flex; align-items: center; gap: 8px; flex-shrink: 0;">
+              <span style="font-size: 11px; font-weight: 700; color: ${sigColor}; background: rgba(255,255,255,0.04); padding: 2px 6px; border-radius: 4px; font-family: monospace;">
+                ${sig}% ${net.bars || '▂▄▆█'}
+              </span>
+              <button class="btn btn-ghost" style="padding: 2px 8px; font-size: 10.5px; ${isSelected ? 'background: #0284c7; color: white;' : ''}" onclick="event.stopPropagation(); onSelectWifi('${safeEncSsid}', true)">
+                ${isSelected ? '✓ Chọn' : 'Chọn'}
+              </button>
+            </div>
+          </div>
+        `;
+      }).join('');
+
+      // Cập nhật song song dropdown select
+      if (sel) {
+        sel.innerHTML = `<option value="">-- Đã tìm thấy ${networks.length} mạng Wi-Fi (Chọn để điền) --</option>` +
+          networks.map(n => {
+            const labelBand = (n.is_24g !== false && !(n.band || '').includes('5')) ? '2.4G ✓' : '5G ⚠️';
+            return `<option value="${n.ssid}" ${selectedSsid === n.ssid ? 'selected' : ''}>📶 ${n.ssid} (${n.signal}% • ${labelBand})</option>`;
+          }).join('');
+      }
+    }
+
+    async function scanNearbyWifi(manual = false) {
+      if (isScanningWifi) return;
+      isScanningWifi = true;
+
+      const statusEl = document.getElementById('wifi-scan-status');
+      const scanBtn = document.getElementById('btn-scan-wifi');
+
+      if (statusEl) {
+        statusEl.style.display = 'inline-block';
+        statusEl.style.color = '#38bdf8';
+        statusEl.innerText = manual ? '🔄 Đang quét ăng-ten ESP32 & PC (2-3s)...' : '🔄 Đang quét Wi-Fi 2.4G...';
+      }
+      if (scanBtn) {
+        scanBtn.disabled = true;
+        scanBtn.innerText = '⏳ Đang quét...';
+      }
+
+      try {
+        const url = '/api/wifi-scan?' + (manual ? 'force=1&' : '') + 't=' + Date.now();
+        const res = await fetch(url);
+        const data = await res.json();
+        if (data.success && data.networks && data.networks.length > 0) {
+          const currentSsid = document.getElementById('esp-input-ssid')?.value?.trim() || '';
+          const best24g = data.networks.find(n => n.is_24g !== false) || data.networks[0];
+          const targetSsid = currentSsid || best24g?.ssid || '';
+          renderWifiCards(data.networks, targetSsid);
+
+          if (!currentSsid && best24g) {
+            onSelectWifi(encodeURIComponent(best24g.ssid), false);
+          }
+
+          if (statusEl) {
+            const count24 = data.networks.filter(n => n.is_24g !== false).length;
+            statusEl.innerText = `✓ Tìm thấy ${data.networks.length} mạng (${count24} mạng 2.4G)`;
+            statusEl.style.color = '#34d399';
+            setTimeout(() => { if (statusEl) statusEl.style.display = 'none'; }, 5000);
+          }
+        } else {
+          renderWifiCards([], '');
+          if (statusEl) {
+            statusEl.innerText = '⚠️ Không tìm thấy mạng Wi-Fi';
+            statusEl.style.color = '#f59e0b';
+          }
+        }
+      } catch (err) {
+        console.error('Wi-Fi scan error:', err);
+        if (statusEl) {
+          statusEl.innerText = '❌ Lỗi quét: ' + err.message;
+          statusEl.style.color = '#f87171';
+        }
+      } finally {
+        isScanningWifi = false;
+        if (scanBtn) {
+          scanBtn.disabled = false;
+          scanBtn.innerText = '🔄 Quét Wi-Fi';
+        }
+      }
+    }
+
+    function onSelectWifi(encodedSsid, userInitiated = true) {
+      let ssid = encodedSsid;
+      try { ssid = decodeURIComponent(encodedSsid); } catch(e) {}
+      if (!ssid) return;
+
+      const ssidInput = document.getElementById('esp-input-ssid');
+      const passInput = document.getElementById('esp-input-pass');
+      const sel = document.getElementById('esp-wifi-select');
+      const msgEl = document.getElementById('esp-wifi-msg');
+
+      if (ssidInput) ssidInput.value = ssid;
+      if (sel) sel.value = ssid;
+
+      // Kiểm tra xem mạng có tương thích ESP32 (2.4GHz Personal/Open) không
+      const netObj = currentScannedNetworks.find(n => n.ssid === ssid);
+      if (msgEl && netObj) {
+        const is5g = (netObj.is_24g === false) || (netObj.band || '').includes('5');
+        const isEnt = (netObj.auth || '').toLowerCase().includes('enterprise');
+        if (is5g) {
+          msgEl.style.display = 'block';
+          msgEl.style.background = 'rgba(245, 158, 11, 0.15)';
+          msgEl.style.border = '1px solid rgba(245, 158, 11, 0.45)';
+          msgEl.style.color = '#fbbf24';
+          msgEl.innerHTML = `⚠️ <b>Cảnh báo băng tần 5 GHz:</b> Mạng "<b>${ssid}</b>" phát ở băng tần 5 GHz. Chip ESP32-S3 chỉ bắt được Wi-Fi <b>2.4 GHz</b>! Vui lòng chọn một mạng có nhãn <b style="color:#34d399;">✓ 2.4 GHz</b>.`;
+        } else if (isEnt) {
+          msgEl.style.display = 'block';
+          msgEl.style.background = 'rgba(245, 158, 11, 0.15)';
+          msgEl.style.border = '1px solid rgba(245, 158, 11, 0.45)';
+          msgEl.style.color = '#fbbf24';
+          msgEl.innerHTML = `⚠️ <b>Lưu ý bảo mật Enterprise:</b> Mạng "<b>${ssid}</b>" dùng chuẩn <b>${netObj.auth}</b> (yêu cầu tài khoản/chứng chỉ doanh nghiệp). ESP32-S3 chỉ hỗ trợ Wi-Fi chuẩn Personal (WPA/WPA2-PSK) hoặc Open.`;
+        } else {
+          msgEl.style.display = 'none';
+        }
+      }
+
+      // Nạp lại mật khẩu đã lưu trước đó nếu có
+      const savedPass = localStorage.getItem('wifi_pass_' + ssid) || '';
+      if (passInput) {
+        if (savedPass) passInput.value = savedPass;
+        if (userInitiated) {
+          passInput.focus();
+          passInput.style.borderColor = '#38bdf8';
+          setTimeout(() => { passInput.style.borderColor = ''; }, 1500);
+        }
+      }
+
+      // Re-render visual cards to highlight the selected card
+      if (currentScannedNetworks && currentScannedNetworks.length > 0) {
+        renderWifiCards(currentScannedNetworks, ssid);
+      }
+    }
+
+    function toggleWifiPassVisibility() {
+      const passInput = document.getElementById('esp-input-pass');
+      if (passInput) {
+        passInput.type = (passInput.type === 'password') ? 'text' : 'password';
+      }
+    }
+
+    async function saveEspWifiConfig() {
+      const ssid = document.getElementById('esp-input-ssid').value.trim();
+      const password = document.getElementById('esp-input-pass').value;
+      const msgEl = document.getElementById('esp-wifi-msg');
+      const btn = document.getElementById('btn-save-esp-wifi');
+      const passInput = document.getElementById('esp-input-pass');
+
+      if (!ssid) {
+        alert('Vui lòng chọn hoặc nhập Tên Wi-Fi (SSID) để cài cho ESP32!');
+        return;
+      }
+
+      btn.disabled = true;
+      btn.innerHTML = `⏳ Đang kết nối tới <b>${ssid}</b>... Vui lòng đợi (khoảng 3-8s)`;
+      if (msgEl) {
+        msgEl.style.display = 'block';
+        msgEl.style.background = 'rgba(59, 130, 246, 0.15)';
+        msgEl.style.border = '1px solid rgba(59, 130, 246, 0.4)';
+        msgEl.style.color = '#60a5fa';
+        msgEl.innerHTML = `⏳ Đang gửi cấu hình và xác thực kết nối Wi-Fi 2.4GHz với mạng "<b>${ssid}</b>"...`;
+      }
+      if (passInput) passInput.style.borderColor = '';
+
+      try {
+        const res = await fetch('/api/esp32/wifi-config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ssid, password })
+        });
+        const data = await res.json();
+        if (data.success) {
+          if (msgEl) {
+            msgEl.style.background = 'rgba(16, 185, 129, 0.2)';
+            msgEl.style.border = '1px solid rgba(16, 185, 129, 0.5)';
+            msgEl.style.color = '#34d399';
+            msgEl.innerHTML = `
+              <div style="font-size: 13px; font-weight: 700; margin-bottom: 4px;">✓ KẾT NỐI WI-FI 2.4GHz THÀNH CÔNG!</div>
+              <div>ESP32 đã kết nối vào mạng <b>${ssid}</b> và nhận IP: <b style="color: #67e8f9;">${data.ip || ''}</b></div>
+              <div style="margin-top: 4px; font-size: 11px; color: #a7f3d0;">Thông tin đã được lưu vĩnh viễn vào Flash NVS. Bạn có thể chọn chế độ [📡 Wi-Fi ESP32-S3] để ESP tự gửi HTTP hoặc rút USB chạy độc lập!</div>
+            `;
+          }
+          if (password) {
+            localStorage.setItem('wifi_pass_' + ssid, password);
+          }
+          // Gọi cập nhật trạng thái ngay lập tức
+          if (typeof pollStatus === 'function') pollStatus();
+        } else {
+          if (msgEl) {
+            msgEl.style.background = 'rgba(239, 68, 68, 0.2)';
+            msgEl.style.border = '1px solid rgba(239, 68, 68, 0.5)';
+            msgEl.style.color = '#f87171';
+
+            if (data.errorCode === 'WRONG_PASSWORD') {
+              msgEl.innerHTML = `
+                <div style="font-size: 13px; font-weight: 700; margin-bottom: 4px;">❌ KẾT NỐI THẤT BẠI: SAI MẬT KHẨU!</div>
+                <div>Mật khẩu bạn vừa nhập cho mạng "<b>${ssid}</b>" không chính xác.</div>
+                <div style="margin-top: 4px; font-size: 11px; color: #fca5a5;">Vui lòng kiểm tra lại mật khẩu (chú ý chữ hoa/thường) rồi bấm "Lưu & Kết Nối" lại.</div>
+              `;
+              if (passInput) {
+                passInput.style.borderColor = '#ef4444';
+                passInput.focus();
+                passInput.select();
+              }
+            } else if (data.errorCode === 'NO_AP_FOUND') {
+              msgEl.innerHTML = `
+                <div style="font-size: 13px; font-weight: 700; margin-bottom: 4px;">❌ KHÔNG TÌM THẤY MẠNG WI-FI 2.4GHz!</div>
+                <div>Không tìm thấy mạng "<b>${ssid}</b>" ở băng tần 2.4GHz trong phạm vi phủ sóng của ESP32 (Lưu ý: ESP32-S3 không hỗ trợ 5GHz).</div>
+                <div style="margin-top: 4px; font-size: 11px; color: #fca5a5;">Vui lòng bấm nút "🔄 Quét Wi-Fi" để chọn lại mạng 2.4GHz chính xác.</div>
+              `;
+            } else if (data.errorCode === 'ASSOC_FAIL') {
+              msgEl.innerHTML = `
+                <div style="font-size: 13px; font-weight: 700; margin-bottom: 4px;">❌ ROUTER TỪ CHỐI KẾT NỐI (ASSOC_FAIL)!</div>
+                <div>Bộ định tuyến Wi-Fi "<b>${ssid}</b>" đã từ chối yêu cầu gia nhập của ESP32.</div>
+                <div style="margin-top: 4px; font-size: 11px; color: #fca5a5;">Nguyên nhân: Router giới hạn thiết bị, bật lọc địa chỉ MAC, hoặc mạng yêu cầu đăng nhập Enterprise/Captive Portal.</div>
+              `;
+            } else if (data.errorCode === 'FIRMWARE_UNRESPONSIVE') {
+              msgEl.innerHTML = `
+                <div style="font-size: 13px; font-weight: 700; margin-bottom: 4px;">⚠️ FIRMWARE CHƯA ĐƯỢC CẬP NHẬT TRÊN MẠCH!</div>
+                <div>Bo mạch ESP32 đang chạy firmware cũ hoặc chưa khởi động xong. Vui lòng nạp lại firmware mới bằng <b>flash_firmware.bat</b>.</div>
+              `;
+            } else if (data.errorCode === 'DHCP_TIMEOUT') {
+              msgEl.innerHTML = `
+                <div style="font-size: 13px; font-weight: 700; margin-bottom: 4px;">⏱️ QUÁ THỜI GIAN CẤP IP (DHCP TIMEOUT > 15s)!</div>
+                <div>ESP32 đã liên kết được với sóng "<b>${ssid}</b>" nhưng router chưa cấp phát địa chỉ IP.</div>
+                <div style="margin-top: 4px; font-size: 11px; color: #fca5a5;">Vui lòng thử bấm "Lưu & Kết Nối" lại hoặc kiểm tra router Wi-Fi.</div>
+              `;
+            } else {
+              msgEl.innerHTML = `
+                <div style="font-size: 13px; font-weight: 700; margin-bottom: 4px;">❌ KẾT NỐI WI-FI THẤT BẠI! (${data.errorCode || 'LỖI'})</div>
+                <div>${data.message || 'Không thể kết nối tới mạng Wi-Fi đã chọn. Vui lòng thử lại.'}</div>
+              `;
+            }
+          }
+        }
+      } catch (err) {
+        if (msgEl) {
+          msgEl.style.background = 'rgba(239, 68, 68, 0.2)';
+          msgEl.style.border = '1px solid rgba(239, 68, 68, 0.5)';
+          msgEl.style.color = '#f87171';
+          msgEl.innerHTML = `<b>❌ Lỗi kết nối server:</b> ${err.message}`;
+        }
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = '💾 Lưu & Kết Nối Wi-Fi Cho ESP32';
+      }
+    }
+
+    // Tự động quét Wi-Fi, khôi phục chế độ đường truyền & trạng thái Auto Check-in khi trang tải xong
+    window.addEventListener('DOMContentLoaded', () => {
+      const savedAuto = localStorage.getItem('eventhub_auto_confirm');
+      if (savedAuto === '1' || savedAuto === '0') {
+        const autoBox = document.getElementById('auto-confirm');
+        if (autoBox) autoBox.checked = (savedAuto === '1');
+      }
+      const savedRoute = localStorage.getItem('eventhub_route_mode');
+      if (savedRoute === 'esp32' || savedRoute === 'pc') {
+        setRequestRoute(savedRoute, true);
+      }
+      setTimeout(() => {
+        scanNearbyWifi(false);
+      }, 1000);
+    });
+  </script>
+</body>
+</html>

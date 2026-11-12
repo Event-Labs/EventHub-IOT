@@ -1,0 +1,476 @@
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include "esp_log.h"
+#include "esp_system.h"
+#include "esp_err.h"
+#include "nvs_flash.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "esp_timer.h"
+#include "esp_psram.h"
+#include "esp_http_server.h"
+#include "esp_chip_info.h"
+#include "esp_flash.h"
+#include "esp_mac.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/event_groups.h"
+
+#include "esp_camera.h"
+#include "camera_pins.h"
+
+static const char *TAG = "EVENTHUB_CAM";
+
+/* Wi-Fi Credentials - Can be configured here or defaults to SoftAP mode */
+#ifdef CONFIG_ESP_WIFI_SSID
+#define WIFI_SSID       CONFIG_ESP_WIFI_SSID
+#else
+#define WIFI_SSID       ""
+#endif
+
+#ifdef CONFIG_ESP_WIFI_PASSWORD
+#define WIFI_PASS       CONFIG_ESP_WIFI_PASSWORD
+#else
+#define WIFI_PASS       ""
+#endif
+#define SOFTAP_SSID     "ESP32-S3-OV5640"
+#define SOFTAP_PASS     "12345678"
+
+#define PART_BOUNDARY   "123456789000000000000987654321"
+static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
+static const char* _STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
+static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
+
+static httpd_handle_t stream_httpd = NULL;
+static EventGroupHandle_t s_wifi_event_group;
+#define WIFI_CONNECTED_BIT BIT0
+
+/* HTML Web Interface */
+static const char INDEX_HTML[] = 
+"<!DOCTYPE html>"
+"<html>"
+"<head>"
+"<meta charset='utf-8'>"
+"<meta name='viewport' content='width=device-width, initial-scale=1'>"
+"<title>ESP32-S3 OV5640 Stream</title>"
+"<style>"
+"body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background: #121212; color: #f0f0f0; margin: 0; padding: 20px; display: flex; flex-direction: column; align-items: center; }"
+".container { max-width: 900px; width: 100%; background: #1e1e1e; border-radius: 12px; padding: 24px; box-shadow: 0 4px 20px rgba(0,0,0,0.5); }"
+"h1 { color: #3b82f6; margin-top: 0; font-size: 24px; }"
+".status-badge { display: inline-block; padding: 4px 12px; border-radius: 9999px; font-size: 13px; font-weight: 600; background: #10b981; color: white; margin-bottom: 16px; }"
+".stream-container { position: relative; width: 100%; background: #000; border-radius: 8px; overflow: hidden; display: flex; justify-content: center; align-items: center; min-height: 400px; }"
+".stream-container img { width: 100%; height: auto; display: block; max-height: 70vh; object-fit: contain; }"
+".stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-top: 20px; }"
+".stat-card { background: #2a2a2a; padding: 12px 16px; border-radius: 8px; border-left: 4px solid #3b82f6; }"
+".stat-label { font-size: 12px; color: #9ca3af; text-transform: uppercase; letter-spacing: 0.05em; }"
+".stat-value { font-size: 18px; font-weight: bold; margin-top: 4px; color: #fff; }"
+".btn { display: inline-block; background: #3b82f6; color: white; border: none; padding: 10px 18px; border-radius: 6px; cursor: pointer; text-decoration: none; font-weight: 500; margin-top: 16px; }"
+".btn:hover { background: #2563eb; }"
+"</style>"
+"</head>"
+"<body>"
+"<div class='container'>"
+"  <h1>ESP32-S3 OV5640 Live Stream</h1>"
+"  <div><span class='status-badge'>STREAM ACTIVE</span></div>"
+"  <div class='stream-container'>"
+"    <img src='/stream' id='live-stream' alt='Live Stream'>"
+"  </div>"
+"  <div class='stats-grid'>"
+"    <div class='stat-card'><div class='stat-label'>Sensor</div><div class='stat-value' id='sensor-name'>OV5640</div></div>"
+"    <div class='stat-card'><div class='stat-label'>Resolution</div><div class='stat-value'>SVGA (800x600)</div></div>"
+"    <div class='stat-card'><div class='stat-label'>Free PSRAM</div><div class='stat-value' id='psram-val'>Checking...</div></div>"
+"    <div class='stat-card'><div class='stat-label'>Internal Heap</div><div class='stat-value' id='heap-val'>Checking...</div></div>"
+"  </div>"
+"  <div style='margin-top: 16px; display: flex; gap: 10px;'>"
+"    <a href='/capture' target='_blank' class='btn'>Capture Single Frame</a>"
+"    <button onclick=\"document.getElementById('live-stream').src='/stream?t=' + Date.now()\" class='btn' style='background:#4b5563;'>Reconnect Stream</button>"
+"  </div>"
+"</div>"
+"<script>"
+"async function updateStats() {"
+"  try {"
+"    const res = await fetch('/status');"
+"    const data = await res.json();"
+"    document.getElementById('psram-val').innerText = (data.free_psram / 1024 / 1024).toFixed(2) + ' MB';"
+"    document.getElementById('heap-val').innerText = (data.free_heap / 1024).toFixed(1) + ' KB';"
+"    document.getElementById('sensor-name').innerText = data.sensor_name;"
+"  } catch(e) {}"
+"}"
+"setInterval(updateStats, 2000);"
+"updateStats();"
+"</script>"
+"</body>"
+"</html>";
+
+/* HTTP Handler: Index Page */
+static esp_err_t index_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/html");
+    return httpd_resp_send(req, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
+}
+
+/* HTTP Handler: Single Snapshot */
+static esp_err_t capture_handler(httpd_req_t *req)
+{
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) {
+        ESP_LOGE(TAG, "Camera capture failed");
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "image/jpeg");
+    httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=capture.jpg");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+
+    esp_err_t res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
+    esp_camera_fb_return(fb);
+    return res;
+}
+
+/* HTTP Handler: MJPEG Video Stream */
+static esp_err_t stream_handler(httpd_req_t *req)
+{
+    camera_fb_t *fb = NULL;
+    esp_err_t res = ESP_OK;
+    size_t _jpg_buf_len = 0;
+    uint8_t *_jpg_buf = NULL;
+    char part_buf[128];
+
+    res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
+    if (res != ESP_OK) {
+        return res;
+    }
+
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+
+    while (true) {
+        fb = esp_camera_fb_get();
+        if (!fb) {
+            ESP_LOGE(TAG, "Camera capture failed during stream");
+            res = ESP_FAIL;
+            break;
+        }
+
+        if (fb->format != PIXFORMAT_JPEG) {
+            bool jpeg_converted = frame2jpg(fb, 80, &_jpg_buf, &_jpg_buf_len);
+            esp_camera_fb_return(fb);
+            fb = NULL;
+            if (!jpeg_converted) {
+                ESP_LOGE(TAG, "JPEG compression failed");
+                res = ESP_FAIL;
+                break;
+            }
+        } else {
+            _jpg_buf_len = fb->len;
+            _jpg_buf = fb->buf;
+        }
+
+        if (res == ESP_OK) {
+            res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
+        }
+        if (res == ESP_OK) {
+            size_t hlen = snprintf(part_buf, sizeof(part_buf), _STREAM_PART, _jpg_buf_len);
+            res = httpd_resp_send_chunk(req, part_buf, hlen);
+        }
+        if (res == ESP_OK) {
+            res = httpd_resp_send_chunk(req, (const char *)_jpg_buf, _jpg_buf_len);
+        }
+
+        if (fb) {
+            esp_camera_fb_return(fb);
+            fb = NULL;
+            _jpg_buf = NULL;
+        } else if (_jpg_buf) {
+            free(_jpg_buf);
+            _jpg_buf = NULL;
+        }
+
+        if (res != ESP_OK) {
+            break;
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    return res;
+}
+
+/* HTTP Handler: Status JSON API */
+static esp_err_t status_handler(httpd_req_t *req)
+{
+    char json_response[256];
+    sensor_t *s = esp_camera_sensor_get();
+    const char *sensor_name = "Unknown";
+    if (s) {
+        if (s->id.PID == OV5640_PID) sensor_name = "OV5640";
+        else if (s->id.PID == OV2640_PID) sensor_name = "OV2640";
+        else if (s->id.PID == OV3660_PID) sensor_name = "OV3660";
+        else sensor_name = "Detected Camera";
+    }
+
+    uint32_t free_psram = 0;
+    if (esp_psram_is_initialized()) {
+        free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    }
+    uint32_t free_heap = esp_get_free_internal_heap_size();
+
+    snprintf(json_response, sizeof(json_response),
+             "{\"sensor_name\":\"%s\",\"free_psram\":%lu,\"free_heap\":%lu}",
+             sensor_name, (unsigned long)free_psram, (unsigned long)free_heap);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    return httpd_resp_send(req, json_response, HTTPD_RESP_USE_STRLEN);
+}
+
+/* Start Web Server */
+static void start_camera_webserver(void)
+{
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.max_uri_handlers = 8;
+    config.server_port = 80;
+    config.ctrl_port = 32768;
+
+    httpd_uri_t index_uri = {
+        .uri       = "/",
+        .method    = HTTP_GET,
+        .handler   = index_handler,
+        .user_ctx  = NULL
+    };
+
+    httpd_uri_t stream_uri = {
+        .uri       = "/stream",
+        .method    = HTTP_GET,
+        .handler   = stream_handler,
+        .user_ctx  = NULL
+    };
+
+    httpd_uri_t capture_uri = {
+        .uri       = "/capture",
+        .method    = HTTP_GET,
+        .handler   = capture_handler,
+        .user_ctx  = NULL
+    };
+
+    httpd_uri_t status_uri = {
+        .uri       = "/status",
+        .method    = HTTP_GET,
+        .handler   = status_handler,
+        .user_ctx  = NULL
+    };
+
+    ESP_LOGI(TAG, "Starting HTTP server on port: %d", config.server_port);
+    if (httpd_start(&stream_httpd, &config) == ESP_OK) {
+        httpd_register_uri_handler(stream_httpd, &index_uri);
+        httpd_register_uri_handler(stream_httpd, &stream_uri);
+        httpd_register_uri_handler(stream_httpd, &capture_uri);
+        httpd_register_uri_handler(stream_httpd, &status_uri);
+        ESP_LOGI(TAG, "Web server registered URI endpoints: /, /stream, /capture, /status");
+    } else {
+        ESP_LOGE(TAG, "Error starting HTTP server!");
+    }
+}
+
+/* Wi-Fi Event Handler */
+static void wifi_event_handler(void* arg, esp_event_base_t event_base,
+                               int32_t event_id, void* event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+        ESP_LOGI(TAG, "Wi-Fi STA started, connecting...");
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        ESP_LOGW(TAG, "Wi-Fi disconnected, reconnecting...");
+        esp_wifi_connect();
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        ESP_LOGI(TAG, "Connected to Wi-Fi! IP Address: " IPSTR, IP2STR(&event->ip_info.ip));
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STACONNECTED) {
+        wifi_event_ap_staconnected_t* event = (wifi_event_ap_staconnected_t*) event_data;
+        ESP_LOGI(TAG, "Client joined AP, MAC: " MACSTR, MAC2STR(event->mac));
+    }
+}
+
+/* Initialize Wi-Fi (Tries Station mode if configured, starts SoftAP as ready fallback) */
+static void init_wifi(void)
+{
+    s_wifi_event_group = xEventGroupCreate();
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                                                        ESP_EVENT_ANY_ID,
+                                                        &wifi_event_handler,
+                                                        NULL,
+                                                        NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
+                                                        IP_EVENT_STA_GOT_IP,
+                                                        &wifi_event_handler,
+                                                        NULL,
+                                                        NULL));
+
+    /* Always start SoftAP + STA mode so you can connect via home Wi-Fi OR direct AP */
+    esp_netif_create_default_wifi_sta();
+    esp_netif_t *ap_netif = esp_netif_create_default_wifi_ap();
+
+    wifi_config_t wifi_ap_config = {
+        .ap = {
+            .ssid = SOFTAP_SSID,
+            .ssid_len = strlen(SOFTAP_SSID),
+            .channel = 1,
+            .password = SOFTAP_PASS,
+            .max_connection = 4,
+            .authmode = WIFI_AUTH_WPA2_PSK,
+        },
+    };
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_ap_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    esp_netif_ip_info_t ip_info;
+    esp_netif_get_ip_info(ap_netif, &ip_info);
+    ESP_LOGI(TAG, "SoftAP Started! SSID: %s | Password: %s", SOFTAP_SSID, SOFTAP_PASS);
+    ESP_LOGI(TAG, "SoftAP Web UI URL: http://" IPSTR, IP2STR(&ip_info.ip));
+}
+
+/* Initialize Camera */
+static esp_err_t init_camera(void)
+{
+    camera_config_t config;
+    memset(&config, 0, sizeof(camera_config_t));
+    config.ledc_channel = LEDC_CHANNEL_0;
+    config.ledc_timer = LEDC_TIMER_0;
+    config.pin_d0 = CAM_PIN_D0;
+    config.pin_d1 = CAM_PIN_D1;
+    config.pin_d2 = CAM_PIN_D2;
+    config.pin_d3 = CAM_PIN_D3;
+    config.pin_d4 = CAM_PIN_D4;
+    config.pin_d5 = CAM_PIN_D5;
+    config.pin_d6 = CAM_PIN_D6;
+    config.pin_d7 = CAM_PIN_D7;
+    config.pin_xclk = CAM_PIN_XCLK;
+    config.pin_pclk = CAM_PIN_PCLK;
+    config.pin_vsync = CAM_PIN_VSYNC;
+    config.pin_href = CAM_PIN_HREF;
+    config.pin_sccb_sda = CAM_PIN_SIOD;
+    config.pin_sccb_scl = CAM_PIN_SIOC;
+    config.pin_pwdn = CAM_PIN_PWDN;
+    config.pin_reset = CAM_PIN_RESET;
+    config.xclk_freq_hz = 20000000;
+    config.pixel_format = PIXFORMAT_JPEG;
+    config.frame_size = FRAMESIZE_SVGA;
+    config.jpeg_quality = 12;
+    config.fb_count = 2;
+    config.fb_location = CAMERA_FB_IN_PSRAM;
+    config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+    config.sccb_i2c_port = -1;
+    config.jpeg_buffer_size = 0;
+
+    // Check PSRAM availability
+    if (!esp_psram_is_initialized()) {
+        ESP_LOGW(TAG, "PSRAM not available! Adjusting camera buffers for internal RAM.");
+        config.frame_size = FRAMESIZE_VGA;
+        config.fb_location = CAMERA_FB_IN_DRAM;
+        config.fb_count = 1;
+    }
+
+    esp_err_t err = esp_camera_init(&config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Camera Init Failed with error 0x%x", err);
+        return err;
+    }
+
+    sensor_t *s = esp_camera_sensor_get();
+    if (s != NULL) {
+        ESP_LOGI(TAG, "Camera sensor detected successfully!");
+        ESP_LOGI(TAG, "Sensor PID: 0x%04x, MID: 0x%04x", s->id.PID, s->id.MIDH);
+        if (s->id.PID == OV5640_PID) {
+            ESP_LOGI(TAG, ">> SENSOR CONFIRMED: OmniVision OV5640 (5 Megapixel) <<");
+            s->set_vflip(s, 0);
+            s->set_hmirror(s, 0);
+        } else if (s->id.PID == OV2640_PID) {
+            ESP_LOGI(TAG, ">> SENSOR CONFIRMED: OmniVision OV2640 <<");
+        } else {
+            ESP_LOGI(TAG, ">> SENSOR PID: 0x%04x <<", s->id.PID);
+        }
+    } else {
+        ESP_LOGW(TAG, "Failed to retrieve camera sensor pointer");
+    }
+
+    return ESP_OK;
+}
+
+void app_main(void)
+{
+    ESP_LOGI(TAG, "=================================================");
+    ESP_LOGI(TAG, "   EventHub QR Check-in ESP32-S3 OV5640 System    ");
+    ESP_LOGI(TAG, "=================================================");
+
+    /* 1. Print Chip & Flash details */
+    esp_chip_info_t chip_info;
+    esp_chip_info(&chip_info);
+    ESP_LOGI(TAG, "ESP32-S3 Chip Cores: %d, Silicon Revision: %d", chip_info.cores, chip_info.revision);
+
+    uint32_t flash_size = 0;
+    if (esp_flash_get_size(NULL, &flash_size) == ESP_OK) {
+        ESP_LOGI(TAG, "Flash Size: %lu MB (%lu bytes)", (unsigned long)(flash_size / (1024 * 1024)), (unsigned long)flash_size);
+    }
+
+    /* 2. Check PSRAM */
+    if (esp_psram_is_initialized()) {
+        size_t psram_size = esp_psram_get_size();
+        size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+        ESP_LOGI(TAG, "PSRAM initialized successfully! Total: %zu MB, Free: %zu KB",
+                 psram_size / (1024 * 1024), free_psram / 1024);
+    } else {
+        ESP_LOGW(TAG, "PSRAM is NOT initialized or not detected.");
+    }
+    ESP_LOGI(TAG, "Free Internal Heap: %lu bytes", (unsigned long)esp_get_free_internal_heap_size());
+
+    /* 3. Initialize NVS */
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    /* 4. Initialize Camera */
+    ESP_LOGI(TAG, "Initializing OV5640 Camera...");
+    if (init_camera() == ESP_OK) {
+        ESP_LOGI(TAG, "Capturing test frame...");
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (fb) {
+            ESP_LOGI(TAG, "Test Frame Captured! Size: %zu bytes, Format: %d, Width: %zu, Height: %zu",
+                     fb->len, fb->format, fb->width, fb->height);
+            esp_camera_fb_return(fb);
+        } else {
+            ESP_LOGE(TAG, "Test frame capture failed!");
+        }
+    } else {
+        ESP_LOGE(TAG, "Camera initialization failed! Check pinout in camera_pins.h");
+    }
+
+    /* 5. Initialize Wi-Fi (AP+STA) and Web Server */
+    ESP_LOGI(TAG, "Initializing Wi-Fi subsystem...");
+    init_wifi();
+
+    ESP_LOGI(TAG, "Starting Live Video Stream Server...");
+    start_camera_webserver();
+
+    ESP_LOGI(TAG, "=================================================");
+    ESP_LOGI(TAG, "   SYSTEM READY: Connect to Wi-Fi 'ESP32-S3-OV5640'");
+    ESP_LOGI(TAG, "   Open in Chrome: http://192.168.4.1            ");
+    ESP_LOGI(TAG, "=================================================");
+
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+}
