@@ -18,6 +18,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/timers.h"
 
 #include "esp_log.h"
 #include "esp_system.h"
@@ -82,6 +83,37 @@ static const uint8_t END_MAGIC[4]  = {0x55, 0xAA, 0x55, 0xAA};
 #define LEDC_FLASH_TIMER        LEDC_TIMER_1
 #define LEDC_FLASH_MODE         LEDC_LOW_SPEED_MODE
 #define LEDC_FLASH_CHANNEL      LEDC_CHANNEL_1
+
+#ifndef SERVO_PIN
+#define SERVO_PIN               14                   /* GPIO 14: PWM điều khiển Servo mở cổng */
+#endif
+
+#define LEDC_SERVO_TIMER        LEDC_TIMER_2
+#define LEDC_SERVO_MODE         LEDC_LOW_SPEED_MODE
+#define LEDC_SERVO_CHANNEL      LEDC_CHANNEL_2
+#define LEDC_SERVO_DUTY_RES     LEDC_TIMER_14_BIT
+#define LEDC_SERVO_FREQ_HZ      50
+
+#define SERVO_MIN_PULSEWIDTH_US 500                  /* 0 độ: đóng thanh chắn (500us) */
+#define SERVO_MAX_PULSEWIDTH_US 2500                 /* 180 độ: góc tối đa (2500us) */
+#define SERVO_GATE_CLOSE_DEGREE 0                    /* Góc đóng cổng: 0 độ */
+#define SERVO_GATE_OPEN_DEGREE  90                   /* Góc mở cổng: 90 độ */
+#define SERVO_GATE_HOLD_MS      3000                 /* Thời gian giữ tối thiểu: 3000ms (3s) */
+#define SERVO_GATE_SAFETY_TIMEOUT_MS 15000           /* Timeout an toàn: Tự đóng sau 15s nếu người không đi qua */
+
+#ifndef IR_SENSOR_PIN
+#define IR_SENSOR_PIN           48                   /* GPIO 48: Cảm biến hồng ngoại phát hiện người qua cổng */
+#endif
+
+#ifndef LED_GREEN_PIN
+#define LED_GREEN_PIN           41                   /* GPIO 41: Đèn LED Xanh lá (Vé hợp lệ) */
+#endif
+
+#ifndef LED_RED_PIN
+#define LED_RED_PIN             42                   /* GPIO 42: Đèn LED Đỏ (Vé lỗi / Đã check-in) */
+#endif
+
+#define STATUS_LED_HOLD_MS      60000                /* Thời gian sáng đèn: 60,000ms (1 phút) */
 
 /* Wi-Fi & Network Global State */
 #define MAX_WIFI_PROFILES 4
@@ -158,6 +190,88 @@ static standalone_scan_state_t s_last_scan = {
     .auto_checked_in = false
 };
 
+#define DEVICE_HISTORY_MAX_ITEMS OLED_HISTORY_MAX_ITEMS
+
+typedef struct {
+    char id[48];
+    char ticket_code[48];
+    char attendee_name[64];
+    char event_id[48];
+    char event_code[48];
+    char event_name[80];
+    char action[16];
+    char result[24];
+    bool success;
+    char message[128];
+    char scanned_at[36];
+} dev_history_item_t;
+
+typedef struct {
+    bool initialized;
+    bool initial_synced;
+    bool is_stale;
+    bool offline_cached;
+    bool loading;
+    int last_http_code;
+    char last_error[96];
+    int page;
+    int limit;
+    int total;
+    bool has_more;
+    char filter[24];
+    bool event_only;
+    int total_scans;
+    int ok_count;
+    int verified_count;
+    int failed_count;
+    int item_count;
+    dev_history_item_t items[DEVICE_HISTORY_MAX_ITEMS];
+} dev_history_cache_t;
+
+static SemaphoreHandle_t g_history_mutex = NULL;
+static dev_history_cache_t s_dev_history = {
+    .page = 1,
+    .limit = 5,
+    .filter = "ALL",
+    .is_stale = true,
+};
+
+static void sync_oled_network_state(void);
+static const char *find_json_key(const char *json, const char *key);
+static bool extract_json_str(const char *json, const char *key, char *out, size_t out_max);
+static bool extract_json_bool(const char *json, const char *key, bool *out_val);
+static bool extract_json_int(const char *json, const char *key, int *out_val);
+static const char *extract_json_object_slice(const char *obj_start, char *out_buf, size_t out_max)
+{
+    if (!obj_start || *obj_start != '{' || !out_buf || out_max < 2) return NULL;
+    const char *p = obj_start;
+    size_t idx = 0;
+    int depth = 0;
+    bool in_str = false;
+    while (*p) {
+        char c = *p++;
+        if (idx + 1 < out_max) out_buf[idx++] = c;
+        if (c == '\\' && in_str && *p) {
+            char esc = *p++;
+            if (idx + 1 < out_max) out_buf[idx++] = esc;
+            continue;
+        }
+        if (c == '"') {
+            in_str = !in_str;
+        } else if (!in_str) {
+            if (c == '{') depth++;
+            else if (c == '}') {
+                depth--;
+                if (depth <= 0) break;
+            }
+        }
+    }
+    out_buf[idx] = '\0';
+    return p;
+}
+
+static esp_err_t fetchDeviceHistory(int page, int limit, const char *result_filter, bool event_only);
+
 static const char *iot_state_to_str(iot_reg_state_t st)
 {
     switch (st) {
@@ -233,10 +347,8 @@ static void clear_iot_credentials_nvs(bool keep_url)
     save_iot_nvs_str("evt_name", "");
     save_iot_nvs_i32("cfg_ver", 0);
     save_iot_nvs_i32("pend_auto", 0);
-    if (!keep_url) {
-        snprintf(g_iot_base_url, sizeof(g_iot_base_url), "%s", EVENTHUB_IOT_BASE_URL);
-        save_iot_nvs_str("iot_url", "");
-    }
+    /* Luôn giữ nguyên g_iot_base_url và NVS iot_url để người dùng cấu hình 1 lần dùng mãi mãi */
+    (void)keep_url;
     g_iot_force_sync = true;
 }
 
@@ -262,6 +374,9 @@ static void load_iot_config_nvs(void)
         if (nvs_get_str(h, "iot_url", custom_url, &len) == ESP_OK &&
             custom_url[0] != '\0' && strstr(custom_url, "example.com") == NULL) {
             snprintf(g_iot_base_url, sizeof(g_iot_base_url), "%s", custom_url);
+            ESP_LOGI(TAG, "NVS: Loaded persistent IoT Base URL: %s", g_iot_base_url);
+        } else {
+            ESP_LOGW(TAG, "NVS: No custom IoT URL in NVS, using default: %s", g_iot_base_url);
         }
 
         int32_t ver = 0;
@@ -428,6 +543,292 @@ static void set_led_duty(uint32_t duty)
     if (duty > 255) duty = 255;
     ledc_set_duty(LEDC_FLASH_MODE, LEDC_FLASH_CHANNEL, duty);
     ledc_update_duty(LEDC_FLASH_MODE, LEDC_FLASH_CHANNEL);
+}
+
+/* ============================================================================
+ * 2.1. ĐIỀU KHIỂN SERVO CỔNG CHECK-IN (SG90 / MG90S BARRIER GATE)
+ * ============================================================================ */
+static TaskHandle_t s_servo_task_handle = NULL;
+static uint32_t s_servo_current_angle = SERVO_GATE_CLOSE_DEGREE;
+
+static void servo_set_angle(uint32_t degree)
+{
+    if (degree > 180) degree = 180;
+    s_servo_current_angle = degree;
+    uint32_t pulse_us = SERVO_MIN_PULSEWIDTH_US + (degree * (SERVO_MAX_PULSEWIDTH_US - SERVO_MIN_PULSEWIDTH_US) / 180);
+    /* Độ phân giải 14-bit: 2^14 = 16384 ticks cho chu kỳ 20,000 us (50Hz) */
+    uint32_t duty = (pulse_us * ((1 << 14) - 1)) / 20000;
+    ledc_set_duty(LEDC_SERVO_MODE, LEDC_SERVO_CHANNEL, duty);
+    ledc_update_duty(LEDC_SERVO_MODE, LEDC_SERVO_CHANNEL);
+}
+
+void servo_trigger_gate_open(void)
+{
+    if (s_servo_task_handle) {
+        xTaskNotifyGive(s_servo_task_handle);
+    }
+}
+
+static void init_servo_pwm(void)
+{
+    ledc_timer_config_t timer_conf = {
+        .speed_mode       = LEDC_SERVO_MODE,
+        .timer_num        = LEDC_SERVO_TIMER,
+        .duty_resolution  = LEDC_SERVO_DUTY_RES,
+        .freq_hz          = LEDC_SERVO_FREQ_HZ,
+        .clk_cfg          = LEDC_AUTO_CLK
+    };
+    ledc_timer_config(&timer_conf);
+
+    /* Khởi tạo ở 0 độ (hạ cần / đóng cổng) */
+    uint32_t init_duty = (SERVO_MIN_PULSEWIDTH_US * ((1 << 14) - 1)) / 20000;
+    ledc_channel_config_t ch_conf = {
+        .speed_mode     = LEDC_SERVO_MODE,
+        .channel        = LEDC_SERVO_CHANNEL,
+        .timer_sel      = LEDC_SERVO_TIMER,
+        .intr_type      = LEDC_INTR_DISABLE,
+        .gpio_num       = SERVO_PIN,
+        .duty           = init_duty,
+        .hpoint         = 0
+    };
+    ledc_channel_config(&ch_conf);
+    ESP_LOGI(TAG, "Servo Gate PWM initialized on GPIO %d (50Hz, 14-bit, Timer %d, Channel %d)",
+             SERVO_PIN, LEDC_SERVO_TIMER, LEDC_SERVO_CHANNEL);
+}
+
+/* Khởi tạo cảm biến hồng ngoại phát hiện người đi qua cổng (IR Obstacle Sensor) */
+static void init_ir_sensor(void)
+{
+    gpio_reset_pin(IR_SENSOR_PIN);
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << IR_SENSOR_PIN),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io_conf);
+    ESP_LOGI(TAG, "IR Sensor initialized on GPIO %d (Active-LOW when obstacle detected)", IR_SENSOR_PIN);
+}
+
+/* Đọc trạng thái cảm biến IR (true = có người/vật cản chặn tia hồng ngoại) */
+static bool is_ir_obstacle_detected(void)
+{
+    return gpio_get_level(IR_SENSOR_PIN) == 0;
+}
+
+static void servo_gate_task(void *pvParameters)
+{
+    (void)pvParameters;
+    servo_set_angle(SERVO_GATE_CLOSE_DEGREE);
+
+    while (1) {
+        /* Chờ tín hiệu mở cổng khi vé check-in hợp lệ */
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        ESP_LOGI(TAG, "Servo Gate: VALID TICKET -> OPENING GATE (%d deg)...", SERVO_GATE_OPEN_DEGREE);
+        servo_set_angle(SERVO_GATE_OPEN_DEGREE);
+        /* Chờ 1 giây để cần servo nâng hoàn toàn lên vị trí 90 độ trước khi giám sát cảm biến */
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        /* Trạng thái thông minh với cảm biến hồng ngoại:
+         * 1. Cổng mở góc 90 độ.
+         * 2. Chờ người bước vào cổng (cảm biến IR phát hiện có người = LOW).
+         * 3. Khi người đã bước qua hẳn khỏi cổng (cảm biến IR quay lại HIGH) -> Đóng cổng!
+         * 4. Kèm timeout an toàn (SERVO_GATE_SAFETY_TIMEOUT_MS) nếu người đổi ý không bước vào. */
+        TickType_t start_tick = xTaskGetTickCount();
+        bool person_entered = false;
+
+        while (1) {
+            /* Nếu có vé khác được check-in liên tiếp, reset lại timer an toàn */
+            if (ulTaskNotifyTake(pdTRUE, 0) > 0) {
+                ESP_LOGI(TAG, "Servo Gate: Additional valid ticket scanned, extending gate open...");
+                start_tick = xTaskGetTickCount();
+            }
+
+            bool obstacle = is_ir_obstacle_detected();
+
+            if (obstacle) {
+                if (!person_entered) {
+                    ESP_LOGI(TAG, "Servo Gate: IR Sensor -> Person ENTERED the gate zone.");
+                    person_entered = true;
+                }
+            } else {
+                if (person_entered) {
+                    /* Người đã đi qua hẳn khỏi cảm biến hồng ngoại! Chờ 400ms an toàn rồi đóng cổng */
+                    vTaskDelay(pdMS_TO_TICKS(400));
+                    ESP_LOGI(TAG, "Servo Gate: IR Sensor -> Person PASSED completely. CLOSING GATE (%d deg)...", SERVO_GATE_CLOSE_DEGREE);
+                    break;
+                }
+            }
+
+            /* Cơ chế timeout an toàn nếu không ai đi qua trong 15 giây */
+            if ((xTaskGetTickCount() - start_tick) > pdMS_TO_TICKS(SERVO_GATE_SAFETY_TIMEOUT_MS)) {
+                ESP_LOGW(TAG, "Servo Gate: Safety timeout (15s) reached. CLOSING GATE (%d deg)...", SERVO_GATE_CLOSE_DEGREE);
+                break;
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+
+        servo_set_angle(SERVO_GATE_CLOSE_DEGREE);
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+
+/* ============================================================================
+ * 2.2. ĐÈN LED BÁO TRẠNG THÁI SOÁT VÉ (LED XANH LÁ & ĐỎ - SÁNG 1 PHÚT)
+ * ============================================================================ */
+static TimerHandle_t s_led_green_timer = NULL;
+static TimerHandle_t s_led_red_timer = NULL;
+
+static void led_green_timer_cb(TimerHandle_t xTimer)
+{
+    (void)xTimer;
+    gpio_set_level(LED_GREEN_PIN, 0);
+    ESP_LOGI(TAG, "Status LED: Green LED turned OFF after 60s timeout");
+}
+
+static void led_red_timer_cb(TimerHandle_t xTimer)
+{
+    (void)xTimer;
+    gpio_set_level(LED_RED_PIN, 0);
+    ESP_LOGI(TAG, "Status LED: Red LED turned OFF after 60s timeout");
+}
+
+static void led_turn_off_all(void)
+{
+    if (s_led_green_timer) xTimerStop(s_led_green_timer, 0);
+    if (s_led_red_timer) xTimerStop(s_led_red_timer, 0);
+    gpio_set_level(LED_GREEN_PIN, 0);
+    gpio_set_level(LED_RED_PIN, 0);
+}
+
+void led_set_green_direct(int level)
+{
+    if (s_led_green_timer) xTimerStop(s_led_green_timer, 0);
+    gpio_set_level(LED_GREEN_PIN, level ? 1 : 0);
+    ESP_LOGI(TAG, "Status LED: Green direct level = %d (GPIO %d)", level ? 1 : 0, LED_GREEN_PIN);
+}
+
+void led_set_red_direct(int level)
+{
+    if (s_led_red_timer) xTimerStop(s_led_red_timer, 0);
+    gpio_set_level(LED_RED_PIN, level ? 1 : 0);
+    ESP_LOGI(TAG, "Status LED: Red direct level = %d (GPIO %d)", level ? 1 : 0, LED_RED_PIN);
+}
+
+void led_trigger_green_ok(void)
+{
+    /* Tắt đèn đỏ nếu đang sáng */
+    if (s_led_red_timer) xTimerStop(s_led_red_timer, 0);
+    gpio_set_level(LED_RED_PIN, 0);
+
+    /* Bật đèn xanh lá và kích hoạt/gia hạn bộ đếm 1 phút (60s) */
+    gpio_set_level(LED_GREEN_PIN, 1);
+    if (s_led_green_timer) {
+        xTimerReset(s_led_green_timer, 0);
+    }
+    ESP_LOGI(TAG, "Status LED: GREEN ON for 60s (Ticket OK)");
+}
+
+void led_trigger_red_error(void)
+{
+    /* Tắt đèn xanh nếu đang sáng */
+    if (s_led_green_timer) xTimerStop(s_led_green_timer, 0);
+    gpio_set_level(LED_GREEN_PIN, 0);
+
+    /* Bật đèn đỏ và kích hoạt/gia hạn bộ đếm 1 phút (60s) */
+    gpio_set_level(LED_RED_PIN, 1);
+    if (s_led_red_timer) {
+        xTimerReset(s_led_red_timer, 0);
+    }
+    ESP_LOGI(TAG, "Status LED: RED ON for 60s (Ticket Error/Used)");
+}
+
+static void hw_test_task(void *pvParameters)
+{
+    ESP_LOGI(TAG, "Hardware Self-Test: STARTING...");
+    safe_uart_write_string("TESTRESP:STARTING\n");
+
+    /* Step 1: Green LED test (GPIO 41) */
+    ESP_LOGI(TAG, "Hardware Self-Test: Green LED ON (GPIO %d)...", LED_GREEN_PIN);
+    gpio_set_level(LED_GREEN_PIN, 1);
+    vTaskDelay(pdMS_TO_TICKS(1500));
+    gpio_set_level(LED_GREEN_PIN, 0);
+    vTaskDelay(pdMS_TO_TICKS(300));
+
+    /* Step 2: Red LED test (GPIO 42) */
+    ESP_LOGI(TAG, "Hardware Self-Test: Red LED ON (GPIO %d)...", LED_RED_PIN);
+    gpio_set_level(LED_RED_PIN, 1);
+    vTaskDelay(pdMS_TO_TICKS(1500));
+    gpio_set_level(LED_RED_PIN, 0);
+    vTaskDelay(pdMS_TO_TICKS(300));
+
+    /* Step 3: Buzzer test (GPIO 1) */
+    ESP_LOGI(TAG, "Hardware Self-Test: Buzzer Beep 2x...");
+    buzzer_beep(100);
+    vTaskDelay(pdMS_TO_TICKS(180));
+    buzzer_beep(100);
+    vTaskDelay(pdMS_TO_TICKS(400));
+
+    /* Step 4: Servo Gate test (GPIO 14 - 90 deg) */
+    ESP_LOGI(TAG, "Hardware Self-Test: Servo Opening to 90 deg...");
+    servo_trigger_gate_open();
+    vTaskDelay(pdMS_TO_TICKS(3200));
+
+    /* Step 5: OLED feedback */
+    oled_show_ticket_status(OLED_TICKET_OK, "TEST PASS", "PHAN CUNG OK");
+    vTaskDelay(pdMS_TO_TICKS(2500));
+    oled_show_ticket_status(OLED_TICKET_IDLE, "", NULL);
+
+    ESP_LOGI(TAG, "Hardware Self-Test: COMPLETED SUCCESSFULLY.");
+    safe_uart_write_string("TESTRESP:COMPLETED\n");
+    vTaskDelete(NULL);
+}
+
+void trigger_hardware_selftest(void)
+{
+    xTaskCreate(hw_test_task, "hw_test_task", 3072, NULL, 5, NULL);
+}
+
+static void init_status_leds(void)
+{
+    /* BẮT BUỘC: Reset GPIO 41 và 42 để tách hoàn toàn khỏi chân MTDI/MTMS của khối phần cứng JTAG.
+     * Mặc định trên ESP32-S3, GPIO 41 và 42 được gán vào JTAG TAP Controller.
+     * Nếu không gọi gpio_reset_pin(), chân vẫn nằm ở chế độ JTAG nên gpio_set_level không thể điều khiển mức ra
+     * và bất kỳ thay đổi điện áp/tải gắn vào chân sẽ gây kích hoạt ngắt debug phần cứng làm treo/đơ chip! */
+    gpio_reset_pin(LED_GREEN_PIN);
+    gpio_set_direction(LED_GREEN_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_pull_mode(LED_GREEN_PIN, GPIO_FLOATING);
+    gpio_set_drive_capability(LED_GREEN_PIN, GPIO_DRIVE_CAP_3);
+    gpio_set_level(LED_GREEN_PIN, 0);
+
+    gpio_reset_pin(LED_RED_PIN);
+    gpio_set_direction(LED_RED_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_pull_mode(LED_RED_PIN, GPIO_FLOATING);
+    gpio_set_drive_capability(LED_RED_PIN, GPIO_DRIVE_CAP_3);
+    gpio_set_level(LED_RED_PIN, 0);
+
+    /* Khởi tạo FreeRTOS One-shot Timers (60 giây) */
+    if (!s_led_green_timer) {
+        s_led_green_timer = xTimerCreate("led_grn_tmr", pdMS_TO_TICKS(STATUS_LED_HOLD_MS),
+                                          pdFALSE, NULL, led_green_timer_cb);
+    }
+    if (!s_led_red_timer) {
+        s_led_red_timer   = xTimerCreate("led_red_tmr", pdMS_TO_TICKS(STATUS_LED_HOLD_MS),
+                                          pdFALSE, NULL, led_red_timer_cb);
+    }
+
+    /* Nháy nhanh 2 LED 120ms để tự kiểm tra phần cứng (Hardware Power-on Self-Test) */
+    gpio_set_level(LED_GREEN_PIN, 1);
+    gpio_set_level(LED_RED_PIN, 1);
+    vTaskDelay(pdMS_TO_TICKS(120));
+    gpio_set_level(LED_GREEN_PIN, 0);
+    gpio_set_level(LED_RED_PIN, 0);
+
+    ESP_LOGI(TAG, "Status LEDs initialized safely on GPIO %d (Green) & GPIO %d (Red) - JTAG detached, 60s auto-off",
+             LED_GREEN_PIN, LED_RED_PIN);
 }
 
 /* ============================================================================
@@ -1012,6 +1413,11 @@ static void extract_url_origin(const char *url, char *out, size_t out_max)
 
 static esp_err_t ensure_api_client_locked(const char *url)
 {
+    if (!url || (strncmp(url, "http://", 7) != 0 && strncmp(url, "https://", 8) != 0)) {
+        ESP_LOGE(TAG, "Invalid HTTP/HTTPS URL passed to client: '%s'", url ? url : "NULL");
+        return ESP_ERR_INVALID_ARG;
+    }
+
     char origin[96];
     extract_url_origin(url, origin, sizeof(origin));
 
@@ -1285,8 +1691,44 @@ static esp_err_t esp32_http_json_request(esp_http_client_method_t method,
     return err;
 }
 
+static bool is_valid_iot_url(const char *url)
+{
+    if (!url || strlen(url) < 10) return false;
+    if (strncmp(url, "http://", 7) != 0 && strncmp(url, "https://", 8) != 0) return false;
+    if (strstr(url, "example.com") != NULL) return false;
+    return true;
+}
+
+static void normalize_iot_url(const char *in_url, char *out_url, size_t out_max)
+{
+    if (!out_url || out_max == 0) return;
+    out_url[0] = '\0';
+    if (!in_url) return;
+
+    while (*in_url == ' ' || *in_url == '\t') in_url++;
+    char clean[192];
+    snprintf(clean, sizeof(clean), "%s", in_url);
+    size_t len = strlen(clean);
+    while (len > 0 && (clean[len - 1] == ' ' || clean[len - 1] == '/' || clean[len - 1] == '\r' || clean[len - 1] == '\n')) {
+        clean[--len] = '\0';
+    }
+
+    if (len == 0) return;
+
+    if (strstr(clean, "/iot/v1") != NULL || strstr(clean, "/v1") != NULL) {
+        snprintf(out_url, out_max, "%s", clean);
+    } else if (len >= 4 && strcmp(clean + len - 4, "/api") == 0) {
+        snprintf(out_url, out_max, "%s/iot/v1", clean);
+    } else {
+        snprintf(out_url, out_max, "%s/api/iot/v1", clean);
+    }
+}
+
 static void build_iot_url(const char *suffix, char *out_url, size_t out_max)
 {
+    if (!out_url || out_max == 0) return;
+    out_url[0] = '\0';
+    if (!is_valid_iot_url(g_iot_base_url)) return;
     size_t blen = strlen(g_iot_base_url);
     while (blen > 0 && g_iot_base_url[blen - 1] == '/') blen--;
     snprintf(out_url, out_max, "%.*s%s", (int)blen, g_iot_base_url, suffix);
@@ -1295,11 +1737,28 @@ static void build_iot_url(const char *suffix, char *out_url, size_t out_max)
 static esp_err_t esp32_iot_scan_ticket(const char *qr_code, const char *action,
                                        char *out_response, size_t out_max, int *out_status_code)
 {
+    if (!is_valid_iot_url(g_iot_base_url)) {
+        if (out_response && out_max > 0) {
+            snprintf(out_response, out_max,
+                     "{\"success\":false,\"errorCode\":\"API_URL_NOT_CONFIGURED\",\"statusCode\":400,"
+                     "\"message\":\"Chua cau hinh dia chi API Server tren ESP32!\"}");
+        }
+        if (out_status_code) *out_status_code = 400;
+        return ESP_ERR_INVALID_STATE;
+    }
+
     char escaped_qr[384];
     json_escape_into(qr_code, escaped_qr, sizeof(escaped_qr));
 
     char url[256];
     build_iot_url("/tickets/scan", url, sizeof(url));
+    if (url[0] == '\0') {
+        if (out_response && out_max > 0) {
+            snprintf(out_response, out_max, "{\"success\":false,\"message\":\"URL API khong hop le!\"}");
+        }
+        if (out_status_code) *out_status_code = 400;
+        return ESP_ERR_INVALID_STATE;
+    }
 
     char *post_data = (char *)malloc(512);
     if (!post_data) {
@@ -1322,6 +1781,340 @@ static esp_err_t esp32_iot_scan_ticket(const char *qr_code, const char *action,
                                             out_response, out_max, out_status_code);
     free(post_data);
     return err;
+}
+
+/* ============================================================================
+ * 5.1. QUẢN LÝ LỊCH SỬ CHECK-IN / QUÉT VÉ THIẾT BỊ (DEVICE HISTORY)
+ * ============================================================================ */
+static void copy_utf8_ascii_oled(char *dst, size_t dst_max, const char *src)
+{
+    if (!dst || dst_max == 0) return;
+    dst[0] = '\0';
+    if (!src) return;
+
+    size_t j = 0;
+    const uint8_t *p = (const uint8_t *)src;
+    while (*p && j + 1 < dst_max) {
+        if (*p < 0x80) {
+            dst[j++] = (char)*p++;
+        } else {
+            uint32_t cp = 0;
+            if ((*p & 0xE0) == 0xC0 && p[1]) {
+                cp = ((uint32_t)(p[0] & 0x1F) << 6) | (p[1] & 0x3F);
+                p += 2;
+            } else if ((*p & 0xF0) == 0xE0 && p[1] && p[2]) {
+                cp = ((uint32_t)(p[0] & 0x0F) << 12) | ((uint32_t)(p[1] & 0x3F) << 6) | (p[2] & 0x3F);
+                p += 3;
+            } else {
+                p++;
+                continue;
+            }
+            char ascii = '?';
+            if ((cp >= 0xC0 && cp <= 0xC5) || cp == 0x102 || (cp >= 0x1EA0 && cp <= 0x1EB6 && (cp & 1) == 0)) ascii = 'A';
+            else if ((cp >= 0xE0 && cp <= 0xE5) || cp == 0x103 || (cp >= 0x1EA1 && cp <= 0x1EB7 && (cp & 1) == 1)) ascii = 'a';
+            else if (cp == 0x110) ascii = 'D';
+            else if (cp == 0x111) ascii = 'd';
+            else if ((cp >= 0xC8 && cp <= 0xCB) || (cp >= 0x1EB8 && cp <= 0x1EC6 && (cp & 1) == 0)) ascii = 'E';
+            else if ((cp >= 0xE8 && cp <= 0xEB) || (cp >= 0x1EB9 && cp <= 0x1EC7 && (cp & 1) == 1)) ascii = 'e';
+            else if ((cp >= 0xCC && cp <= 0xCF) || cp == 0x128 || cp == 0x1ECA || cp == 0x1EC8) ascii = 'I';
+            else if ((cp >= 0xEC && cp <= 0xEF) || cp == 0x129 || cp == 0x1ECB || cp == 0x1EC9) ascii = 'i';
+            else if ((cp >= 0xD2 && cp <= 0xD5) || cp == 0x1A0 || (cp >= 0x1ECC && cp <= 0x1EE2 && (cp & 1) == 0)) ascii = 'O';
+            else if ((cp >= 0xF2 && cp <= 0xF5) || cp == 0x1A1 || (cp >= 0x1ECD && cp <= 0x1EE3 && (cp & 1) == 1)) ascii = 'o';
+            else if ((cp >= 0xD9 && cp <= 0xDC) || cp == 0x1AF || (cp >= 0x1EE4 && cp <= 0x1EF0 && (cp & 1) == 0)) ascii = 'U';
+            else if ((cp >= 0xF9 && cp <= 0xFC) || cp == 0x1B0 || (cp >= 0x1EE5 && cp <= 0x1EF1 && (cp & 1) == 1)) ascii = 'u';
+            else if (cp == 0xDD || cp == 0x1EF2 || cp == 0x1EF4 || cp == 0x1EF6 || cp == 0x1EF8) ascii = 'Y';
+            else if (cp == 0xFD || cp == 0x1EF3 || cp == 0x1EF5 || cp == 0x1EF7 || cp == 0x1EF9) ascii = 'y';
+            dst[j++] = ascii;
+        }
+    }
+    dst[j] = '\0';
+}
+
+static void format_history_short_time(const char *iso_time, char *out_time, size_t out_max)
+{
+    if (!out_time || out_max == 0) return;
+    out_time[0] = '\0';
+    if (!iso_time || iso_time[0] == '\0') return;
+
+    /* Parse ISO UTC "2026-11-12T16:50:00.000Z" -> local VN (+7h) "11-12 23:50" */
+    int y = 0, mo = 0, da = 0, hh = 0, mm = 0, ss = 0;
+    if (sscanf(iso_time, "%d-%d-%dT%d:%d:%d", &y, &mo, &da, &hh, &mm, &ss) >= 5) {
+        if (strchr(iso_time, 'Z') != NULL) {
+            hh += 7;
+            if (hh >= 24) {
+                hh -= 24;
+                da += 1;
+                static const int mdays[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
+                int maxd = (mo >= 1 && mo <= 12) ? mdays[mo - 1] : 30;
+                if (mo == 2 && ((y % 4 == 0 && y % 100 != 0) || (y % 400 == 0))) maxd = 29;
+                if (da > maxd) {
+                    da = 1;
+                    mo += 1;
+                    if (mo > 12) mo = 1;
+                }
+            }
+        }
+        snprintf(out_time, out_max, "%02d-%02d %02d:%02d", mo, da, hh, mm);
+        return;
+    }
+    snprintf(out_time, out_max, "%.11s", iso_time);
+}
+
+static void push_history_cache_to_oled_locked(void)
+{
+    oled_history_snapshot_t snap;
+    memset(&snap, 0, sizeof(snap));
+
+    snap.page = s_dev_history.page;
+    snap.limit = s_dev_history.limit;
+    snap.total = s_dev_history.total;
+    snap.has_more = s_dev_history.has_more;
+    snap.total_scans = s_dev_history.total_scans;
+    snap.ok_count = s_dev_history.ok_count;
+    snap.verified_count = s_dev_history.verified_count;
+    snap.failed_count = s_dev_history.failed_count;
+    snprintf(snap.filter, sizeof(snap.filter), "%.15s", s_dev_history.filter[0] ? s_dev_history.filter : "ALL");
+    snap.event_only = s_dev_history.event_only;
+    snap.offline_cached = s_dev_history.offline_cached;
+    snap.loading = s_dev_history.loading;
+    snprintf(snap.error_msg, sizeof(snap.error_msg), "%.23s", s_dev_history.last_error);
+
+    int count = s_dev_history.item_count;
+    if (count > OLED_HISTORY_MAX_ITEMS) count = OLED_HISTORY_MAX_ITEMS;
+    snap.item_count = count;
+
+    for (int i = 0; i < count; i++) {
+        copy_utf8_ascii_oled(snap.items[i].ticket_code, sizeof(snap.items[i].ticket_code), s_dev_history.items[i].ticket_code);
+        copy_utf8_ascii_oled(snap.items[i].attendee_name, sizeof(snap.items[i].attendee_name), s_dev_history.items[i].attendee_name);
+        copy_utf8_ascii_oled(snap.items[i].result, sizeof(snap.items[i].result), s_dev_history.items[i].result);
+        copy_utf8_ascii_oled(snap.items[i].message, sizeof(snap.items[i].message), s_dev_history.items[i].message);
+        snap.items[i].success = s_dev_history.items[i].success;
+        format_history_short_time(s_dev_history.items[i].scanned_at, snap.items[i].scanned_at, sizeof(snap.items[i].scanned_at));
+    }
+
+    oled_update_history(&snap);
+}
+
+static void record_local_history_scan(const char *ticket_code, const char *result, const char *msg, bool success)
+{
+    if (g_history_mutex) xSemaphoreTake(g_history_mutex, portMAX_DELAY);
+
+    /* Shift cached items down */
+    for (int i = DEVICE_HISTORY_MAX_ITEMS - 1; i > 0; i--) {
+        s_dev_history.items[i] = s_dev_history.items[i - 1];
+    }
+
+    dev_history_item_t *head = &s_dev_history.items[0];
+    memset(head, 0, sizeof(*head));
+    snprintf(head->ticket_code, sizeof(head->ticket_code), "%s", ticket_code ? ticket_code : "");
+    snprintf(head->result, sizeof(head->result), "%s", result ? result : "OK");
+    snprintf(head->message, sizeof(head->message), "%s", msg ? msg : "");
+    head->success = success;
+
+    uint32_t up_sec = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+    uint32_t h = (up_sec / 3600) % 24;
+    uint32_t m = (up_sec / 60) % 60;
+    snprintf(head->scanned_at, sizeof(head->scanned_at), "%02lu:%02lu", (unsigned long)h, (unsigned long)m);
+
+    if (s_dev_history.item_count < DEVICE_HISTORY_MAX_ITEMS) {
+        s_dev_history.item_count++;
+    }
+
+    s_dev_history.total_scans++;
+    s_dev_history.total++;
+    if (result && strcmp(result, "OK") == 0) {
+        s_dev_history.ok_count++;
+    } else if (result && strcmp(result, "VERIFIED") == 0) {
+        s_dev_history.verified_count++;
+    } else {
+        s_dev_history.failed_count++;
+    }
+
+    s_dev_history.is_stale = true;
+    push_history_cache_to_oled_locked();
+    if (g_history_mutex) xSemaphoreGive(g_history_mutex);
+
+    ESP_LOGI(TAG, "History local record: %s [%s] (Total=%d, OK=%d, ERR=%d)",
+             ticket_code ? ticket_code : "--", result ? result : "?",
+             s_dev_history.total_scans, s_dev_history.ok_count, s_dev_history.failed_count);
+}
+
+static esp_err_t fetchDeviceHistory(int page, int limit, const char *result_filter, bool event_only)
+{
+    if (page < 1) page = 1;
+    if (limit < 1) limit = 5;
+    if (limit > DEVICE_HISTORY_MAX_ITEMS) limit = DEVICE_HISTORY_MAX_ITEMS;
+    const char *flt = (result_filter && result_filter[0]) ? result_filter : "ALL";
+
+    char dev_id[64] = "";
+    char dev_sec[160] = "";
+    if (g_iot_mutex) xSemaphoreTake(g_iot_mutex, portMAX_DELAY);
+    snprintf(dev_id, sizeof(dev_id), "%s", g_iot_device_id);
+    snprintf(dev_sec, sizeof(dev_sec), "%s", g_iot_device_secret);
+    bool paired = is_iot_device_paired_active();
+    if (g_iot_mutex) xSemaphoreGive(g_iot_mutex);
+
+    if (!paired || dev_id[0] == '\0' || dev_sec[0] == '\0') {
+        if (g_history_mutex) xSemaphoreTake(g_history_mutex, portMAX_DELAY);
+        s_dev_history.offline_cached = true;
+        s_dev_history.loading = false;
+        snprintf(s_dev_history.last_error, sizeof(s_dev_history.last_error), "CHUA GHEP IOT");
+        push_history_cache_to_oled_locked();
+        if (g_history_mutex) xSemaphoreGive(g_history_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (!is_valid_iot_url(g_iot_base_url)) {
+        if (g_history_mutex) xSemaphoreTake(g_history_mutex, portMAX_DELAY);
+        s_dev_history.offline_cached = true;
+        s_dev_history.loading = false;
+        snprintf(s_dev_history.last_error, sizeof(s_dev_history.last_error), "CHUA CAU HINH URL");
+        push_history_cache_to_oled_locked();
+        if (g_history_mutex) xSemaphoreGive(g_history_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (g_history_mutex) xSemaphoreTake(g_history_mutex, portMAX_DELAY);
+    s_dev_history.loading = true;
+    s_dev_history.page = page;
+    s_dev_history.limit = limit;
+    snprintf(s_dev_history.filter, sizeof(s_dev_history.filter), "%s", flt);
+    s_dev_history.event_only = event_only;
+    push_history_cache_to_oled_locked();
+    if (g_history_mutex) xSemaphoreGive(g_history_mutex);
+
+    char path[160];
+    snprintf(path, sizeof(path), "/devices/history?page=%d&limit=%d&result=%s&event_only=%s",
+             page, limit, flt, event_only ? "true" : "false");
+    char url[256];
+    build_iot_url(path, url, sizeof(url));
+
+    char *resp_buf = (char *)heap_caps_malloc(8192, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!resp_buf) {
+        resp_buf = (char *)malloc(8192);
+    }
+    if (!resp_buf) {
+        if (g_history_mutex) xSemaphoreTake(g_history_mutex, portMAX_DELAY);
+        s_dev_history.loading = false;
+        snprintf(s_dev_history.last_error, sizeof(s_dev_history.last_error), "HET RAM HEAP");
+        push_history_cache_to_oled_locked();
+        if (g_history_mutex) xSemaphoreGive(g_history_mutex);
+        return ESP_ERR_NO_MEM;
+    }
+    resp_buf[0] = '\0';
+
+    int http_code = -1;
+    ESP_LOGI(TAG, "Fetching Device History: %s...", url);
+    esp_err_t err = esp32_http_json_request(HTTP_METHOD_GET, url, NULL,
+                                            NULL, NULL, dev_id, dev_sec,
+                                            resp_buf, 8192, &http_code);
+
+    if (g_history_mutex) xSemaphoreTake(g_history_mutex, portMAX_DELAY);
+    s_dev_history.last_http_code = http_code;
+    s_dev_history.loading = false;
+
+    if (err != ESP_OK || http_code != 200) {
+        s_dev_history.offline_cached = true;
+        if (http_code == 403) {
+            snprintf(s_dev_history.last_error, sizeof(s_dev_history.last_error), "MAY BI KHOA (403)");
+            if (g_iot_mutex) xSemaphoreTake(g_iot_mutex, portMAX_DELAY);
+            g_iot_state = IOT_STATE_DISABLED;
+            snprintf(g_iot_last_err, sizeof(g_iot_last_err), "DEVICE_DISABLED");
+            if (g_iot_mutex) xSemaphoreGive(g_iot_mutex);
+            sync_oled_network_state();
+        } else if (http_code == 401) {
+            snprintf(s_dev_history.last_error, sizeof(s_dev_history.last_error), "SAI SECRET (401)");
+            if (g_iot_mutex) xSemaphoreTake(g_iot_mutex, portMAX_DELAY);
+            snprintf(g_iot_last_err, sizeof(g_iot_last_err), "UNAUTHORIZED");
+            if (g_iot_mutex) xSemaphoreGive(g_iot_mutex);
+        } else {
+            snprintf(s_dev_history.last_error, sizeof(s_dev_history.last_error), "HTTP %d", http_code);
+        }
+        push_history_cache_to_oled_locked();
+        if (g_history_mutex) xSemaphoreGive(g_history_mutex);
+        free(resp_buf);
+        return ESP_FAIL;
+    }
+
+    if (resp_buf[0] != '{') {
+        s_dev_history.offline_cached = true;
+        snprintf(s_dev_history.last_error, sizeof(s_dev_history.last_error), "PARSE JSON ERR");
+        push_history_cache_to_oled_locked();
+        if (g_history_mutex) xSemaphoreGive(g_history_mutex);
+        free(resp_buf);
+        return ESP_FAIL;
+    }
+
+    /* Parse pagination */
+    const char *pag_ptr = find_json_key(resp_buf, "pagination");
+    if (pag_ptr && *pag_ptr == '{') {
+        char pag_buf[192];
+        extract_json_object_slice(pag_ptr, pag_buf, sizeof(pag_buf));
+        extract_json_int(pag_buf, "page", &s_dev_history.page);
+        extract_json_int(pag_buf, "limit", &s_dev_history.limit);
+        extract_json_int(pag_buf, "total", &s_dev_history.total);
+        extract_json_bool(pag_buf, "has_more", &s_dev_history.has_more);
+    }
+
+    /* Parse stats */
+    const char *stats_ptr = find_json_key(resp_buf, "stats");
+    if (stats_ptr && *stats_ptr == '{') {
+        char stats_buf[192];
+        extract_json_object_slice(stats_ptr, stats_buf, sizeof(stats_buf));
+        extract_json_int(stats_buf, "total_scans", &s_dev_history.total_scans);
+        extract_json_int(stats_buf, "ok_count", &s_dev_history.ok_count);
+        extract_json_int(stats_buf, "verified_count", &s_dev_history.verified_count);
+        extract_json_int(stats_buf, "failed_count", &s_dev_history.failed_count);
+    }
+
+    /* Parse items array (zero AST heap allocation) */
+    const char *items_ptr = find_json_key(resp_buf, "items");
+    int count = 0;
+    if (items_ptr && *items_ptr == '[') {
+        const char *p = items_ptr + 1;
+        while (*p && *p != ']' && count < DEVICE_HISTORY_MAX_ITEMS) {
+            while (*p && *p != '{' && *p != ']') p++;
+            if (*p != '{') break;
+
+            char item_buf[640];
+            const char *next_p = extract_json_object_slice(p, item_buf, sizeof(item_buf));
+            if (!next_p) break;
+            p = next_p;
+
+            dev_history_item_t *dst = &s_dev_history.items[count];
+            memset(dst, 0, sizeof(*dst));
+
+            extract_json_str(item_buf, "id", dst->id, sizeof(dst->id));
+            extract_json_str(item_buf, "ticket_code", dst->ticket_code, sizeof(dst->ticket_code));
+            extract_json_str(item_buf, "attendee_name", dst->attendee_name, sizeof(dst->attendee_name));
+            extract_json_str(item_buf, "event_id", dst->event_id, sizeof(dst->event_id));
+            extract_json_str(item_buf, "event_code", dst->event_code, sizeof(dst->event_code));
+            extract_json_str(item_buf, "event_name", dst->event_name, sizeof(dst->event_name));
+            extract_json_str(item_buf, "action", dst->action, sizeof(dst->action));
+            extract_json_str(item_buf, "result", dst->result, sizeof(dst->result));
+            extract_json_str(item_buf, "message", dst->message, sizeof(dst->message));
+            extract_json_str(item_buf, "scanned_at", dst->scanned_at, sizeof(dst->scanned_at));
+            if (!extract_json_bool(item_buf, "success", &dst->success)) {
+                dst->success = (strcmp(dst->result, "OK") == 0);
+            }
+
+            count++;
+        }
+    }
+
+    s_dev_history.item_count = count;
+    s_dev_history.offline_cached = false;
+    s_dev_history.is_stale = false;
+    s_dev_history.last_error[0] = '\0';
+    push_history_cache_to_oled_locked();
+    if (g_history_mutex) xSemaphoreGive(g_history_mutex);
+
+    free(resp_buf);
+
+    ESP_LOGI(TAG, "Device History synced: %d items (page %d, total %d, has_more=%d, OK=%d, ERR=%d)",
+             count, s_dev_history.page, s_dev_history.total, s_dev_history.has_more ? 1 : 0,
+             s_dev_history.ok_count, s_dev_history.failed_count);
+    return ESP_OK;
 }
 
 /* ============================================================================
@@ -1363,7 +2156,7 @@ static esp_err_t jpg_stream_httpd_handler(httpd_req_t *req)
         fb = NULL;
 
         if (res != ESP_OK) break;
-        vTaskDelay(pdMS_TO_TICKS(g_https_in_progress ? 28 : 15));
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
     return res;
 }
@@ -1675,12 +2468,16 @@ static esp_err_t iot_config_httpd_handler(httpd_req_t *req)
         ESP_LOGW(TAG, "HTTP: Cleared IoT pairing credentials for re-registration");
     }
     if (new_url[0] != '\0') {
-        if (g_iot_mutex) xSemaphoreTake(g_iot_mutex, portMAX_DELAY);
-        snprintf(g_iot_base_url, sizeof(g_iot_base_url), "%s", new_url);
-        if (g_iot_mutex) xSemaphoreGive(g_iot_mutex);
-        save_iot_nvs_str("iot_url", new_url);
-        g_iot_force_sync = true;
-        ESP_LOGI(TAG, "HTTP: Updated IoT Base URL -> %s", new_url);
+        char norm_url[192];
+        normalize_iot_url(new_url, norm_url, sizeof(norm_url));
+        if (norm_url[0] != '\0') {
+            if (g_iot_mutex) xSemaphoreTake(g_iot_mutex, portMAX_DELAY);
+            snprintf(g_iot_base_url, sizeof(g_iot_base_url), "%s", norm_url);
+            if (g_iot_mutex) xSemaphoreGive(g_iot_mutex);
+            save_iot_nvs_str("iot_url", norm_url);
+            g_iot_force_sync = true;
+            ESP_LOGI(TAG, "HTTP: Persistent IoT Base URL saved to NVS -> %s", norm_url);
+        }
     } else if (do_sync) {
         g_iot_force_sync = true;
     }
@@ -1850,11 +2647,20 @@ static oled_ticket_status_t process_iot_scan_response(const char *raw_qr, const 
                                                       bool *out_net_err)
 {
     if (out_net_err) *out_net_err = false;
+    if (resp_json && strstr(resp_json, "API_URL_NOT_CONFIGURED") != NULL) {
+        if (out_net_err) *out_net_err = true;
+        oled_show_ticket_status(OLED_TICKET_NET_ERR, clean_qr, "CHUA CAU HINH URL");
+        update_last_scan_state(raw_qr, "ERROR", "Chua cau hinh URL API!", false);
+        buzzer_beep(240);
+        led_trigger_red_error();
+        return OLED_TICKET_NET_ERR;
+    }
     if (http_code <= 0 || is_json_network_error(resp_json)) {
         if (out_net_err) *out_net_err = true;
         oled_show_ticket_status(OLED_TICKET_NET_ERR, clean_qr, "KIEM TRA MANG");
         update_last_scan_state(raw_qr, "ERROR", "Loi ket noi server IoT", false);
         buzzer_beep(240);
+        led_trigger_red_error();
         return OLED_TICKET_NET_ERR;
     }
 
@@ -1873,6 +2679,7 @@ static oled_ticket_status_t process_iot_scan_response(const char *raw_qr, const 
         oled_show_ticket_status(OLED_TICKET_NET_ERR, clean_qr, "CAN RESET GHEP");
         update_last_scan_state(raw_qr, "ERROR", msg[0] ? msg : "Thiet bi can ghep noi lai", false);
         buzzer_beep(240);
+        led_trigger_red_error();
         return OLED_TICKET_NET_ERR;
     }
 
@@ -1884,52 +2691,67 @@ static oled_ticket_status_t process_iot_scan_response(const char *raw_qr, const 
         oled_show_ticket_status(OLED_TICKET_NET_ERR, clean_qr, "MAY BI KHOA!");
         update_last_scan_state(raw_qr, "DISABLED", msg[0] ? msg : "Thiet bi da bi khoa boi Admin", false);
         buzzer_beep(240);
+        led_trigger_red_error();
         return OLED_TICKET_NET_ERR;
     }
 
     if (http_code == 403 || strcmp(result_str, "WRONG_EVENT") == 0 || strcmp(error_code, "WRONG_EVENT") == 0) {
+        record_local_history_scan(clean_qr, "WRONG_EVENT", msg[0] ? msg : "Ve khong thuoc su kien", false);
         oled_show_ticket_status(OLED_TICKET_WRONG_EVENT, clean_qr, "SAI SU KIEN!");
         update_last_scan_state(raw_qr, "WRONG_EVENT", msg[0] ? msg : "Ve khong thuoc su kien cua thiet bi nay", false);
         buzzer_beep(240);
+        led_trigger_red_error();
         return OLED_TICKET_WRONG_EVENT;
     }
 
     if (http_code == 400 && (strcmp(result_str, "NO_EVENT_ASSIGNED") == 0 || strcmp(error_code, "NO_EVENT_ASSIGNED") == 0)) {
+        record_local_history_scan(clean_qr, "NO_EVENT", msg[0] ? msg : "Chua duoc gan su kien", false);
         oled_show_ticket_status(OLED_TICKET_WRONG_EVENT, clean_qr, "CHUA GAN SK!");
         update_last_scan_state(raw_qr, "NO_EVENT", msg[0] ? msg : "Admin chua gan su kien cho thiet bi", false);
         buzzer_beep(240);
+        led_trigger_red_error();
         return OLED_TICKET_WRONG_EVENT;
     }
 
     if (strcmp(result_str, "OK") == 0) {
+        record_local_history_scan(clean_qr, "OK", msg[0] ? msg : "Check-in thanh cong", true);
         oled_show_ticket_status(OLED_TICKET_OK, clean_qr, "VE HOP LE");
         update_last_scan_state(raw_qr, "CONFIRMED", msg[0] ? msg : "Check-in IoT thanh cong!", true);
-        set_led_duty(180);
-        buzzer_beep(65);
-        vTaskDelay(pdMS_TO_TICKS(120));
-        buzzer_beep(65);
-        vTaskDelay(pdMS_TO_TICKS(140));
-        set_led_duty(0);
+        /* Kêu bíp bíp 2 tiếng vui tai khi vé hợp lệ */
+        buzzer_beep(70);
+        vTaskDelay(pdMS_TO_TICKS(80));
+        buzzer_beep(90);
+        servo_trigger_gate_open();
+        led_trigger_green_ok();
         return OLED_TICKET_OK;
     }
 
     if (strcmp(result_str, "VERIFIED") == 0) {
+        record_local_history_scan(clean_qr, "VERIFIED", msg[0] ? msg : "Ve hop le (cho xac nhan)", false);
         oled_show_ticket_status(OLED_TICKET_VERIFIED, clean_qr, "BAM XAC NHAN");
         update_last_scan_state(raw_qr, "VERIFIED", msg[0] ? msg : "Ve hop le (cho xac nhan)", false);
-        buzzer_beep(65);
+        /* Kêu bíp bíp 2 tiếng cho vé hợp lệ chờ xác nhận */
+        buzzer_beep(70);
+        vTaskDelay(pdMS_TO_TICKS(80));
+        buzzer_beep(90);
+        led_trigger_green_ok();
         return OLED_TICKET_VERIFIED;
     }
 
     if (http_code == 409 || strcmp(result_str, "USED") == 0 || is_json_ticket_used(resp_json)) {
+        record_local_history_scan(clean_qr, "USED", msg[0] ? msg : "Ve da duoc su dung", false);
         oled_show_ticket_status(OLED_TICKET_USED, clean_qr, "DA CHECKIN ROI");
         update_last_scan_state(raw_qr, "USED", msg[0] ? msg : "Ve nay da duoc su dung truoc do", false);
         buzzer_beep(240);
+        led_trigger_red_error();
         return OLED_TICKET_USED;
     }
 
+    record_local_history_scan(clean_qr, "NOT_FOUND", msg[0] ? msg : "Ve khong ton tai", false);
     oled_show_ticket_status(OLED_TICKET_NOT_FOUND, clean_qr, "VE KO TON TAI");
     update_last_scan_state(raw_qr, "INVALID", msg[0] ? msg : "Khong tim thay hoac ve khong hop le", false);
     buzzer_beep(240);
+    led_trigger_red_error();
     return OLED_TICKET_NOT_FOUND;
 }
 
@@ -1996,6 +2818,90 @@ static esp_err_t checkin_ticket_httpd_handler(httpd_req_t *req)
     return handle_ticket_action_httpd(req, true);
 }
 
+static esp_err_t history_httpd_handler(httpd_req_t *req)
+{
+    char query[128] = "";
+    int page = 1;
+    int limit = 5;
+    char filter[24] = "ALL";
+    bool event_only = false;
+    bool force_refresh = false;
+
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char val[32];
+        if (httpd_query_key_value(query, "page", val, sizeof(val)) == ESP_OK) {
+            page = atoi(val);
+            if (page < 1) page = 1;
+        }
+        if (httpd_query_key_value(query, "limit", val, sizeof(val)) == ESP_OK) {
+            limit = atoi(val);
+            if (limit < 1) limit = 5;
+            if (limit > DEVICE_HISTORY_MAX_ITEMS) limit = DEVICE_HISTORY_MAX_ITEMS;
+        }
+        if (httpd_query_key_value(query, "result", val, sizeof(val)) == ESP_OK) {
+            snprintf(filter, sizeof(filter), "%.23s", val);
+        }
+        if (httpd_query_key_value(query, "event_only", val, sizeof(val)) == ESP_OK) {
+            event_only = (strcmp(val, "true") == 0 || strcmp(val, "1") == 0);
+        }
+        if (httpd_query_key_value(query, "refresh", val, sizeof(val)) == ESP_OK) {
+            force_refresh = (strcmp(val, "true") == 0 || strcmp(val, "1") == 0);
+        }
+    }
+
+    if (force_refresh || s_dev_history.is_stale ||
+        page != s_dev_history.page ||
+        limit != s_dev_history.limit ||
+        strcmp(filter, s_dev_history.filter) != 0 ||
+        event_only != s_dev_history.event_only) {
+        fetchDeviceHistory(page, limit, filter, event_only);
+    }
+
+    char *resp = (char *)heap_caps_malloc(8192, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!resp) resp = (char *)malloc(8192);
+    if (!resp) return httpd_resp_send_500(req);
+
+    if (g_history_mutex) xSemaphoreTake(g_history_mutex, portMAX_DELAY);
+    size_t off = 0;
+    off += snprintf(resp + off, 8192 - off,
+                    "{\"success\":true,\"device_id\":\"%s\",\"device_name\":\"%s\","
+                    "\"pagination\":{\"page\":%d,\"limit\":%d,\"total\":%d,\"has_more\":%s},"
+                    "\"stats\":{\"total_scans\":%d,\"ok_count\":%d,\"verified_count\":%d,\"failed_count\":%d},"
+                    "\"filter\":\"%s\",\"event_only\":%s,\"offline_cached\":%s,\"loading\":%s,"
+                    "\"last_error\":\"%s\",\"items\":[",
+                    g_iot_device_id, g_iot_device_name,
+                    s_dev_history.page, s_dev_history.limit, s_dev_history.total, s_dev_history.has_more ? "true" : "false",
+                    s_dev_history.total_scans, s_dev_history.ok_count, s_dev_history.verified_count, s_dev_history.failed_count,
+                    s_dev_history.filter, s_dev_history.event_only ? "true" : "false",
+                    s_dev_history.offline_cached ? "true" : "false",
+                    s_dev_history.loading ? "true" : "false",
+                    s_dev_history.last_error);
+
+    for (int i = 0; i < s_dev_history.item_count && off + 320 < 8192; i++) {
+        const dev_history_item_t *it = &s_dev_history.items[i];
+        char esc_tck[96], esc_att[96], esc_msg[160];
+        json_escape_into(it->ticket_code, esc_tck, sizeof(esc_tck));
+        json_escape_into(it->attendee_name, esc_att, sizeof(esc_att));
+        json_escape_into(it->message, esc_msg, sizeof(esc_msg));
+
+        off += snprintf(resp + off, 8192 - off,
+                        "%s{\"id\":\"%s\",\"ticket_code\":\"%s\",\"attendee_name\":\"%s\","
+                        "\"event_code\":\"%s\",\"action\":\"%s\",\"result\":\"%s\","
+                        "\"success\":%s,\"message\":\"%s\",\"scanned_at\":\"%s\"}",
+                        (i > 0) ? "," : "",
+                        it->id, esc_tck, esc_att, it->event_code, it->action, it->result,
+                        it->success ? "true" : "false", esc_msg, it->scanned_at);
+    }
+    off += snprintf(resp + off, 8192 - off, "]}");
+    if (g_history_mutex) xSemaphoreGive(g_history_mutex);
+
+    httpd_resp_set_type(req, "application/json");
+    send_cors_headers(req);
+    esp_err_t ret = httpd_resp_send(req, resp, strlen(resp));
+    free(resp);
+    return ret;
+}
+
 static const char STANDALONE_HTML[] =
 "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
 "<title>ESP32-S3 Check-in Station (Standalone)</title>"
@@ -2006,6 +2912,7 @@ static const char STANDALONE_HTML[] =
 ".card{background:#0f172a;border:1px solid #334155;border-radius:10px;padding:12px;margin-top:12px;text-align:left;font-size:13px;}"
 ".row{display:flex;align-items:center;justify-content:space-between;gap:8px;}"
 ".btn{background:#3b82f6;color:#fff;border:none;border-radius:8px;padding:8px 14px;font-weight:700;cursor:pointer;}"
+".btn:disabled{opacity:0.4;cursor:not-allowed;}"
 ".btn-ok{background:#10b981;}"
 ".ok{border-color:#10b981;background:rgba(16,185,129,0.14);}"
 "input{width:100%;box-sizing:border-box;background:#1e293b;color:#f8fafc;border:1px solid #475569;border-radius:6px;padding:7px;margin-top:6px;}"
@@ -2029,12 +2936,67 @@ static const char STANDALONE_HTML[] =
 "<div id='scan-qr' style='font-weight:700;font-size:15px;margin:4px 0'>Chờ mã QR...</div>"
 "<div id='scan-msg' style='color:#cbd5e1'>Đưa mã QR vào trước camera ESP32</div>"
 "<button id='btn-ci' class='btn btn-ok' style='display:none;margin-top:10px;width:100%' onclick='manualCi()'>Xác nhận soát vé ngay</button></div>"
+"<div class='card' id='hist-card'><div class='row'>"
+"<div style='color:#94a3b8;font-size:11px'>📜 LỊCH SỬ QUÉT VÉ THIẾT BỊ</div>"
+"<button class='btn' style='padding:3px 9px;font-size:11px' onclick='loadHist(hPage,true)'>🔄 Làm mới</button></div>"
+"<div style='margin:6px 0;font-size:11px'>"
+"<span class='badge' id='h-stat-ok' style='margin:2px;font-size:11px'>OK: 0</span>"
+"<span class='badge' id='h-stat-err' style='background:rgba(239,68,68,0.2);color:#f87171;margin:2px;font-size:11px'>Lỗi: 0</span>"
+"<span class='badge' id='h-stat-all' style='background:rgba(148,163,184,0.2);color:#cbd5e1;margin:2px;font-size:11px'>Tổng: 0</span></div>"
+"<div class='row' style='margin-bottom:8px;flex-wrap:wrap'>"
+"<div style='display:flex;gap:4px'>"
+"<button class='btn' id='hf-all' style='padding:3px 9px;font-size:11px' onclick='setHistFilter(\"ALL\")'>Tất cả</button>"
+"<button class='btn' id='hf-ok' style='background:#1e293b;border:1px solid #475569;padding:3px 9px;font-size:11px' onclick='setHistFilter(\"OK\")'>OK</button>"
+"<button class='btn' id='hf-err' style='background:#1e293b;border:1px solid #475569;padding:3px 9px;font-size:11px' onclick='setHistFilter(\"FAILED\")'>Lỗi</button></div>"
+"<label style='font-size:11px;color:#94a3b8;display:flex;align-items:center;gap:4px;cursor:pointer'>"
+"<input type='checkbox' id='h-event-only' style='width:auto;margin:0' onchange='loadHist(1,true)'>Chỉ SK gán</label></div>"
+"<div id='hist-list' style='font-size:12px;display:flex;flex-direction:column;gap:6px;min-height:36px'>"
+"<div style='color:#94a3b8'>Đang tải lịch sử...</div></div>"
+"<div class='row' style='margin-top:8px'>"
+"<button class='btn' id='h-btn-prev' style='padding:4px 10px;font-size:11px' onclick='prevHistPage()'>◀ Trước</button>"
+"<span id='h-page-info' style='color:#94a3b8;font-size:11px'>Trang 1</span>"
+"<button class='btn' id='h-btn-next' style='padding:4px 10px;font-size:11px' onclick='nextHistPage()'>Sau ▶</button></div></div>"
+"<div class='card'><div class='row'><div style='color:#94a3b8;font-size:11px'>🛠️ KIỂM TRA PHẦN CỨNG (TEST HARDWARE)</div>"
+"<button class='btn' style='background:#d97706;padding:3px 9px;font-size:11px' onclick='testDev(\"all\")'>⚡ Test toàn bộ</button></div>"
+"<div class='row' style='margin-top:8px;gap:6px'>"
+"<button class='btn' style='background:#10b981;flex:1;padding:5px;font-size:11px' onclick='testDev(\"green\",1)'>🟢 LED Xanh</button>"
+"<button class='btn' style='background:#ef4444;flex:1;padding:5px;font-size:11px' onclick='testDev(\"red\",1)'>🔴 LED Đỏ</button>"
+"<button class='btn' style='background:#3b82f6;flex:1;padding:5px;font-size:11px' onclick='testDev(\"buzzer\")'>🔊 Còi</button>"
+"<button class='btn' style='background:#8b5cf6;flex:1;padding:5px;font-size:11px' onclick='testDev(\"servo\")'>🚪 Servo 90°</button></div>"
+"<div class='row' style='margin-top:6px;gap:6px'>"
+"<button class='btn' style='background:#334155;flex:1;padding:4px;font-size:11px' onclick='testDev(\"green\",0);testDev(\"red\",0)'>⚫ Tắt LED</button>"
+"<button class='btn' style='background:#334155;flex:1;padding:4px;font-size:11px' onclick='testDev(\"servo\",0)'>🚪 Đóng Servo 0°</button></div></div>"
 "</div><script>"
-"let lastQr='';let busyAuto=0;let iotUrlInit=false;"
+"let lastQr='';let lastSeq=-1;let busyAuto=0;let iotUrlInit=false;"
+"let hPage=1;let hLimit=5;let hFilter='ALL';let hHasMore=false;"
+"async function testDev(d,s){try{await fetch('/api/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({device:d,state:(s!==undefined?s:1),angle:(s===0?0:90),duration:120})});}catch(e){}}"
+"function esc(s){return String(s||'').replace(/[&<>\"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[m]));}"
+"function fmtT(s){if(!s)return '';const d=new Date(s);if(!isNaN(d.getTime()))return d.toLocaleTimeString('vi-VN',{hour:'2-digit',minute:'2-digit'})+' '+d.toLocaleDateString('vi-VN',{day:'2-digit',month:'2-digit'});return s;}"
 "async function setAuto(v){busyAuto=Date.now();const r=await fetch('/api/auto-confirm',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:v})});const d=await r.json();document.getElementById('auto-msg').innerText=d.auto_confirm?'✓ ESP32 đang BẬT tự xác nhận vé (đã lưu NVS)':'ESP32 đang TẮT tự xác nhận vé (đã lưu NVS)';}"
-"async function saveIotUrl(){const u=document.getElementById('iot-url-in').value.trim();if(!u)return;await fetch('/api/iot-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({iot_base_url:u,sync:true})});poll();}"
+"async function saveIotUrl(){const u=document.getElementById('iot-url-in').value.trim();if(!u)return;await fetch('/api/iot-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({iot_base_url:u,sync:true})});alert('Đã lưu vĩnh viễn địa chỉ URL máy chủ vào Flash ESP32!');poll();}"
 "async function resetIot(){if(!confirm('Xóa device_secret hiện tại để xin mã ghép nối mới?'))return;await fetch('/api/iot-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reset:true})});poll();}"
-"async function manualCi(){if(!lastQr)return;const r=await fetch('/api/check-in',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({qrCode:lastQr})});const d=await r.json();alert(d.message||(d.success?'Xác nhận thành công':'Lỗi xác nhận'));poll();}"
+"async function manualCi(){if(!lastQr)return;const r=await fetch('/api/check-in',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({qrCode:lastQr})});const d=await r.json();alert(d.message||(d.success?'Xác nhận thành công':'Lỗi xác nhận'));poll();loadHist(1,true);}"
+"async function setHistFilter(f){hFilter=f;['all','ok','err'].forEach(k=>{const b=document.getElementById('hf-'+k);const sel=(f==='ALL'&&k==='all')||(f==='OK'&&k==='ok')||(f==='FAILED'&&k==='err');b.style.background=sel?'#3b82f6':'#1e293b';b.style.border=sel?'none':'1px solid #475569';});await loadHist(1,true);}"
+"async function prevHistPage(){if(hPage>1){await loadHist(hPage-1,true);}}"
+"async function nextHistPage(){if(hHasMore){await loadHist(hPage+1,true);}}"
+"async function loadHist(p,force){try{hPage=p||1;const eo=document.getElementById('h-event-only').checked?'true':'false';"
+"const u='/api/history?page='+hPage+'&limit='+hLimit+'&result='+encodeURIComponent(hFilter)+'&event_only='+eo+(force?'&refresh=1':'');"
+"const r=await fetch(u);const d=await r.json();const st=d.stats||{};"
+"document.getElementById('h-stat-ok').innerText='OK: '+(st.ok_count||0);"
+"document.getElementById('h-stat-err').innerText='Lỗi: '+(st.failed_count||0);"
+"document.getElementById('h-stat-all').innerText='Tổng: '+(st.total_scans||0);"
+"const pag=d.pagination||{};hHasMore=!!pag.has_more;hPage=pag.page||hPage;"
+"document.getElementById('h-page-info').innerText='Trang '+hPage+(pag.total?(' ('+pag.total+' lượt)'):'')+(d.offline_cached?' • Cache':'');"
+"document.getElementById('h-btn-prev').disabled=(hPage<=1);document.getElementById('h-btn-next').disabled=!hHasMore;"
+"const items=d.items||[];const hl=document.getElementById('hist-list');"
+"if(!items.length){hl.innerHTML='<div style=\"color:#94a3b8;padding:4px 0\">Chưa có lượt quét nào'+(d.last_error?(' ('+esc(d.last_error)+')'):'')+'</div>';return;}"
+"hl.innerHTML=items.map(it=>{const ok=(it.result==='OK'||it.success);const ver=(it.result==='VERIFIED');"
+"const col=ok?'#34d399':(ver?'#93c5fd':'#f87171');const bg=ok?'rgba(16,185,129,0.15)':(ver?'rgba(59,130,246,0.15)':'rgba(239,68,68,0.15)');"
+"const code=it.ticket_code||it.message||'--';const att=it.attendee_name?('<b style=\"color:#f8fafc\">'+esc(it.attendee_name)+'</b> • '):'';"
+"return '<div style=\"background:#1e293b;border-radius:6px;padding:7px 9px;border-left:3px solid '+col+'\">'"
+"+'<div class=\"row\"><span><span style=\"background:'+bg+';color:'+col+';padding:1px 5px;border-radius:4px;font-weight:700;font-size:10px\">'+esc(it.result)+'</span> '"
+"+'<b style=\"margin-left:4px\">'+esc(code)+'</b></span><small style=\"color:#94a3b8\">'+esc(fmtT(it.scanned_at))+'</small></div>'"
+"+'<div style=\"color:#cbd5e1;font-size:11px;margin-top:3px\">'+att+esc(it.message)+'</div></div>';}).join('');}catch(e){}}"
 "async function poll(){try{const r=await fetch('/status');const d=await r.json();"
 "document.getElementById('b-wifi').innerText=(d.wifi_connected?('📶 '+d.ssid+' ('+d.ip+')'):'Mất Wi-Fi');"
 "const iot=d.iot||{};const bi=document.getElementById('b-iot');"
@@ -2053,8 +3015,84 @@ static const char STANDALONE_HTML[] =
 "document.getElementById('scan-msg').innerText=ls.message||'Đưa mã QR vào trước camera ESP32';"
 "document.getElementById('scan-card').className='card'+(ls.status==='CONFIRMED'?' ok':'');"
 "document.getElementById('btn-ci').style.display=(ls.status==='VERIFIED'&&!d.auto_confirm&&ls.qr)?'block':'none';"
-"}catch(e){}setTimeout(poll,1000);}poll();"
+"if(ls.seq!==undefined&&ls.seq!==lastSeq){const firstLoad=(lastSeq===-1);lastSeq=ls.seq;if(!firstLoad)loadHist(1,false);}"
+"}catch(e){}setTimeout(poll,1000);}poll();loadHist(1,false);"
 "</script></body></html>";
+
+static esp_err_t servo_control_httpd_handler(httpd_req_t *req)
+{
+    char content[128];
+    int ret = httpd_req_recv(req, content, sizeof(content) - 1);
+    int angle = -1;
+    if (ret > 0) {
+        content[ret] = '\0';
+        extract_json_int(content, "angle", &angle);
+    }
+
+    if (angle >= 0 && angle <= 180) {
+        servo_set_angle((uint32_t)angle);
+    } else {
+        servo_trigger_gate_open();
+    }
+
+    const char *resp = "{\"success\":true,\"message\":\"Servo gate triggered OK\"}";
+    httpd_resp_set_type(req, "application/json");
+    send_cors_headers(req);
+    return httpd_resp_send(req, resp, strlen(resp));
+}
+
+static esp_err_t test_hardware_httpd_handler(httpd_req_t *req)
+{
+    char buf[256];
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret <= 0) {
+        httpd_resp_set_type(req, "application/json");
+        send_cors_headers(req);
+        return httpd_resp_send(req, "{\"success\":false,\"message\":\"No body\"}", HTTPD_RESP_USE_STRLEN);
+    }
+    buf[ret] = '\0';
+
+    char dev[32] = "";
+    extract_json_str(buf, "device", dev, sizeof(dev));
+    if (dev[0] == '\0') {
+        extract_json_str(buf, "action", dev, sizeof(dev));
+    }
+    int state = 0;
+    extract_json_int(buf, "state", &state);
+
+    char resp[160];
+    if (strcmp(dev, "green") == 0 || strcmp(dev, "led_green") == 0) {
+        led_set_green_direct(state);
+        snprintf(resp, sizeof(resp), "{\"success\":true,\"device\":\"green\",\"state\":%d}", state ? 1 : 0);
+    } else if (strcmp(dev, "red") == 0 || strcmp(dev, "led_red") == 0) {
+        led_set_red_direct(state);
+        snprintf(resp, sizeof(resp), "{\"success\":true,\"device\":\"red\",\"state\":%d}", state ? 1 : 0);
+    } else if (strcmp(dev, "buzzer") == 0) {
+        int b_ms = 150;
+        extract_json_int(buf, "duration", &b_ms);
+        buzzer_beep(b_ms > 0 ? b_ms : 150);
+        snprintf(resp, sizeof(resp), "{\"success\":true,\"device\":\"buzzer\",\"beep_ms\":%d}", b_ms > 0 ? b_ms : 150);
+    } else if (strcmp(dev, "servo") == 0) {
+        int angle = 90;
+        extract_json_int(buf, "angle", &angle);
+        if (angle == 90) servo_trigger_gate_open();
+        else servo_set_angle((uint32_t)angle);
+        snprintf(resp, sizeof(resp), "{\"success\":true,\"device\":\"servo\",\"angle\":%d}", angle);
+    } else if (strcmp(dev, "ir") == 0 || strcmp(dev, "sensor") == 0) {
+        bool blocked = is_ir_obstacle_detected();
+        snprintf(resp, sizeof(resp), "{\"success\":true,\"device\":\"ir\",\"detected\":%s,\"state\":%d}",
+                 blocked ? "true" : "false", blocked ? 1 : 0);
+    } else if (strcmp(dev, "all") == 0) {
+        trigger_hardware_selftest();
+        snprintf(resp, sizeof(resp), "{\"success\":true,\"device\":\"all\",\"message\":\"Self-test sequence started\"}");
+    } else {
+        snprintf(resp, sizeof(resp), "{\"success\":false,\"message\":\"Unknown test device\"}");
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    send_cors_headers(req);
+    return httpd_resp_send(req, resp, strlen(resp));
+}
 
 static esp_err_t index_httpd_handler(httpd_req_t *req)
 {
@@ -2070,8 +3108,8 @@ static void start_standalone_webserver(void)
     config.server_port = 80;
     config.ctrl_port = 32768;
     config.max_open_sockets = 6;
-    config.max_uri_handlers = 24;
-    config.stack_size = 8192;
+    config.max_uri_handlers = 28;
+    config.stack_size = 12288;
 
     if (httpd_start(&g_http_server, &config) == ESP_OK) {
         const httpd_uri_t uris[] = {
@@ -2081,6 +3119,8 @@ static void start_standalone_webserver(void)
             { .uri = "/api/iot-status",   .method = HTTP_OPTIONS, .handler = cors_options_httpd_handler,   .user_ctx = NULL },
             { .uri = "/api/iot-config",   .method = HTTP_POST,    .handler = iot_config_httpd_handler,     .user_ctx = NULL },
             { .uri = "/api/iot-config",   .method = HTTP_OPTIONS, .handler = cors_options_httpd_handler,   .user_ctx = NULL },
+            { .uri = "/api/history",      .method = HTTP_GET,     .handler = history_httpd_handler,        .user_ctx = NULL },
+            { .uri = "/api/history",      .method = HTTP_OPTIONS, .handler = cors_options_httpd_handler,   .user_ctx = NULL },
             { .uri = "/api/wifi",         .method = HTTP_POST,    .handler = wifi_cfg_httpd_handler,       .user_ctx = NULL },
             { .uri = "/api/wifi",         .method = HTTP_OPTIONS, .handler = cors_options_httpd_handler,   .user_ctx = NULL },
             { .uri = "/api/wifi-profiles", .method = HTTP_POST,   .handler = wifi_profiles_httpd_handler,  .user_ctx = NULL },
@@ -2091,6 +3131,10 @@ static void start_standalone_webserver(void)
             { .uri = "/api/check-in",     .method = HTTP_OPTIONS, .handler = cors_options_httpd_handler,   .user_ctx = NULL },
             { .uri = "/api/auto-confirm", .method = HTTP_POST,    .handler = auto_confirm_httpd_handler,   .user_ctx = NULL },
             { .uri = "/api/auto-confirm", .method = HTTP_OPTIONS, .handler = cors_options_httpd_handler,   .user_ctx = NULL },
+            { .uri = "/api/servo",        .method = HTTP_POST,    .handler = servo_control_httpd_handler,  .user_ctx = NULL },
+            { .uri = "/api/servo",        .method = HTTP_OPTIONS, .handler = cors_options_httpd_handler,   .user_ctx = NULL },
+            { .uri = "/api/test",         .method = HTTP_POST,    .handler = test_hardware_httpd_handler,   .user_ctx = NULL },
+            { .uri = "/api/test",         .method = HTTP_OPTIONS, .handler = cors_options_httpd_handler,   .user_ctx = NULL },
             { .uri = "/",                 .method = HTTP_GET,     .handler = index_httpd_handler,          .user_ctx = NULL },
         };
         for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
@@ -2141,7 +3185,7 @@ static void camera_stream_task(void *pvParameters)
         }
 
         esp_camera_fb_return(fb);
-        int delay_ms = g_https_in_progress ? 28 : (is_pc_usb_active() ? 6 : 20);
+        int delay_ms = is_pc_usb_active() ? 5 : 12;
         vTaskDelay(pdMS_TO_TICKS(delay_ms));
     }
 }
@@ -2276,18 +3320,35 @@ static void standalone_qr_task(void *pvParameters)
                         snprintf(clean_code, sizeof(clean_code), "%s", detected_code);
                     }
 
-                    ESP_LOGI(TAG, "[STANDALONE QR] Detected '%s' (iot=%d, auto_confirm=%d)",
-                             detected_code, is_iot_device_paired_active() ? 1 : 0, g_auto_confirm ? 1 : 0);
-                    oled_show_ticket_status(OLED_TICKET_CHECKING, clean_code, NULL);
-                    char *v_resp = (char *)malloc(4096);
-                    if (v_resp) {
-                        v_resp[0] = '\0';
-                        int http_code = -1;
-                        bool net_err = false;
-                        esp32_iot_scan_ticket(detected_code, "auto", v_resp, 4096, &http_code);
-                        process_iot_scan_response(detected_code, clean_code, v_resp, http_code, &net_err);
-                        last_code_cooldown_ms = net_err ? 2500 : 8000;
-                        free(v_resp);
+                    if (!is_valid_iot_url(g_iot_base_url)) {
+                        ESP_LOGW(TAG, "[STANDALONE QR] API URL not configured or invalid: '%s'", g_iot_base_url);
+                        oled_show_ticket_status(OLED_TICKET_NET_ERR, clean_code, "CHUA CAU HINH URL");
+                        buzzer_beep(240);
+                        led_trigger_red_error();
+                        last_code_cooldown_ms = 4000;
+                    } else {
+                        ESP_LOGI(TAG, "[STANDALONE QR] Detected '%s' (iot=%d, auto_confirm=%d)",
+                                 detected_code, is_iot_device_paired_active() ? 1 : 0, g_auto_confirm ? 1 : 0);
+                        oled_show_ticket_status(OLED_TICKET_CHECKING, clean_code, NULL);
+                        char *v_resp = (char *)malloc(4096);
+                        if (v_resp) {
+                            v_resp[0] = '\0';
+                            int http_code = -1;
+                            bool net_err = false;
+                            esp32_iot_scan_ticket(detected_code, "auto", v_resp, 4096, &http_code);
+                            process_iot_scan_response(detected_code, clean_code, v_resp, http_code, &net_err);
+                            char *uart_line = (char *)malloc(4120);
+                            if (uart_line) {
+                                for (char *rp = v_resp; *rp; rp++) {
+                                    if (*rp == '\r' || *rp == '\n') *rp = ' ';
+                                }
+                                snprintf(uart_line, 4120, "CHECKINRESP:%s\n", v_resp);
+                                safe_uart_write_string(uart_line);
+                                free(uart_line);
+                            }
+                            last_code_cooldown_ms = net_err ? 2500 : 8000;
+                            free(v_resp);
+                        }
                     }
                 }
             }
@@ -2354,13 +3415,13 @@ static void apply_iot_server_config_from_json(const char *json, bool from_scan)
             strcmp(g_iot_event_code, evt_code) != 0 ||
             strcmp(g_iot_event_name, evt_name) != 0) {
             changed = true;
+            snprintf(g_iot_assigned_event_id, sizeof(g_iot_assigned_event_id), "%s", evt_id);
+            snprintf(g_iot_event_code, sizeof(g_iot_event_code), "%s", evt_code);
+            snprintf(g_iot_event_name, sizeof(g_iot_event_name), "%s", evt_name);
+            save_iot_nvs_str("evt_id", g_iot_assigned_event_id);
+            save_iot_nvs_str("evt_code", g_iot_event_code);
+            save_iot_nvs_str("evt_name", g_iot_event_name);
         }
-        snprintf(g_iot_assigned_event_id, sizeof(g_iot_assigned_event_id), "%s", evt_id);
-        snprintf(g_iot_event_code, sizeof(g_iot_event_code), "%s", evt_code);
-        snprintf(g_iot_event_name, sizeof(g_iot_event_name), "%s", evt_name);
-        save_iot_nvs_str("evt_id", g_iot_assigned_event_id);
-        save_iot_nvs_str("evt_code", g_iot_event_code);
-        save_iot_nvs_str("evt_name", g_iot_event_name);
     }
     if (dev_name[0] != '\0' && strcmp(g_iot_device_name, dev_name) != 0) {
         snprintf(g_iot_device_name, sizeof(g_iot_device_name), "%s", dev_name);
@@ -2404,7 +3465,7 @@ static void iot_device_task(void *pvParameters)
              g_device_mac, g_iot_base_url, is_iot_device_paired_active() ? 1 : 0);
 
     while (1) {
-        if (!g_wifi_connected || strstr(g_iot_base_url, "example.com") != NULL) {
+        if (!g_wifi_connected || !is_valid_iot_url(g_iot_base_url)) {
             iot_wait_interruptible_ms(1500);
             continue;
         }
@@ -2467,6 +3528,11 @@ static void iot_device_task(void *pvParameters)
                 if (!toggled_midflight || (has_applied && !cfg_applied)) {
                     apply_iot_server_config_from_json(resp, false);
                     sync_oled_network_state();
+                    if (!s_dev_history.initial_synced) {
+                        if (fetchDeviceHistory(1, 5, "ALL", false) == ESP_OK) {
+                            s_dev_history.initial_synced = true;
+                        }
+                    }
                     iot_wait_interruptible_ms(10000);
                 } else {
                     iot_wait_interruptible_ms(200);
@@ -2601,6 +3667,9 @@ static void iot_device_task(void *pvParameters)
                     save_iot_nvs_str("dev_secret", g_iot_device_secret);
                     apply_iot_server_config_from_json(resp, false);
                     sync_oled_network_state();
+                    if (fetchDeviceHistory(1, 5, "ALL", false) == ESP_OK) {
+                        s_dev_history.initial_synced = true;
+                    }
 
                     ESP_LOGI(TAG, "IoT Pairing COMPLETED! device_id=%s", g_iot_device_id);
                     buzzer_beep(65);
@@ -2951,6 +4020,9 @@ static void uart_cmd_task(void *pvParameters)
                                     oled_show_ticket_status(OLED_TICKET_NET_ERR, clean_qr, "CHUA GHEP IOT");
                                     buzzer_beep(240);
                                 }
+                                for (char *rp = api_resp; *rp; rp++) {
+                                    if (*rp == '\r' || *rp == '\n') *rp = ' ';
+                                }
                                 snprintf(uart_line, 4120, "%s:%s\n", is_checkin ? "CHECKINRESP" : "VERIFYRESP", api_resp);
                                 safe_uart_write_string(uart_line);
                             }
@@ -2983,19 +4055,110 @@ static void uart_cmd_task(void *pvParameters)
                         } else if (strncmp(s_cmd_str, "SETIOTURL:", 10) == 0) {
                             const char *u = s_cmd_str + 10;
                             while (*u == ' ') u++;
-                            if (u[0] != '\0') {
+                            char norm_url[256] = "";
+                            normalize_iot_url(u, norm_url, sizeof(norm_url));
+                            if (norm_url[0] != '\0') {
                                 if (g_iot_mutex) xSemaphoreTake(g_iot_mutex, portMAX_DELAY);
-                                snprintf(g_iot_base_url, sizeof(g_iot_base_url), "%.*s",
-                                         (int)(sizeof(g_iot_base_url) - 1), u);
+                                snprintf(g_iot_base_url, sizeof(g_iot_base_url), "%s", norm_url);
                                 if (g_iot_mutex) xSemaphoreGive(g_iot_mutex);
                                 save_iot_nvs_str("iot_url", g_iot_base_url);
                                 g_iot_force_sync = true;
-                                ESP_LOGI(TAG, "UART: Updated IoT URL -> %s", g_iot_base_url);
+                                ESP_LOGI(TAG, "UART: Updated & saved persistent IoT URL -> %s", g_iot_base_url);
+                                char ack[300];
+                                snprintf(ack, sizeof(ack), "IOTURLSAVED:%s\n", g_iot_base_url);
+                                safe_uart_write_string(ack);
                             }
+                        } else if (strcmp(s_cmd_str, "GETIOTURL?") == 0 || strcmp(s_cmd_str, "GETIOTURL") == 0) {
+                            char resp_line[300];
+                            snprintf(resp_line, sizeof(resp_line), "IOTURLSTAT:%s\n", g_iot_base_url);
+                            safe_uart_write_string(resp_line);
                         } else if (strcmp(s_cmd_str, "RESETIOT") == 0) {
                             clear_iot_credentials_nvs(true);
                             sync_oled_network_state();
                             ESP_LOGW(TAG, "UART: Cleared IoT pairing credentials");
+                        } else if (strcmp(s_cmd_str, "HIST?") == 0 || strcmp(s_cmd_str, "HIST") == 0) {
+                            if (s_dev_history.is_stale && g_wifi_connected && is_iot_device_paired_active()) {
+                                fetchDeviceHistory(s_dev_history.page, s_dev_history.limit, s_dev_history.filter, s_dev_history.event_only);
+                            }
+                            if (g_history_mutex) xSemaphoreTake(g_history_mutex, portMAX_DELAY);
+                            char line[256];
+                            snprintf(line, sizeof(line),
+                                     "HISTINFO:page=%d|limit=%d|total=%d|has_more=%d|all=%d|ok=%d|ver=%d|fail=%d|filter=%s|offline=%d|items=%d\n",
+                                     s_dev_history.page, s_dev_history.limit, s_dev_history.total,
+                                     s_dev_history.has_more ? 1 : 0, s_dev_history.total_scans,
+                                     s_dev_history.ok_count, s_dev_history.verified_count, s_dev_history.failed_count,
+                                     s_dev_history.filter, s_dev_history.offline_cached ? 1 : 0, s_dev_history.item_count);
+                            safe_uart_write_string(line);
+                            for (int hi = 0; hi < s_dev_history.item_count; hi++) {
+                                const dev_history_item_t *it = &s_dev_history.items[hi];
+                                snprintf(line, sizeof(line), "HISTITEM:%d|%s|%s|%s|%s|%s\n",
+                                         hi + 1, it->result,
+                                         it->ticket_code[0] ? it->ticket_code : "--",
+                                         it->attendee_name[0] ? it->attendee_name : "--",
+                                         it->scanned_at, it->message);
+                                safe_uart_write_string(line);
+                            }
+                            if (g_history_mutex) xSemaphoreGive(g_history_mutex);
+                        } else if (strncmp(s_cmd_str, "HIST:", 5) == 0) {
+                            int hp = 1, hl = 5, heo = 0;
+                            char hflt[24] = "ALL";
+                            int matched = sscanf(s_cmd_str + 5, "%d,%d,%23[^,],%d", &hp, &hl, hflt, &heo);
+                            if (matched >= 1) {
+                                fetchDeviceHistory(hp, (matched >= 2) ? hl : 5, hflt, (heo != 0));
+                                char ack[96];
+                                snprintf(ack, sizeof(ack), "HISTOK:page=%d|total=%d|items=%d|has_more=%d\n",
+                                         s_dev_history.page, s_dev_history.total, s_dev_history.item_count, s_dev_history.has_more ? 1 : 0);
+                                safe_uart_write_string(ack);
+                            }
+                        } else if (sscanf(s_cmd_str, "HISTMODE:%d", &val) == 1) {
+                            bool vis = (val != 0);
+                            if (vis && s_dev_history.is_stale && g_wifi_connected && is_iot_device_paired_active()) {
+                                fetchDeviceHistory(1, 5, s_dev_history.filter, s_dev_history.event_only);
+                            }
+                            oled_set_history_mode(vis, 0);
+                            char ack[32];
+                            snprintf(ack, sizeof(ack), "HISTMODEOK:%d\n", vis ? 1 : 0);
+                            safe_uart_write_string(ack);
+                        } else if (strcmp(s_cmd_str, "HISTNEXT") == 0) {
+                            int cur = oled_get_history_selected_idx();
+                            if (!oled_is_history_mode()) {
+                                oled_set_history_mode(true, 0);
+                            } else if (cur + 1 < s_dev_history.item_count) {
+                                oled_set_history_mode(true, cur + 1);
+                            } else if (s_dev_history.has_more) {
+                                fetchDeviceHistory(s_dev_history.page + 1, s_dev_history.limit, s_dev_history.filter, s_dev_history.event_only);
+                                oled_set_history_mode(true, 0);
+                            }
+                        } else if (strcmp(s_cmd_str, "HISTPREV") == 0) {
+                            int cur = oled_get_history_selected_idx();
+                            if (!oled_is_history_mode()) {
+                                oled_set_history_mode(true, 0);
+                            } else if (cur > 0) {
+                                oled_set_history_mode(true, cur - 1);
+                            } else if (s_dev_history.page > 1) {
+                                fetchDeviceHistory(s_dev_history.page - 1, s_dev_history.limit, s_dev_history.filter, s_dev_history.event_only);
+                                oled_set_history_mode(true, 0);
+                            }
+                        } else if (strncmp(s_cmd_str, "HISTFILTER:", 11) == 0) {
+                            const char *flt = s_cmd_str + 11;
+                            if (flt[0] != '\0') {
+                                fetchDeviceHistory(1, 5, flt, s_dev_history.event_only);
+                                oled_set_history_mode(true, 0);
+                            }
+                        } else if (strcmp(s_cmd_str, "SERVO:OPEN") == 0 || strcmp(s_cmd_str, "OPENSERVO") == 0) {
+                            servo_trigger_gate_open();
+                            safe_uart_write_string("SERVO:OPENED\n");
+                            ESP_LOGI(TAG, "UART: Manual trigger servo gate open");
+                        } else if (strcmp(s_cmd_str, "SERVO:CLOSE") == 0 || strcmp(s_cmd_str, "CLOSESERVO") == 0) {
+                            servo_set_angle(SERVO_GATE_CLOSE_DEGREE);
+                            safe_uart_write_string("SERVO:CLOSED\n");
+                            ESP_LOGI(TAG, "UART: Manual trigger servo gate close");
+                        } else if (sscanf(s_cmd_str, "SERVO:ANGLE:%d", &val) == 1) {
+                            servo_set_angle((uint32_t)val);
+                            char s_ack[48];
+                            snprintf(s_ack, sizeof(s_ack), "SERVO:ANGLE=%d\n", val);
+                            safe_uart_write_string(s_ack);
+                            ESP_LOGI(TAG, "UART: Set servo angle to %d deg", val);
                         } else if (oled_p) {
                             char *st_p = oled_p + 5;
                             char *code_p = strchr(st_p, '|');
@@ -3011,19 +4174,63 @@ static void uart_cmd_task(void *pvParameters)
                             }
                             if (strcmp(st_p, "OK") == 0) {
                                 oled_show_ticket_status(OLED_TICKET_OK, clean_c, "VE HOP LE");
+                                servo_trigger_gate_open();
+                                led_trigger_green_ok();
                             } else if (strcmp(st_p, "VERIFIED") == 0) {
                                 oled_show_ticket_status(OLED_TICKET_VERIFIED, clean_c, g_auto_confirm ? "DANG XAC NHAN" : "BAM XAC NHAN");
+                                led_trigger_green_ok();
                             } else if (strcmp(st_p, "USED") == 0) {
                                 oled_show_ticket_status(OLED_TICKET_USED, clean_c, "DA CHECKIN ROI");
+                                led_trigger_red_error();
                             } else if (strcmp(st_p, "NOTFOUND") == 0) {
                                 oled_show_ticket_status(OLED_TICKET_NOT_FOUND, clean_c, "VE KO TON TAI");
+                                led_trigger_red_error();
                             } else if (strcmp(st_p, "CHECKING") == 0) {
                                 oled_show_ticket_status(OLED_TICKET_CHECKING, clean_c, NULL);
                             } else if (strcmp(st_p, "ERROR") == 0) {
                                 oled_show_ticket_status(OLED_TICKET_NET_ERR, clean_c, "KIEM TRA LAI");
+                                led_trigger_red_error();
                             } else if (strcmp(st_p, "IDLE") == 0) {
                                 oled_show_ticket_status(OLED_TICKET_IDLE, "", NULL);
                             }
+                        } else if (strcmp(s_cmd_str, "LED:GREEN") == 0 || strcmp(s_cmd_str, "LEDGREEN") == 0) {
+                            led_trigger_green_ok();
+                            safe_uart_write_string("LED:GREEN_ON_60S\n");
+                        } else if (strcmp(s_cmd_str, "LED:RED") == 0 || strcmp(s_cmd_str, "LEDRED") == 0) {
+                            led_trigger_red_error();
+                            safe_uart_write_string("LED:RED_ON_60S\n");
+                        } else if (strcmp(s_cmd_str, "LED:OFF") == 0 || strcmp(s_cmd_str, "LEDOFF") == 0) {
+                            led_turn_off_all();
+                            safe_uart_write_string("LED:ALL_OFF\n");
+                        } else if (sscanf(s_cmd_str, "TEST:GREEN:%d", &val) == 1 || sscanf(s_cmd_str, "TEST:LED_GREEN:%d", &val) == 1) {
+                            led_set_green_direct(val);
+                            char t_ack[48];
+                            snprintf(t_ack, sizeof(t_ack), "TESTRESP:GREEN=%d\n", val ? 1 : 0);
+                            safe_uart_write_string(t_ack);
+                        } else if (sscanf(s_cmd_str, "TEST:RED:%d", &val) == 1 || sscanf(s_cmd_str, "TEST:LED_RED:%d", &val) == 1) {
+                            led_set_red_direct(val);
+                            char t_ack[48];
+                            snprintf(t_ack, sizeof(t_ack), "TESTRESP:RED=%d\n", val ? 1 : 0);
+                            safe_uart_write_string(t_ack);
+                        } else if (sscanf(s_cmd_str, "TEST:BUZZER:%d", &val) == 1 || strcmp(s_cmd_str, "TEST:BUZZER") == 0) {
+                            int b_dur = (val > 0) ? val : 150;
+                            buzzer_beep(b_dur);
+                            char t_ack[48];
+                            snprintf(t_ack, sizeof(t_ack), "TESTRESP:BUZZER=%dms\n", b_dur);
+                            safe_uart_write_string(t_ack);
+                        } else if (sscanf(s_cmd_str, "TEST:SERVO:%d", &val) == 1) {
+                            servo_set_angle((uint32_t)val);
+                            char t_ack[48];
+                            snprintf(t_ack, sizeof(t_ack), "TESTRESP:SERVO=%d\n", val);
+                            safe_uart_write_string(t_ack);
+                        } else if (strcmp(s_cmd_str, "TEST:IR") == 0 || strcmp(s_cmd_str, "TEST:SENSOR") == 0) {
+                            bool obs = is_ir_obstacle_detected();
+                            char t_ack[48];
+                            snprintf(t_ack, sizeof(t_ack), "TESTRESP:IR=%d\n", obs ? 1 : 0);
+                            safe_uart_write_string(t_ack);
+                        } else if (strcmp(s_cmd_str, "TEST:ALL") == 0 || strcmp(s_cmd_str, "TEST:SYSTEM") == 0) {
+                            trigger_hardware_selftest();
+                            safe_uart_write_string("TESTRESP:ALL_STARTED\n");
                         } else if (sscanf(s_cmd_str, "PCHB:%d", &val) == 1) {
                             /* Heartbeat from PC host updates g_pc_usb_last_tick above */
                         } else if (sscanf(s_cmd_str, "AE:%d", &val) == 1 && s != NULL) {
@@ -3040,6 +4247,12 @@ static void uart_cmd_task(void *pvParameters)
                             s->set_vflip(s, val);
                         } else if (sscanf(s_cmd_str, "MIRROR:%d", &val) == 1 && s != NULL) {
                             s->set_hmirror(s, val);
+                        } else if (strcmp(s_cmd_str, "BEEP:DOUBLE") == 0 || strcmp(s_cmd_str, "BEEP:2") == 0) {
+                            buzzer_beep(70);
+                            vTaskDelay(pdMS_TO_TICKS(80));
+                            buzzer_beep(90);
+                        } else if (strcmp(s_cmd_str, "BEEP:LONG") == 0 || strcmp(s_cmd_str, "BEEP:ERROR") == 0) {
+                            buzzer_beep(350);
                         } else if (sscanf(s_cmd_str, "BEEP:%d", &val) == 1) {
                             buzzer_beep(val);
                         } else if (sscanf(s_cmd_str, "LED:%d", &val) == 1) {
@@ -3057,8 +4270,106 @@ static void uart_cmd_task(void *pvParameters)
 }
 
 /* ============================================================================
- * 9. HÀM MAIN KHỞI ĐỘNG HỆ THỐNG
+ * 9. HÀM MAIN KHỞI ĐỘNG HỆ THỐNG & NÚT NHẤN LỊCH SỬ (GPIO0 BOOT)
  * ============================================================================ */
+#define BOOT_BUTTON_PIN GPIO_NUM_0
+
+static void history_btn_task(void *pvParameters)
+{
+    (void)pvParameters;
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << BOOT_BUTTON_PIN),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io_conf);
+
+    /* Wait until boot stabilization */
+    vTaskDelay(pdMS_TO_TICKS(1500));
+
+    int last_lvl = 1;
+    TickType_t press_tick = 0;
+
+    while (1) {
+        int lvl = gpio_get_level(BOOT_BUTTON_PIN);
+        if (lvl == 0 && last_lvl == 1) {
+            press_tick = xTaskGetTickCount();
+        } else if (lvl == 1 && last_lvl == 0) {
+            TickType_t dur = xTaskGetTickCount() - press_tick;
+            if (dur >= pdMS_TO_TICKS(45)) {
+                if (dur >= pdMS_TO_TICKS(3000)) {
+                    /* Nhấn giữ siêu dài > 3s: Kích hoạt Hardware Self-Test ngay từ nút BOOT */
+                    ESP_LOGI(TAG, "BOOT button held > 3s: Triggering Hardware Self-Test...");
+                    buzzer_beep(200);
+                    trigger_hardware_selftest();
+                } else if (dur < pdMS_TO_TICKS(750)) {
+                    /* Short press: open History or advance item/page */
+                    if (!oled_is_history_mode()) {
+                        if (s_dev_history.is_stale && g_wifi_connected && is_iot_device_paired_active()) {
+                            fetchDeviceHistory(1, 5, s_dev_history.filter, s_dev_history.event_only);
+                        }
+                        oled_set_history_mode(true, 0);
+                        ESP_LOGI(TAG, "BOOT button: Opened History view");
+                    } else {
+                        int cur = oled_get_history_selected_idx();
+                        int max_i = 0;
+                        bool has_more = false;
+                        int cur_page = 1;
+                        char cur_flt[24] = "ALL";
+                        bool cur_eo = false;
+
+                        if (g_history_mutex) xSemaphoreTake(g_history_mutex, portMAX_DELAY);
+                        max_i = s_dev_history.item_count;
+                        has_more = s_dev_history.has_more;
+                        cur_page = s_dev_history.page;
+                        snprintf(cur_flt, sizeof(cur_flt), "%s", s_dev_history.filter);
+                        cur_eo = s_dev_history.event_only;
+                        if (g_history_mutex) xSemaphoreGive(g_history_mutex);
+
+                        if (cur + 1 < max_i) {
+                            oled_set_history_mode(true, cur + 1);
+                        } else if (has_more) {
+                            fetchDeviceHistory(cur_page + 1, 5, cur_flt, cur_eo);
+                            oled_set_history_mode(true, 0);
+                        } else if (cur_page > 1) {
+                            fetchDeviceHistory(1, 5, cur_flt, cur_eo);
+                            oled_set_history_mode(true, 0);
+                        } else {
+                            oled_set_history_mode(false, 0);
+                        }
+                    }
+                } else {
+                    /* Long press: cycle filter ALL -> OK -> FAILED -> exit */
+                    if (oled_is_history_mode()) {
+                        const char *next_flt = "ALL";
+                        bool exit_mode = false;
+                        if (strcmp(s_dev_history.filter, "ALL") == 0) next_flt = "OK";
+                        else if (strcmp(s_dev_history.filter, "OK") == 0) next_flt = "FAILED";
+                        else exit_mode = true;
+
+                        if (exit_mode) {
+                            snprintf(s_dev_history.filter, sizeof(s_dev_history.filter), "ALL");
+                            oled_set_history_mode(false, 0);
+                        } else {
+                            fetchDeviceHistory(1, 5, next_flt, s_dev_history.event_only);
+                            oled_set_history_mode(true, 0);
+                        }
+                        buzzer_beep(40);
+                    } else {
+                        fetchDeviceHistory(1, 5, "ALL", false);
+                        oled_set_history_mode(true, 0);
+                        buzzer_beep(50);
+                    }
+                }
+            }
+        }
+        last_lvl = lvl;
+        vTaskDelay(pdMS_TO_TICKS(40));
+    }
+}
+
 void app_main(void)
 {
     ESP_LOGI(TAG, "==========================================================");
@@ -3082,6 +4393,10 @@ void app_main(void)
     if (!g_iot_mutex) {
         ESP_LOGE(TAG, "Failed to create IoT mutex!");
     }
+    g_history_mutex = xSemaphoreCreateMutex();
+    if (!g_history_mutex) {
+        ESP_LOGE(TAG, "Failed to create History mutex!");
+    }
 
     /* 1. Khởi tạo NVS Flash & đọc MAC + IoT Device Config */
     esp_err_t ret = nvs_flash_init();
@@ -3094,9 +4409,12 @@ void app_main(void)
     init_device_mac();
     load_iot_config_nvs();
 
-    /* 2. Khởi tạo Còi Buzzer, Đèn LED PWM & Màn hình OLED 0.96" I2C (SSD1306) */
+    /* 2. Khởi tạo Còi Buzzer, Đèn LED PWM, Servo Cổng, Đèn LED Trạng Thái & Màn hình OLED 0.96" I2C (SSD1306) */
     init_buzzer();
     init_led_pwm();
+    init_status_leds();
+    init_servo_pwm();
+    init_ir_sensor();
     oled_init();
     buzzer_beep(80);
 
@@ -3132,13 +4450,19 @@ void app_main(void)
     xTaskCreatePinnedToCore(camera_stream_task, "cam_stream", 4096, NULL, 5, NULL, 1);
 
     /* 7. Khởi chạy Task Nhận Lệnh & Telemetry trên Core 0 */
-    xTaskCreatePinnedToCore(uart_cmd_task, "uart_cmd", 12288, NULL, 4, NULL, 0);
+    xTaskCreatePinnedToCore(uart_cmd_task, "uart_cmd", 14336, NULL, 4, NULL, 0);
 
-    /* 8. Khởi chạy Task Quét QR Độc Lập khi rút khỏi PC */
-    xTaskCreatePinnedToCore(standalone_qr_task, "qr_standalone", 10240, NULL, 2, NULL, 1);
+    /* 8. Khởi chạy Task Quét QR Độc Lập khi rút khỏi PC (Core 0, mức ưu tiên 1 nhường CPU cho camera) */
+    xTaskCreatePinnedToCore(standalone_qr_task, "qr_standalone", 14336, NULL, 1, NULL, 0);
 
     /* 9. Khởi chạy Task Đăng ký IoT, Ghép nối & Heartbeat trên Core 0 */
-    xTaskCreatePinnedToCore(iot_device_task, "iot_device", 8192, NULL, 3, NULL, 0);
+    xTaskCreatePinnedToCore(iot_device_task, "iot_device", 12288, NULL, 3, NULL, 0);
+
+    /* 10. Khởi chạy Task Nút Nhấn BOOT (GPIO0) xem Lịch Sử trên OLED */
+    xTaskCreatePinnedToCore(history_btn_task, "hist_btn", 4096, NULL, 1, NULL, 0);
+
+    /* 11. Khởi chạy Task Điều Khiển Servo Nâng Cần Mở Cổng trên Core 0 */
+    xTaskCreatePinnedToCore(servo_gate_task, "servo_gate", 4096, NULL, 2, &s_servo_task_handle, 0);
 
     ESP_LOGI(TAG, "EventHub Dual-Mode Station ready! MAC=%s", g_device_mac);
 }

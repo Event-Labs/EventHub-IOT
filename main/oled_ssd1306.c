@@ -147,6 +147,8 @@ typedef struct {
     char ticket_code[24];
     char sub_msg[24];
     TickType_t ticket_tick;
+    bool history_mode;
+    int history_idx;
     bool dirty;
 } oled_state_t;
 
@@ -156,6 +158,8 @@ static SemaphoreHandle_t s_oled_mutex = NULL;
 static TaskHandle_t s_oled_task = NULL;
 static bool s_oled_ready = false;
 static uint8_t s_fb[OLED_FB_SIZE];
+static oled_history_snapshot_t s_hist = { .page = 1, .limit = 5, .filter = "ALL" };
+static oled_history_snapshot_t s_render_hist = { .page = 1, .limit = 5, .filter = "ALL" };
 static oled_state_t s_state = {
     .wifi_connected = false,
     .ssid = "",
@@ -172,6 +176,8 @@ static oled_state_t s_state = {
     .ticket_code = "",
     .sub_msg = "",
     .ticket_tick = 0,
+    .history_mode = false,
+    .history_idx = 0,
     .dirty = true,
 };
 
@@ -411,7 +417,83 @@ static void draw_icon_qr(int x, int y)
     fb_fill_rect(x + 18, y + 18, 5, 5);
 }
 
-static void render_oled_frame(const oled_state_t *st, uint32_t anim_step)
+static void render_history_body(const oled_state_t *st, const oled_history_snapshot_t *h)
+{
+    /* Stats + filter/page header (y = 17..23) */
+    char hdr[32];
+    const char *flt = h->filter[0] ? h->filter : "ALL";
+    int fail_cnt = h->failed_count;
+    int all_cnt = h->total_scans;
+    int ok_cnt = h->ok_count;
+    snprintf(hdr, sizeof(hdr), "O:%d E:%d %s", ok_cnt, fail_cnt, flt);
+    fb_draw_text(1, 17, hdr, 15, 1);
+
+    char ptag[24];
+    int p_num = h->page > 0 ? h->page : 1;
+    snprintf(ptag, sizeof(ptag), "%sP%d%s",
+             h->offline_cached ? "*" : "",
+             p_num,
+             h->has_more ? "+" : "");
+    int px = OLED_WIDTH - (int)strlen(ptag) * 6;
+    if (px < 92) px = 92;
+    fb_draw_text(px, 17, ptag, 6, 1);
+    fb_hline(0, 25, OLED_WIDTH);
+
+    if (h->loading && h->item_count == 0) {
+        fb_draw_text(1, 34, "DANG TAI LICH SU...", 21, 1);
+        return;
+    }
+    if (h->error_msg[0] && h->item_count == 0) {
+        fb_draw_text(1, 30, "LOI DONG BO LICH SU:", 21, 1);
+        fb_draw_text(1, 42, h->error_msg, 21, 1);
+        return;
+    }
+    if (h->item_count <= 0) {
+        fb_draw_text(1, 32, "CHUA CO LUOT QUET", 21, 1);
+        char all_line[32];
+        snprintf(all_line, sizeof(all_line), "TONG:%d  ALL:%d", h->total, all_cnt);
+        fb_draw_text(1, 46, all_line, 21, 1);
+        return;
+    }
+
+    int idx = st->history_idx;
+    if (idx < 0) idx = 0;
+    if (idx >= h->item_count) idx = h->item_count - 1;
+    const oled_history_item_t *it = &h->items[idx];
+
+    /* Row 1: item index + ticket code (fallback message when ticket_code empty) */
+    const char *main_txt = it->ticket_code[0] ? it->ticket_code : (it->message[0] ? it->message : "--");
+    char line1[36];
+    snprintf(line1, sizeof(line1), "%d/%d %s", idx + 1, h->item_count, main_txt);
+    fb_draw_text(1, 27, line1, 21, 1);
+
+    /* Row 2: result badge + timestamp */
+    char line2[32];
+    snprintf(line2, sizeof(line2), "[%s]", it->result[0] ? it->result : "?");
+    fb_draw_text(1, 37, line2, 10, 1);
+    if (it->scanned_at[0]) {
+        int tx = OLED_WIDTH - (int)strlen(it->scanned_at) * 6;
+        if (tx < 60) tx = 60;
+        fb_draw_text(tx, 37, it->scanned_at, 11, 1);
+    }
+
+    /* Row 3: attendee name (or message) */
+    const char *sub = it->attendee_name[0] ? it->attendee_name : (it->message[0] ? it->message : "");
+    if (sub[0]) {
+        fb_draw_text(1, 47, sub, 21, 1);
+    }
+
+    /* Row 4: message detail or navigation footer */
+    if (it->attendee_name[0] && it->message[0]) {
+        fb_draw_text(1, 56, it->message, 21, 1);
+    } else {
+        char nav[32];
+        snprintf(nav, sizeof(nav), "ALL:%d  BOOT:TIEP/GIU", all_cnt);
+        fb_draw_text(1, 56, nav, 21, 1);
+    }
+}
+
+static void render_oled_frame(const oled_state_t *st, const oled_history_snapshot_t *hist, uint32_t anim_step)
 {
     fb_clear();
 
@@ -430,7 +512,7 @@ static void render_oled_frame(const oled_state_t *st, uint32_t anim_step)
         fb_draw_text(15, 0, "CHUA CO WIFI", 14, 1);
     }
 
-    fb_draw_text(104, 0, st->auto_confirm ? "AUTO" : "MAN ", 4, 1);
+    fb_draw_text(92, 0, st->auto_confirm ? "[AUTO]" : "[MANU]", 6, 1);
 
     if (st->wifi_connected) {
         char ip_line[24];
@@ -457,14 +539,14 @@ static void render_oled_frame(const oled_state_t *st, uint32_t anim_step)
     switch (st->ticket_status) {
         case OLED_TICKET_OK:
             draw_icon_tick(17, 39);
-            fb_draw_text(39, 20, "CHECKIN OK!", 14, 1);
+            fb_draw_text(39, 20, st->auto_confirm ? "[AUTO] OK!" : "CHECKIN OK!", 14, 1);
             fb_draw_text(39, 34, code, 14, 1);
             fb_draw_text(39, 48, st->sub_msg[0] ? st->sub_msg : "VE HOP LE", 14, 1);
             break;
 
         case OLED_TICKET_VERIFIED:
             draw_icon_tick(17, 39);
-            fb_draw_text(39, 20, "VE HOP LE!", 14, 1);
+            fb_draw_text(39, 20, st->auto_confirm ? "[AUTO] HOP LE" : "VE HOP LE!", 14, 1);
             fb_draw_text(39, 34, code, 14, 1);
             fb_draw_text(39, 48, st->sub_msg[0] ? st->sub_msg : "BAM XAC NHAN", 14, 1);
             break;
@@ -499,13 +581,17 @@ static void render_oled_frame(const oled_state_t *st, uint32_t anim_step)
 
         case OLED_TICKET_CHECKING:
             draw_icon_qr(6, 27);
-            fb_draw_text(39, 20, "DANG KIEM TRA", 14, 1);
+            fb_draw_text(39, 20, st->auto_confirm ? "[AUTO] DANG SOAT" : "DANG KIEM TRA", 14, 1);
             fb_draw_text(39, 34, code, 14, 1);
             fb_draw_text(39, 48, "VUI LONG CHO..", 14, 1);
             break;
 
         case OLED_TICKET_IDLE:
         default:
+            if (st->history_mode && hist) {
+                render_history_body(st, hist);
+                break;
+            }
             draw_icon_qr(6, 27);
             if (st->iot_status == OLED_IOT_PENDING && st->pairing_code[0]) {
                 char line2[24];
@@ -538,10 +624,10 @@ static void render_oled_frame(const oled_state_t *st, uint32_t anim_step)
                     snprintf(evt_line, sizeof(evt_line), "SK:%.11s", st->event_code);
                     fb_draw_text(39, 34, evt_line, 14, 1);
                 } else {
-                    fb_draw_text(39, 34, st->auto_confirm ? "AUTO: BAT" : "AUTO: TAT", 14, 1);
+                    fb_draw_text(39, 34, st->pc_usb_active ? "CHEDO: PC USB" :
+                                         (st->iot_status == OLED_IOT_READY ? "CHEDO: IOT MAY" : "CHEDO: DOC LAP"), 14, 1);
                 }
-                fb_draw_text(39, 48, st->pc_usb_active ? "CHEDO: PC USB" :
-                                     (st->iot_status == OLED_IOT_READY ? "CHEDO: IOT MAY" : "CHEDO: DOC LAP"), 14, 1);
+                fb_draw_text(39, 48, st->auto_confirm ? "AUTO: BAT (ON)" : "AUTO: TAT (OFF)", 15, 1);
             }
             break;
     }
@@ -618,10 +704,11 @@ static bool try_direct_write_init(int sda_pin, int scl_pin, uint16_t addr, uint3
     oled_state_t init_snap = s_state;
     if (s_oled_mutex) xSemaphoreTake(s_oled_mutex, portMAX_DELAY);
     init_snap = s_state;
+    s_render_hist = s_hist;
     s_state.dirty = false;
     if (s_oled_mutex) xSemaphoreGive(s_oled_mutex);
 
-    render_oled_frame(&init_snap, 0);
+    render_oled_frame(&init_snap, &s_render_hist, 0);
     ssd1306_flush();
     return true;
 }
@@ -744,13 +831,14 @@ static void oled_display_task(void *pvParameters)
         }
         if (s_state.dirty) {
             snap = s_state;
+            s_render_hist = s_hist;
             s_state.dirty = false;
             should_flush = true;
         }
         if (s_oled_mutex) xSemaphoreGive(s_oled_mutex);
 
         if (should_flush && s_oled_ready) {
-            render_oled_frame(&snap, anim_step);
+            render_oled_frame(&snap, &s_render_hist, anim_step);
             ssd1306_flush();
         }
 
@@ -866,4 +954,66 @@ void oled_update_iot_status(oled_iot_status_t iot_status,
     if (changed && s_oled_task) {
         xTaskNotifyGive(s_oled_task);
     }
+}
+
+void oled_update_history(const oled_history_snapshot_t *hist)
+{
+    if (!s_oled_mutex || !hist) return;
+    xSemaphoreTake(s_oled_mutex, portMAX_DELAY);
+    s_hist = *hist;
+    if (s_state.history_idx >= s_hist.item_count) {
+        s_state.history_idx = (s_hist.item_count > 0) ? (s_hist.item_count - 1) : 0;
+    }
+    if (s_state.history_idx < 0) s_state.history_idx = 0;
+    s_state.dirty = true;
+    xSemaphoreGive(s_oled_mutex);
+
+    if (s_oled_task) {
+        xTaskNotifyGive(s_oled_task);
+    }
+}
+
+void oled_set_history_mode(bool visible, int selected_idx)
+{
+    if (!s_oled_mutex) return;
+    xSemaphoreTake(s_oled_mutex, portMAX_DELAY);
+    s_state.history_mode = visible;
+    if (visible) {
+        /* Exit active ticket hold toast immediately when explicitly entering History */
+        s_state.ticket_status = OLED_TICKET_IDLE;
+        if (selected_idx >= 0) {
+            int max_idx = (s_hist.item_count > 0) ? (s_hist.item_count - 1) : 0;
+            s_state.history_idx = (selected_idx <= max_idx) ? selected_idx : max_idx;
+        } else {
+            s_state.history_idx = 0;
+        }
+    } else {
+        s_state.history_idx = 0;
+    }
+    s_state.dirty = true;
+    xSemaphoreGive(s_oled_mutex);
+
+    if (s_oled_task) {
+        xTaskNotifyGive(s_oled_task);
+    }
+}
+
+bool oled_is_history_mode(void)
+{
+    bool mode = false;
+    if (!s_oled_mutex) return false;
+    xSemaphoreTake(s_oled_mutex, portMAX_DELAY);
+    mode = s_state.history_mode;
+    xSemaphoreGive(s_oled_mutex);
+    return mode;
+}
+
+int oled_get_history_selected_idx(void)
+{
+    int idx = 0;
+    if (!s_oled_mutex) return 0;
+    xSemaphoreTake(s_oled_mutex, portMAX_DELAY);
+    idx = s_state.history_idx;
+    xSemaphoreGive(s_oled_mutex);
+    return idx;
 }

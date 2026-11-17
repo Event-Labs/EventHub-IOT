@@ -122,6 +122,7 @@
       transition: transform 0.2s ease-out;
     }
     #scan-canvas {
+      display: none !important;
       position: absolute;
       top: 0;
       left: 0;
@@ -788,6 +789,9 @@
                 </svg>
                 <span>Quét vé khác</span>
               </button>
+              <button class="eh-btn-secondary" style="border-color: rgba(59, 130, 246, 0.4); color: #60a5fa;" onclick="triggerManualServo()" title="Nâng cần mở cổng Servo 90 độ">
+                <span>🚪 Mở cổng (Servo)</span>
+              </button>
             </div>
           </div>
         </div>
@@ -1056,6 +1060,116 @@
           </div>
         </div>
 
+        <!-- BẢNG ĐIỀU KHIỂN & TEST PHẦN CỨNG (HARDWARE TEST PANEL) -->
+        <div class="card" id="hw-test-card" style="padding: 14px 16px; background: linear-gradient(135deg, #131c31, #0c1222); border: 1px solid #3b82f6;">
+          <div class="card-title" style="margin-bottom: 12px;">
+            <span style="font-size: 13px; font-weight: 700; color: #60a5fa; display: flex; align-items: center; gap: 6px;">
+              <span>🛠️</span> KIỂM TRA PHẦN CỨNG (HARDWARE TEST MODE)
+            </span>
+            <span style="font-size: 11px; padding: 2px 8px; border-radius: 9999px; background: rgba(59, 130, 246, 0.2); color: #93c5fd; border: 1px solid rgba(59, 130, 246, 0.4);">
+              GPIO Diagnostic Active
+            </span>
+          </div>
+
+          <!-- 1. Test Đèn LED Trạng Thái (GPIO 41 & 42) -->
+          <div style="background: #0f172a; border-radius: 8px; padding: 10px 12px; border: 1px solid rgba(255,255,255,0.06); margin-bottom: 10px;">
+            <div style="font-size: 11px; font-weight: 700; color: #e2e8f0; text-transform: uppercase; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center;">
+              <span>💡 ĐÈN LED BÁO TRẠNG THÁI (STATUS LEDS)</span>
+              <span style="font-size: 10px; color: #94a3b8;">GPIO 41 & 42 (Đã tách JTAG)</span>
+            </div>
+
+            <!-- LED Xanh Lá -->
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; padding-bottom: 8px; border-bottom: 1px solid rgba(255,255,255,0.05); flex-wrap: wrap; gap: 6px;">
+              <div style="display: flex; align-items: center; gap: 6px;">
+                <span style="width: 10px; height: 10px; border-radius: 50%; background: #34d399; box-shadow: 0 0 8px #34d399; display: inline-block;"></span>
+                <span style="font-size: 12px; font-weight: 600; color: #34d399;">LED Xanh Lá (GPIO 41 - Vé OK):</span>
+              </div>
+              <div style="display: flex; gap: 6px; flex-wrap: wrap;">
+                <button class="btn btn-ghost" style="padding: 4px 10px; font-size: 11px; color: #34d399; border-color: rgba(52, 211, 153, 0.4);" onclick="testLed('green', 1, 'direct')">🟢 Bật (HIGH)</button>
+                <button class="btn btn-ghost" style="padding: 4px 10px; font-size: 11px; color: #94a3b8;" onclick="testLed('green', 0, 'direct')">⚫ Tắt (LOW)</button>
+                <button class="btn btn-ghost" style="padding: 4px 10px; font-size: 11px; color: #60a5fa;" onclick="testLed('green', 1, 'auto')">⏱️ Sáng 60s</button>
+              </div>
+            </div>
+
+            <!-- LED Đỏ -->
+            <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 6px;">
+              <div style="display: flex; align-items: center; gap: 6px;">
+                <span style="width: 10px; height: 10px; border-radius: 50%; background: #f87171; box-shadow: 0 0 8px #f87171; display: inline-block;"></span>
+                <span style="font-size: 12px; font-weight: 600; color: #f87171;">LED Đỏ (GPIO 42 - Vé Lỗi/Đã Dùng):</span>
+              </div>
+              <div style="display: flex; gap: 6px; flex-wrap: wrap;">
+                <button class="btn btn-ghost" style="padding: 4px 10px; font-size: 11px; color: #f87171; border-color: rgba(248, 113, 113, 0.4);" onclick="testLed('red', 1, 'direct')">🔴 Bật (HIGH)</button>
+                <button class="btn btn-ghost" style="padding: 4px 10px; font-size: 11px; color: #94a3b8;" onclick="testLed('red', 0, 'direct')">⚫ Tắt (LOW)</button>
+                <button class="btn btn-ghost" style="padding: 4px 10px; font-size: 11px; color: #60a5fa;" onclick="testLed('red', 1, 'auto')">⏱️ Sáng 60s</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- 2. Test Còi Buzzer, Servo & Cảm Biến Hồng Ngoại -->
+          <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-bottom: 10px;">
+            <!-- Còi Buzzer -->
+            <div style="background: #0f172a; border-radius: 8px; padding: 10px 12px; border: 1px solid rgba(255,255,255,0.06);">
+              <div style="font-size: 11px; font-weight: 700; color: #fbbf24; text-transform: uppercase; margin-bottom: 8px;">
+                🔊 BUZZER (GPIO 1)
+              </div>
+              <div style="display: flex; flex-direction: column; gap: 6px;">
+                <button class="btn btn-ghost" style="padding: 5px 8px; font-size: 11px; justify-content: center;" onclick="testBuzzer(80)">🔊 Kêu Ngắn (80ms)</button>
+                <button class="btn btn-ghost" style="padding: 5px 8px; font-size: 11px; justify-content: center;" onclick="testBuzzer(240)">🔊 Kêu Dài (240ms)</button>
+              </div>
+            </div>
+
+            <!-- Servo Barrier Gate -->
+            <div style="background: #0f172a; border-radius: 8px; padding: 10px 12px; border: 1px solid rgba(255,255,255,0.06);">
+              <div style="font-size: 11px; font-weight: 700; color: #60a5fa; text-transform: uppercase; margin-bottom: 8px;">
+                🚪 SERVO (GPIO 14)
+              </div>
+              <div style="display: flex; flex-direction: column; gap: 6px;">
+                <button class="btn btn-primary" style="padding: 5px 8px; font-size: 11px; justify-content: center; background: #2563eb;" onclick="triggerManualServo()">🚪 Mở Cổng 90° (Chờ qua cổng)</button>
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 4px;">
+                  <button class="btn btn-ghost" style="padding: 4px 6px; font-size: 10px; justify-content: center;" onclick="testServoAngle(90)">Mở 90°</button>
+                  <button class="btn btn-ghost" style="padding: 4px 6px; font-size: 10px; justify-content: center;" onclick="testServoAngle(0)">Đóng 0°</button>
+                </div>
+              </div>
+            </div>
+
+            <!-- Cảm Biến Hồng Ngoại -->
+            <div style="background: #0f172a; border-radius: 8px; padding: 10px 12px; border: 1px solid rgba(255,255,255,0.06);">
+              <div style="font-size: 11px; font-weight: 700; color: #a78bfa; text-transform: uppercase; margin-bottom: 8px;">
+                📡 CẢM BIẾN IR (GPIO 48)
+              </div>
+              <div style="display: flex; flex-direction: column; gap: 6px;">
+                <button class="btn btn-ghost" style="padding: 5px 8px; font-size: 11px; justify-content: center; border-color: rgba(167, 139, 250, 0.4); color: #c4b5fd;" onclick="testIrSensor()">
+                  🔍 Đọc Cảm Biến
+                </button>
+                <div id="ir-sensor-badge" style="font-size: 10px; text-align: center; color: #94a3b8; background: rgba(0,0,0,0.3); padding: 4px; border-radius: 4px;">
+                  Chưa kiểm tra
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- 3. Nút Test Toàn Bộ Hệ Thống Tự Động -->
+          <div style="margin-bottom: 10px;">
+            <button class="btn btn-primary" style="width: 100%; padding: 9px; font-size: 12px; font-weight: 700; justify-content: center; background: linear-gradient(135deg, #d97706, #b45309); border: 1px solid #f59e0b;" onclick="runFullHardwareTest()">
+              ⚡ CHẠY TEST TỰ ĐỘNG TOÀN BỘ PHẦN CỨNG (AUTO SELF-TEST)
+            </button>
+          </div>
+
+          <!-- Console phản hồi trực tiếp từ ESP32 -->
+          <div id="hw-test-status" style="font-size: 11px; color: #94a3b8; background: #070d18; padding: 8px 10px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.08); min-height: 20px;">
+            💡 Sẵn sàng kiểm tra. Bấm các nút ở trên hoặc nhấn giữ nút BOOT trên bo mạch 3 giây để kích hoạt tự kiểm tra.
+          </div>
+
+          <!-- Hướng dẫn đấu nối & Lưu ý kỹ thuật -->
+          <div style="margin-top: 10px; font-size: 11px; color: #cbd5e1; line-height: 1.5; background: rgba(59, 130, 246, 0.08); border: 1px solid rgba(59, 130, 246, 0.2); border-radius: 6px; padding: 8px 10px;">
+            <b style="color: #60a5fa;">📌 Lưu ý kỹ thuật đấu nối phần cứng:</b><br>
+            • <b>Đèn LED Xanh:</b> Chân dài Anode (+) ➔ GPIO 41 (qua trở 220Ω-330Ω), Chân ngắn Cathode (-) ➔ GND.<br>
+            • <b>Đèn LED Đỏ:</b> Chân dài Anode (+) ➔ GPIO 42 (qua trở 220Ω-330Ω), Chân ngắn Cathode (-) ➔ GND.<br>
+            • <b>Tại sao trước đây bị đơ?</b> GPIO 41 và 42 là chân JTAG MTDI/MTMS phần cứng của ESP32-S3. Firmware mới đã cấu hình lệnh <code>gpio_reset_pin()</code> để tách triệt để 2 chân này khỏi JTAG, cho phép hoạt động như GPIO độc lập an toàn 100%.<br>
+            • <b>Điện trở đệm:</b> Bắt buộc có điện trở nối tiếp 220Ω hoặc 330Ω để tránh quá dòng làm sụt áp nguồn camera OV5640.
+          </div>
+        </div>
+
         <!-- Cài đặt API & Test Offline -->
         <div class="card" id="api-settings-card">
           <div class="card-title">
@@ -1067,7 +1181,10 @@
           <div id="api-config" style="display: none; padding: 12px; background: #0f172a; border-radius: 8px;">
             <div class="form-group">
               <label>Backend API Base URL:</label>
-              <input type="text" id="api-base-url" class="form-input" value="" placeholder="https://api.example.com/api">
+              <div style="display: flex; gap: 8px;">
+                <input type="text" id="api-base-url" class="form-input" style="flex: 1;" value="" placeholder="https://api.example.com/api">
+                <button class="btn btn-primary" style="font-size: 11px; white-space: nowrap; padding: 6px 12px;" onclick="saveServerConfigPermanent()">💾 Lưu vĩnh viễn</button>
+              </div>
             </div>
             <div style="display: flex; gap: 8px; margin-bottom: 8px;">
               <button class="btn btn-ghost" style="font-size: 11px;" onclick="setProductionApiUrl()">Production</button>
@@ -1095,6 +1212,8 @@
     let autoConfirmTimer = null;
     let recentlyConfirmedQr = '';
     let recentlyConfirmedAt = 0;
+    let latestEspData = null;
+    let lastHandledScanSeq = '';
 
     // Dedicated QR Code Reader (Chuẩn tương tự @zxing/browser trên dự án web EventHub)
     const decodeHints = new Map();
@@ -1133,12 +1252,23 @@
 
     async function loadClientConfig() {
       try {
+        const localSavedUrl = localStorage.getItem('eh_api_base_url');
         const res = await fetch('/api/client-config');
         if (res.ok) {
           const cfg = await res.json();
+          if (localSavedUrl && !localSavedUrl.includes('example.com')) {
+            cfg.api_base_url = localSavedUrl;
+          }
           applyRuntimeConfig(cfg);
+        } else if (localSavedUrl) {
+          applyRuntimeConfig({ api_base_url: localSavedUrl });
         }
-      } catch (e) {}
+      } catch (e) {
+        const localSavedUrl = localStorage.getItem('eh_api_base_url');
+        if (localSavedUrl) {
+          applyRuntimeConfig({ api_base_url: localSavedUrl });
+        }
+      }
     }
 
     // Init
@@ -1146,8 +1276,10 @@
       await loadClientConfig();
       updateOperatingModeUI();
       initVideoOrientation();
+      initStreamWatchdog();
       startQrScanningLoop();
       pollStatus();
+      loadHistoryFromDatabase();
 
       // Keyboard Shortcut: Space / Enter to Check-in, Escape to Reset/Scan Next
       window.addEventListener('keydown', (e) => {
@@ -1171,11 +1303,159 @@
     }
 
     function setApiUrl(url) {
-      document.getElementById('api-base-url').value = url;
+      const apiIn = document.getElementById('api-base-url');
+      if (apiIn) apiIn.value = url;
+      localStorage.setItem('eh_api_base_url', url);
     }
 
     function setProductionApiUrl() {
       setApiUrl(runtimeConfig.apiBaseUrl || 'http://localhost:3000/api');
+    }
+
+    async function saveServerConfigPermanent() {
+      const apiIn = document.getElementById('api-base-url');
+      const url = (apiIn ? apiIn.value : '').trim().replace(/\/+$/, '');
+      if (!url) {
+        alert('Vui lòng nhập địa chỉ URL máy chủ hợp lệ!');
+        return;
+      }
+      localStorage.setItem('eh_api_base_url', url);
+      try {
+        const res = await fetch('/api/save-server-config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ api_base_url: url })
+        });
+        const d = await res.json();
+        if (d.success) {
+          alert('✅ Đã lưu vĩnh viễn cấu hình API Server vào .env và ESP32 Flash!');
+        } else {
+          alert(d.message || 'Lỗi lưu cấu hình');
+        }
+      } catch (e) {
+        alert('Đã lưu vào bộ nhớ trình duyệt (localStorage). Lỗi gửi tới server Python: ' + e.message);
+      }
+    }
+
+    async function triggerManualServo() {
+      try {
+        const res = await fetch('/api/servo', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'open' })
+        });
+        const d = await res.json();
+        if (d.success) {
+          showAlert('🚪 Đã mở cổng Servo 90° (tự đóng sau 3 giây)', 'success');
+        } else {
+          showAlert('Lỗi mở cổng: ' + (d.message || 'Không kết nối được ESP32'), 'error');
+        }
+      } catch (e) {
+        showAlert('Lỗi kết nối servo: ' + e.message, 'error');
+      }
+    }
+
+    async function testLed(color, state, mode = 'direct') {
+      const statusEl = document.getElementById('hw-test-status');
+      if (statusEl) statusEl.innerText = `Đang gửi lệnh điều khiển LED ${color.toUpperCase()} (${state ? 'BẬT' : 'TẮT'})...`;
+      try {
+        const res = await fetch('/api/test/led', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ color, state, mode })
+        });
+        const d = await res.json();
+        if (d.success) {
+          if (statusEl) statusEl.innerHTML = `<span style="color:#34d399;">✓ ${d.message || 'Lệnh LED thành công'}</span>`;
+          showAlert(`💡 LED ${color === 'green' ? 'Xanh' : 'Đỏ'}: ${state ? 'ĐÃ BẬT' : 'ĐÃ TẮT'}!`, 'success');
+        } else {
+          if (statusEl) statusEl.innerHTML = `<span style="color:#f87171;">⚠️ Lỗi: ${d.message}</span>`;
+          showAlert(`Lỗi LED: ${d.message}`, 'error');
+        }
+      } catch (e) {
+        if (statusEl) statusEl.innerHTML = `<span style="color:#f87171;">⚠️ Không kết nối được: ${e.message}</span>`;
+      }
+    }
+
+    async function testBuzzer(durationMs = 150) {
+      const statusEl = document.getElementById('hw-test-status');
+      if (statusEl) statusEl.innerText = `Đang test còi Buzzer (${durationMs}ms)...`;
+      try {
+        const res = await fetch('/api/test/buzzer', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ duration: durationMs })
+        });
+        const d = await res.json();
+        if (d.success) {
+          if (statusEl) statusEl.innerHTML = `<span style="color:#34d399;">✓ Đã kêu còi Buzzer (${durationMs}ms)</span>`;
+        }
+      } catch (e) {
+        if (statusEl) statusEl.innerHTML = `<span style="color:#f87171;">⚠️ Lỗi còi: ${e.message}</span>`;
+      }
+    }
+
+    async function testServoAngle(angle) {
+      const statusEl = document.getElementById('hw-test-status');
+      if (statusEl) statusEl.innerText = `Đang điều khiển Servo về góc ${angle}°...`;
+      try {
+        const res = await fetch('/api/test/servo', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ angle })
+        });
+        const d = await res.json();
+        if (d.success) {
+          if (statusEl) statusEl.innerHTML = `<span style="color:#34d399;">✓ Servo đã quay về ${angle}°</span>`;
+          showAlert(`🚪 Servo: Góc ${angle}°`, 'success');
+        }
+      } catch (e) {
+        if (statusEl) statusEl.innerHTML = `<span style="color:#f87171;">⚠️ Lỗi servo: ${e.message}</span>`;
+      }
+    }
+
+    async function testIrSensor() {
+      const statusEl = document.getElementById('hw-test-status');
+      const badge = document.getElementById('ir-sensor-badge');
+      if (statusEl) statusEl.innerText = 'Đang đọc tín hiệu cảm biến hồng ngoại (GPIO 48)...';
+      try {
+        const res = await fetch('/api/test/ir', { method: 'POST' });
+        const d = await res.json();
+        if (d.success) {
+          const hasObstacle = Boolean(d.detected || d.state === 1);
+          if (badge) {
+            badge.innerText = hasObstacle ? '🚶 CÓ VẬT CẢN (LOW)' : '🟢 TRỐNG (HIGH)';
+            badge.style.color = hasObstacle ? '#f87171' : '#34d399';
+            badge.style.fontWeight = 'bold';
+          }
+          if (statusEl) {
+            statusEl.innerHTML = hasObstacle
+              ? '<span style="color:#f87171;">⚠️ Cảm biến IR phát hiện CÓ VẬT CẢN/NGƯỜI (OUT=0 / LOW)</span>'
+              : '<span style="color:#34d399;">✓ Cảm biến IR: ĐƯỜNG ĐI THÔNG THOÁNG (OUT=1 / HIGH)</span>';
+          }
+          showAlert(hasObstacle ? '⚠️ Cảm biến IR: Có vật cản' : '✓ Cảm biến IR: Thông thoáng', hasObstacle ? 'warning' : 'success');
+        }
+      } catch (e) {
+        if (statusEl) statusEl.innerHTML = `<span style="color:#f87171;">⚠️ Lỗi đọc IR: ${e.message}</span>`;
+      }
+    }
+
+    async function runFullHardwareTest() {
+      const statusEl = document.getElementById('hw-test-status');
+      if (statusEl) statusEl.innerText = '⚡ Đang kích hoạt chu trình tự kiểm tra toàn bộ phần cứng trên ESP32...';
+      try {
+        const res = await fetch('/api/test/all', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' }
+        });
+        const d = await res.json();
+        if (d.success) {
+          if (statusEl) statusEl.innerHTML = `<span style="color:#fbbf24;">⚡ Đang chạy test: LED Xanh ➔ LED Đỏ ➔ Còi ➔ Servo 90° ➔ OLED...</span>`;
+          showAlert('⚡ Đã kích hoạt chu trình kiểm tra tự động trên ESP32!', 'success');
+        }
+      } catch (e) {
+        if (statusEl) statusEl.innerHTML = `<span style="color:#f87171;">⚠️ Lỗi: ${e.message}</span>`;
+      }
     }
 
     function getApiBaseUrl() {
@@ -1499,9 +1779,35 @@
       updateVideoOrientation();
     }
 
+    let lastStreamFrameTime = Date.now();
+    let streamWatchdogTimer = null;
+
     function reconnectStream() {
       const img = document.getElementById('stream-img');
-      img.src = '/stream?t=' + Date.now();
+      if (img) {
+        img.src = '/stream?t=' + Date.now();
+        lastStreamFrameTime = Date.now();
+      }
+    }
+
+    function initStreamWatchdog() {
+      const img = document.getElementById('stream-img');
+      if (!img) return;
+
+      img.onerror = () => {
+        console.warn('[Stream Watchdog] Mất luồng video, tự động kết nối lại sau 400ms...');
+        setTimeout(reconnectStream, 400);
+      };
+
+      if (streamWatchdogTimer) clearInterval(streamWatchdogTimer);
+      streamWatchdogTimer = setInterval(() => {
+        const now = Date.now();
+        if (img.naturalWidth === 0 && (now - lastStreamFrameTime > 3500)) {
+          console.warn('[Stream Watchdog] Phát hiện luồng video bị đơ hoặc chưa có frame, tự phục hồi...');
+          reconnectStream();
+          lastStreamFrameTime = now;
+        }
+      }, 2000);
     }
 
     // Audio Beep
@@ -1522,19 +1828,29 @@
           osc.start(now);
           osc.stop(now + 0.12);
         } else if (type === 'success') {
-          // Double chime (success)
-          osc.frequency.setValueAtTime(523.25, now);
-          osc.frequency.setValueAtTime(659.25, now + 0.08);
-          gain.gain.setValueAtTime(0.25, now);
-          gain.gain.exponentialRampToValueAtTime(0.01, now + 0.25);
+          // Double chime (bíp bíp 2 tiếng vé hợp lệ)
+          osc.frequency.setValueAtTime(659.25, now);
+          gain.gain.setValueAtTime(0.22, now);
+          gain.gain.exponentialRampToValueAtTime(0.01, now + 0.08);
           osc.start(now);
-          osc.stop(now + 0.25);
+          osc.stop(now + 0.08);
+
+          const osc2 = ctx.createOscillator();
+          const gain2 = ctx.createGain();
+          osc2.connect(gain2);
+          gain2.connect(ctx.destination);
+          osc2.frequency.setValueAtTime(880, now + 0.12);
+          gain2.gain.setValueAtTime(0.25, now + 0.12);
+          gain2.gain.exponentialRampToValueAtTime(0.01, now + 0.22);
+          osc2.start(now + 0.12);
+          osc2.stop(now + 0.22);
         } else if (type === 'error') {
+          // Bíp dài âm trầm cảnh báo vé lỗi / vé đã dùng
           osc.frequency.setValueAtTime(220, now);
-          gain.gain.setValueAtTime(0.3, now);
-          gain.gain.exponentialRampToValueAtTime(0.01, now + 0.3);
+          gain.gain.setValueAtTime(0.35, now);
+          gain.gain.exponentialRampToValueAtTime(0.01, now + 0.45);
           osc.start(now);
-          osc.stop(now + 0.3);
+          osc.stop(now + 0.45);
         }
       } catch (e) {}
     }
@@ -1543,6 +1859,7 @@
     const cropCanvas = document.createElement('canvas');
     const cropCtx = cropCanvas.getContext('2d');
 
+    let decodeCycle = 0;
     function decodeCanvasElement(targetCanvas) {
       if (!targetCanvas || targetCanvas.width === 0 || targetCanvas.height === 0) return null;
       try {
@@ -1555,19 +1872,15 @@
           if (res && res.getText && res.getText().trim()) return res;
         } catch (e1) {}
 
-        // Pass 2: Inverted Luminance Source (cho màn hình điện thoại Dark mode / OLED)
-        try {
-          const invBitmap = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(luminanceSource.invert()));
-          const res = qrReader.decode(invBitmap, decodeHints);
-          if (res && res.getText && res.getText().trim()) return res;
-        } catch (e2) {}
-
-        // Pass 3: GlobalHistogramBinarizer (cho vùng sáng không đều / bóng đổ vé in)
-        try {
-          const histBitmap = new ZXing.BinaryBitmap(new ZXing.GlobalHistogramBinarizer(luminanceSource));
-          const res = qrReader.decode(histBitmap, decodeHints);
-          if (res && res.getText && res.getText().trim()) return res;
-        } catch (e3) {}
+        decodeCycle++;
+        // Pass 2: Inverted Luminance Source (chạy mỗi 2 chu kỳ để tiết kiệm CPU cho camera stream mượt mà)
+        if ((decodeCycle % 2) === 0) {
+          try {
+            const invBitmap = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(luminanceSource.invert()));
+            const res = qrReader.decode(invBitmap, decodeHints);
+            if (res && res.getText && res.getText().trim()) return res;
+          } catch (e2) {}
+        }
 
         return null;
       } catch (e) {
@@ -1579,89 +1892,113 @@
 
     function startQrScanningLoop() {
       const img = document.getElementById('stream-img');
-      const canvas = document.getElementById('scan-canvas');
-      const ctx = canvas.getContext('2d');
+      // Dùng canvas đệm offscreen riêng biệt, tuyệt đối KHÔNG đè lên luồng thẻ <img> của camera
+      const scanCanvas = document.createElement('canvas');
+      const scanCtx = scanCanvas.getContext('2d', { willReadFrequently: true });
       let lastScanTimestamp = 0;
+      let scanCycleIndex = 0;
 
       async function scanFrame(timestamp) {
-        // Tần số quét thời gian thực: ~25ms; tạm dừng giải mã ZXing nặng khi đang gửi request đối soát/xác nhận
-        if (
-          document.getElementById('auto-scan').checked &&
-          !isVerifying &&
-          !isCheckingIn &&
-          img.naturalWidth > 0 &&
-          timestamp - lastScanTimestamp >= 25
-        ) {
-          lastScanTimestamp = timestamp;
-
-          canvas.width = img.naturalWidth;
-          canvas.height = img.naturalHeight;
-
-          // Luôn vẽ khung hình gốc chuẩn không lật ngược để định vị đúng các góc tìm kiếm (Finder Patterns) của QR
-          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-
-          // Tự động đo sáng môi trường vs màn hình điện thoại
-          if (canvas.width >= 100 && canvas.height >= 100) {
-            checkAdaptiveExposure(ctx, canvas.width, canvas.height);
+        try {
+          if (img && img.naturalWidth > 0) {
+            lastStreamFrameTime = Date.now();
           }
 
-          let result = null;
+          // Tần số quét cân bằng tối ưu: ~125ms (~8 FPS) nhận diện tức thì (<0.15s)
+          // Stream video của thẻ <img> chạy độc lập mượt mà 30 FPS không bao giờ bị đơ!
+          if (
+            document.getElementById('auto-scan')?.checked &&
+            !isVerifying &&
+            !isCheckingIn &&
+            img &&
+            img.naturalWidth >= 50 &&
+            img.naturalHeight >= 50 &&
+            timestamp - lastScanTimestamp >= 125
+          ) {
+            lastScanTimestamp = timestamp;
+            scanCycleIndex++;
 
-          // 1. Quét toàn khung hình gốc sắc nét từ camera (Full resolution)
-          result = decodeCanvasElement(canvas);
+            const nw = img.naturalWidth;
+            const nh = img.naturalHeight;
+            if (scanCanvas.width !== nw || scanCanvas.height !== nh) {
+              scanCanvas.width = nw;
+              scanCanvas.height = nh;
+            }
 
-          // 2. Nếu chưa thấy, quét vùng tâm Viewfinder (crop 1:1 không làm mờ nội suy)
-          if (!result && canvas.width >= 100 && canvas.height >= 100) {
-            const cw = Math.floor(canvas.width * 0.70);
-            const ch = Math.floor(canvas.height * 0.70);
-            const cx = Math.floor((canvas.width - cw) / 2);
-            const cy = Math.floor((canvas.height - ch) / 2);
-            cropCanvas.width = cw;
-            cropCanvas.height = ch;
-            cropCtx.drawImage(canvas, cx, cy, cw, ch, 0, 0, cw, ch);
-            result = decodeCanvasElement(cropCanvas);
-          }
+            // Vẽ ảnh vào canvas đệm bộ nhớ (không ảnh hưởng hiển thị UI của img stream)
+            scanCtx.drawImage(img, 0, 0, nw, nh);
 
-          // 3. Nếu vẫn chưa thấy và đang gặp lóa sáng màn hình điện thoại (chống lóa tương phản)
-          if (!result && canvas.width >= 100 && canvas.height >= 100 && clientDimFactor < 0.9) {
-            cropCtx.save();
-            cropCtx.filter = 'contrast(1.4) brightness(' + clientDimFactor + ')';
-            cropCtx.drawImage(canvas, cx, cy, cw, ch, 0, 0, cw, ch);
-            cropCtx.restore();
-            cropCtx.filter = 'none';
-            result = decodeCanvasElement(cropCanvas);
-          }
+            // Tự động đo sáng môi trường vs màn hình điện thoại
+            if (nw >= 100 && nh >= 100) {
+              checkAdaptiveExposure(scanCtx, nw, nh);
+            }
 
-          if (result && result.getText) {
-            const text = String(result.getText() || '').trim();
-            // Tuyệt đối không nhận chuỗi rỗng
-            if (text && text.length > 0) {
-              const now = Date.now();
-              lastDetectTimestamp = now;
+            let result = null;
+            let cx = 0, cy = 0, cw = 0, ch = 0;
 
-              const vf = document.getElementById('viewfinder-box');
-              if (vf) vf.className = 'viewfinder active-detected';
+            // 1. Quét vùng tâm Viewfinder trước (crop 70% ở giữa - siêu nhanh và nét)
+            if (nw >= 100 && nh >= 100) {
+              cw = Math.floor(nw * 0.70);
+              ch = Math.floor(nh * 0.70);
+              cx = Math.floor((nw - cw) / 2);
+              cy = Math.floor((nh - ch) / 2);
+              if (cropCanvas.width !== cw || cropCanvas.height !== ch) {
+                cropCanvas.width = cw;
+                cropCanvas.height = ch;
+              }
+              cropCtx.drawImage(scanCanvas, cx, cy, cw, ch, 0, 0, cw, ch);
+              result = decodeCanvasElement(cropCanvas);
+            }
 
-              // Quét liên tục: Tránh quét lại đúng vé vừa xác nhận trong 6000ms; mã khác -> Nhận diện TỨC THÌ; mã cũ -> Debounce 2000ms
-              const inFreshConfirmCooldown = (text === recentlyConfirmedQr && (now - recentlyConfirmedAt < 6000));
-              if (!inFreshConfirmCooldown && (text !== lastScannedCode || now - lastScannedTime > 2000)) {
-                lastScannedCode = text;
-                lastScannedTime = now;
-                onQrDetected(text);
+            // 2. Chỉ khi ở tâm chưa thấy VÀ vào chu kỳ quét phụ (mỗi 3 frame), mới quét toàn khung hình
+            if (!result && (scanCycleIndex % 3 === 0)) {
+              result = decodeCanvasElement(scanCanvas);
+            }
+
+            // 3. Nếu vẫn chưa thấy và đang gặp lóa sáng màn hình điện thoại (chỉ chạy mỗi 4 frame)
+            if (!result && (scanCycleIndex % 4 === 0) && cw > 0 && ch > 0 && clientDimFactor < 0.9) {
+              cropCtx.save();
+              cropCtx.filter = 'contrast(1.4) brightness(' + clientDimFactor + ')';
+              cropCtx.drawImage(scanCanvas, cx, cy, cw, ch, 0, 0, cw, ch);
+              cropCtx.restore();
+              cropCtx.filter = 'none';
+              result = decodeCanvasElement(cropCanvas);
+            }
+
+            if (result && result.getText) {
+              const text = String(result.getText() || '').trim();
+              if (text && text.length > 0) {
+                const now = Date.now();
+                lastDetectTimestamp = now;
+
+                const vf = document.getElementById('viewfinder-box');
+                if (vf) vf.className = 'viewfinder active-detected';
+
+                // Quét liên tục: Tránh quét lại đúng vé vừa xác nhận trong 5000ms; mã khác -> Nhận diện TỨC THÌ; mã cũ -> Debounce 2500ms
+                const inFreshConfirmCooldown = (text === recentlyConfirmedQr && (now - recentlyConfirmedAt < 5000));
+                if (!inFreshConfirmCooldown && (text !== lastScannedCode || now - lastScannedTime > 2500)) {
+                  lastScannedCode = text;
+                  lastScannedTime = now;
+                  onQrDetected(text);
+                }
+              }
+            } else {
+              // Không tìm thấy mã trong frame này
+              if (Date.now() - lastDetectTimestamp > 400) {
+                const vf = document.getElementById('viewfinder-box');
+                if (vf && !vf.classList.contains('active-detected')) {
+                  vf.className = 'viewfinder';
+                }
+                document.getElementById('scan-status-text').innerText = formatScanStatusForTicket(currentTicket);
               }
             }
-          } else {
-            // Không tìm thấy mã trong frame này
-            if (Date.now() - lastDetectTimestamp > 400) {
-              const vf = document.getElementById('viewfinder-box');
-              if (vf && !vf.classList.contains('active-detected')) {
-                vf.className = 'viewfinder';
-              }
-              document.getElementById('scan-status-text').innerText = formatScanStatusForTicket(currentTicket);
-            }
           }
+        } catch (scanErr) {
+          console.error('[Scan Loop Protected Exception]:', scanErr);
+        } finally {
+          // Luôn luôn duy trì vòng lặp không bao giờ bị đứt đoạn hay crash
+          requestAnimationFrame(scanFrame);
         }
-        requestAnimationFrame(scanFrame);
       }
 
       requestAnimationFrame(scanFrame);
@@ -1976,28 +2313,44 @@
         }
       } catch (e) {}
 
-      const cfg = (data && data.device_config) || {};
-      const code = data?.ticket_code || data?.ticketCode || cleanCode || parsed?.ticket_code || parsed?.code || 'N/A';
-      const eventName = cfg.event_name || data?.event_name || cfg.event_code || data?.event_code || parsed?.event || 'Sự kiện EventHub';
-      const resTag = String(data?.result || '').toUpperCase();
-      const status = (resTag === 'OK' || resTag === 'USED') ? 'USED' : 'VALID';
+      const sub = (data && typeof data === 'object') ? (data.data || data.ticket || data) : {};
+      const cfg = (data && data.device_config) || (sub && sub.device_config) || (latestEspData && latestEspData.iot) || {};
+      const code = sub?.ticket_code || sub?.ticketCode || data?.ticket_code || data?.ticketCode || cleanCode || parsed?.ticket_code || parsed?.code || 'N/A';
+      const eventName = sub?.eventName || sub?.event_name || sub?.event?.title || cfg.event_name || data?.event_name || cfg.event_code || data?.event_code || parsed?.event || (latestEspData?.iot?.event_name) || 'Sự kiện EventHub';
+      const resTag = String(data?.result || sub?.result || '').toUpperCase();
+      const isOk = resTag === 'OK' || resTag === 'CONFIRMED';
+      const isUsed = resTag === 'USED' || sub?.status === 'USED' || Boolean(sub?.checked_in_at || sub?.checkedInAt);
+      const isVerifying = data?.status === 'VERIFYING';
+      const status = (isOk || isUsed) ? 'USED' : (isVerifying ? 'VERIFYING' : 'VALID');
+
+      // Tìm kiếm thông tin khách trong lịch sử check-in nếu có
+      const hist = (Array.isArray(checkinHistory) ? checkinHistory.find(h => h.ticketCode === code || h.id === code) : null);
+
+      const buyerName = sub?.buyerName || sub?.buyer_name || sub?.attendee_name || sub?.buyer?.name || sub?.order?.buyer_name || parsed?.attendee_name || parsed?.name || hist?.buyerName || (isVerifying ? 'Đang xác thực...' : 'Khách tham dự');
+      const buyerEmail = sub?.buyerEmail || sub?.buyer_email || sub?.attendee_email || sub?.buyer?.email || sub?.order?.buyer_email || parsed?.email || hist?.buyerEmail || '--';
+      const buyerPhone = sub?.buyerPhone || sub?.buyer_phone || sub?.buyer?.phone || sub?.order?.buyer_phone || parsed?.phone || hist?.buyerPhone || 'Không có';
+      const ticketType = sub?.ticketType || sub?.ticket_type_name || sub?.ticket_type?.name || data?.ticket_type_name || parsed?.ticket_type || hist?.ticketType || 'Vé tiêu chuẩn';
+      let seat = sub?.seat || sub?.seat_label || data?.seat_label || parsed?.seat || hist?.seat;
+      if (seat && typeof seat === 'object') seat = seat.label || `${seat.row_label || ''}${seat.seat_number || ''}` || 'Không có';
+      if (!seat) seat = 'Không có';
 
       return {
-        id: data?.ticket_id || data?.ticketId || parsed?.ticket_id || parsed?.id || code,
+        id: sub?.id || sub?.ticket_id || sub?.ticketId || parsed?.ticket_id || parsed?.id || code,
         ticket_code: code,
         ticketCode: code,
         status: status,
-        checked_in_at: data?.checked_in_at || data?.checkedInAt || (status === 'USED' ? new Date().toISOString() : null),
-        checkedInAt: data?.checked_in_at || data?.checkedInAt || (status === 'USED' ? new Date().toISOString() : null),
-        checkedInBy: data?.checked_in_by || data?.checkedInBy || 'Thiết bị IoT',
-        attendee_name: data?.attendee_name || parsed?.attendee_name || parsed?.name || 'Khách tham dự',
-        attendee_email: data?.attendee_email || parsed?.email || '--',
-        buyerName: data?.buyer_name || data?.attendee_name || parsed?.attendee_name || parsed?.name || 'Khách tham dự',
-        buyerEmail: data?.buyer_email || parsed?.email || '--',
-        buyerPhone: data?.buyer_phone || parsed?.phone || 'Không có',
+        checked_in_at: sub?.checked_in_at || sub?.checkedInAt || data?.checked_in_at || data?.checkedInAt || (status === 'USED' ? new Date().toISOString() : null),
+        checkedInAt: sub?.checked_in_at || sub?.checkedInAt || data?.checked_in_at || data?.checkedInAt || (status === 'USED' ? new Date().toISOString() : null),
+        checkedInBy: sub?.checked_in_by || sub?.checkedInBy || data?.checked_in_by || data?.checkedInBy || 'Thiết bị IoT',
+        attendee_name: buyerName,
+        attendee_email: buyerEmail,
+        buyerName: buyerName,
+        buyerEmail: buyerEmail,
+        buyerPhone: buyerPhone,
         eventName: eventName,
-        ticketType: data?.ticket_type_name || data?.ticket_type || parsed?.ticket_type || 'Vé tiêu chuẩn',
-        seat: parsed?.seat || data?.seat_label || 'Không có'
+        ticketType: ticketType,
+        seat: seat,
+        raw: sub
       };
     }
 
@@ -2099,11 +2452,21 @@
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ duration: 240, oled_status: 'USED', qr_code: cleanCode || mockTicket.ticket_code || '' })
           }).catch(() => {});
-        } else if (!isAutoConfirm) {
+          fetch('/api/test/led', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ color: 'red', mode: 'auto' })
+          }).catch(() => {});
+        } else {
           fetch('/api/beep', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ duration: 60, oled_status: 'VERIFIED', qr_code: cleanCode || mockTicket.ticket_code || '' })
+            body: JSON.stringify({ duration: 60, oled_status: 'OK', qr_code: cleanCode || mockTicket.ticket_code || '' })
+          }).catch(() => {});
+          fetch('/api/test/led', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ color: 'green', mode: 'auto' })
           }).catch(() => {});
         }
         showAlert(
@@ -2115,7 +2478,18 @@
         return;
       }
 
-      // 3. Gửi kiểm tra qua kết nối IoT tới EventHub Backend (không cần đăng nhập Staff)
+      // 3. Gửi kiểm tra qua kết nối IoT tới EventHub Backend
+      // 🚀 TỐI ƯU HÓA HIỂN THỊ TỨC THÌ (OPTIMISTIC PRE-RENDER):
+      // Ngay lập tức mở khung chi tiết vé bên phải, hiển thị thông tin vé,
+      // đặt trạng thái Trạng thái vé & Thời gian soát vé thành "Đang xác thực..."
+      const initialTicket = buildTicketFromIotResponse(rawValue, cleanCode, {
+        result: 'VERIFYING',
+        status: 'VERIFYING',
+        ticket_code: cleanCode || rawValue
+      });
+      initialTicket.status = 'VERIFYING';
+      displayTicket(initialTicket, false, { allowAutoConfirm: false });
+
       isVerifying = true;
       statusEl.innerHTML = `
         <div style="color: #60a5fa; font-size: 12px; display: flex; align-items: center; gap: 6px; padding: 6px 0;">
@@ -2126,12 +2500,13 @@
       const apiBase = getApiBaseUrl();
 
       try {
+        const isAutoConfirm = Boolean(document.getElementById('auto-confirm')?.checked);
         const res = await fetch('/api/proxy/verify-qr', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json'
           },
-          body: JSON.stringify({ qrCode: rawValue, apiBase })
+          body: JSON.stringify({ qrCode: rawValue, apiBase, action: isAutoConfirm ? 'auto' : 'verify' })
         });
         const serverRoute = res.headers?.get ? res.headers.get('X-Checkin-Route') : null;
         const data = await res.json();
@@ -2148,6 +2523,7 @@
             `;
             displayTicket(resolvedTicket, true, { confirmedSource: confirmSource, confirmedAuto: true });
             addCheckinHistory(currentTicket, confirmSource, true);
+            playBeep('success');
             showAlert('✅ Check-in thành công: ' + (resolvedTicket.ticketCode || cleanCode), 'success');
           } else {
             statusEl.innerHTML = `
@@ -2157,8 +2533,10 @@
             `;
             displayTicket(resolvedTicket);
             if (resolvedTicket.status === 'USED' || resolvedTicket.checked_in_at || resolvedTicket.checkedInAt) {
+              playBeep('error');
               showAlert('⚠️ Vé này đã được check-in trước đó!', 'error');
             } else {
+              playBeep('success');
               const isAutoConfirm = Boolean(document.getElementById('auto-confirm')?.checked);
               showAlert(
                 isAutoConfirm
@@ -2217,10 +2595,14 @@
         } else if (res.status === 405) {
           if (vf) vf.className = 'viewfinder active-error';
           playBeep('error');
-          // Khôi phục URL API về chuẩn từ .env
+          // Không tự ý xóa URL tuỳ chỉnh của người dùng; chỉ sửa khi gõ nhầm tên miền frontend
           const inputEl = document.getElementById('api-base-url');
-          const stdApi = runtimeConfig.apiBaseUrl || 'http://localhost:3000/api';
-          if (inputEl) inputEl.value = stdApi;
+          let curApi = (inputEl ? inputEl.value : '').trim();
+          if (runtimeConfig.frontendDomain && runtimeConfig.backendHost && curApi.includes(runtimeConfig.frontendDomain) && !curApi.includes(runtimeConfig.backendHost)) {
+            curApi = curApi.replace(runtimeConfig.frontendDomain, runtimeConfig.backendHost);
+            if (inputEl) inputEl.value = curApi;
+          }
+          const stdApi = curApi || runtimeConfig.apiBaseUrl || 'http://localhost:3000/api';
           const fallbackTicket = buildFallbackTicket(rawValue, cleanCode);
           displayTicket(fallbackTicket, false, { allowAutoConfirm: false });
           const warningBox = document.getElementById('checkin-warning');
@@ -2333,6 +2715,9 @@
         `;
       } finally {
         isVerifying = false;
+        recentlyConfirmedQr = rawValue;
+        recentlyConfirmedAt = Date.now();
+        lastScannedTime = Date.now();
       }
     }
 
@@ -2507,6 +2892,32 @@
           if (vf) vf.className = 'viewfinder active-error';
           showAlert('⚠️ Vé này đã được check-in trước đó!', 'error');
         }
+      } else if (ticket.status === 'VERIFYING') {
+        // TRẠNG THÁI ĐANG TRUY VẤN DỮ LIỆU TỪ MÁY CHỦ
+        statusPill.className = 'eh-status-pill';
+        statusPill.style.background = 'rgba(59, 130, 246, 0.2)';
+        statusPill.style.color = '#60a5fa';
+        statusPill.style.border = '1px solid rgba(59, 130, 246, 0.4)';
+        statusPill.innerText = '⏳ Đang xác thực...';
+
+        statusText.innerHTML = '<span style="color:#60a5fa; font-weight:600;">⏳ Đang đối soát với máy chủ...</span>';
+        checkinTimeEl.innerHTML = '<span style="color:#94a3b8;">⏳ Đang lấy dữ liệu...</span>';
+
+        if (warningBox) {
+          warningBox.style.display = 'block';
+          warningBox.style.background = 'rgba(59, 130, 246, 0.12)';
+          warningBox.style.border = '1px solid rgba(59, 130, 246, 0.35)';
+          warningBox.style.color = '#93c5fd';
+          warningBox.innerHTML = `⏳ <b>Đang đối soát vé:</b> Mã <b>${escapeHtmlText(ticket.ticketCode || '')}</b> đang được kiểm tra trên máy chủ...`;
+        }
+
+        btnConfirm.classList.add('btn-disabled');
+        btnConfirm.disabled = true;
+        btnConfirm.style.background = '#1e293b';
+        btnConfirm.style.color = '#94a3b8';
+        btnConfirm.style.borderColor = 'rgba(148, 163, 184, 0.3)';
+        if (btnText) btnText.innerText = '⏳ Đang kiểm tra vé...';
+        if (vf) vf.className = 'viewfinder active-detected';
       } else if (ticket.status === 'VALID') {
         // CHƯA SOÁT VÉ (HỢP LỆ)
         ticket._confirmedSource = null;
@@ -2633,7 +3044,7 @@
       const isMock = (operatingMode === 'test') || document.getElementById('mock-api-toggle')?.checked;
       if (isMock) {
         setTimeout(() => {
-          // Kích hoạt còi chíp (GPIO 1) & màn hình OLED trên phần cứng ESP32
+          // Kích hoạt còi chíp (GPIO 1), màn hình OLED & Servo mở cổng trên phần cứng ESP32
           fetch('/api/beep', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -2642,6 +3053,12 @@
               oled_status: 'OK',
               qr_code: currentTicket.ticket_code || currentTicket.code || currentQrRaw || ''
             })
+          }).catch(() => {});
+
+          fetch('/api/servo', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'open' })
           }).catch(() => {});
 
           completeCheckinConfirmation('mock', isAuto);
@@ -2691,6 +3108,63 @@
       }
     }
 
+    function renderHistoryTable() {
+      const tbody = document.getElementById('history-tbody');
+      if (!tbody) return;
+      if (checkinHistory.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="5" style="text-align: center; color: #64748b; padding: 20px;">Chưa có lượt quét nào</td></tr>`;
+        const countEl = document.getElementById('history-count');
+        if (countEl) countEl.innerText = '0 vé';
+        return;
+      }
+      tbody.innerHTML = checkinHistory.slice(0, 20).map(item => `
+        <tr>
+          <td>${escapeHtmlText(item.time)}</td>
+          <td style="font-weight: 600; color: #fff;">${escapeHtmlText(item.name)}</td>
+          <td style="font-family: monospace; color: #60a5fa;">${escapeHtmlText(item.code)}</td>
+          <td>${escapeHtmlText(item.seat || 'Tự do')}</td>
+          <td><span style="color: ${item.success !== false ? '#34d399' : '#f87171'}; font-weight: 700;">${escapeHtmlText(item.status)}</span></td>
+        </tr>
+      `).join('');
+
+      const countEl = document.getElementById('history-count');
+      if (countEl) countEl.innerText = checkinHistory.length + ' vé';
+    }
+
+    async function loadHistoryFromDatabase() {
+      try {
+        const res = await fetch('/api/history?limit=20');
+        if (!res.ok) return;
+        const data = await res.json();
+        if (data && data.success && Array.isArray(data.items) && data.items.length > 0) {
+          checkinHistory = data.items.map(it => {
+            let tStr = it.scanned_at || it.time || '';
+            if (tStr && tStr.includes('T')) {
+              try { tStr = new Date(tStr).toLocaleTimeString('vi-VN'); } catch(e) {}
+            }
+            const ok = (it.result === 'OK' || it.success === true);
+            const verified = (it.result === 'VERIFIED');
+            let stText = ok ? '✓ Đã Check-in' : (verified ? '✓ Vé hợp lệ' : (it.message || it.result || 'Thất bại'));
+            return {
+              time: tStr || '--:--',
+              name: it.attendee_name || it.name || 'Khách',
+              code: it.ticket_code || it.code || 'N/A',
+              seat: it.seat || 'Tự do',
+              status: stText,
+              success: ok || verified
+            };
+          });
+          renderHistoryTable();
+          const countEl = document.getElementById('history-count');
+          if (countEl && data.stats && data.stats.total_scans !== undefined) {
+            countEl.innerText = `${data.stats.total_scans} vé (OK: ${data.stats.ok_count})`;
+          }
+        }
+      } catch (err) {
+        console.warn('loadHistoryFromDatabase:', err);
+      }
+    }
+
     function addCheckinHistory(ticket, confirmSource = null, isAuto = false) {
       const sourceKey = confirmSource || ticket._confirmedSource || resolveCurrentConfirmSource();
       const meta = getCheckinSourceMeta(sourceKey);
@@ -2702,21 +3176,11 @@
         name: ticket.buyerName || ticket.attendee_name || ticket.buyer?.name || 'Khách',
         code: ticket.ticketCode || ticket.ticket_code || 'N/A',
         seat: seatValue || 'Tự do',
-        status: '✓ ' + (autoUsed ? 'Auto • ' : '') + meta.badge + ' vừa xác nhận'
+        status: '✓ ' + (autoUsed ? 'Auto • ' : '') + meta.badge + ' vừa xác nhận',
+        success: true
       });
 
-      const tbody = document.getElementById('history-tbody');
-      tbody.innerHTML = checkinHistory.slice(0, 15).map(item => `
-        <tr>
-          <td>${escapeHtmlText(item.time)}</td>
-          <td style="font-weight: 600; color: #fff;">${escapeHtmlText(item.name)}</td>
-          <td style="font-family: monospace; color: #60a5fa;">${escapeHtmlText(item.code)}</td>
-          <td>${escapeHtmlText(item.seat)}</td>
-          <td><span style="color: #34d399; font-weight: 700;">${escapeHtmlText(item.status)}</span></td>
-        </tr>
-      `).join('');
-
-      document.getElementById('history-count').innerText = checkinHistory.length + ' vé';
+      renderHistoryTable();
     }
 
     function resetScanState() {
@@ -2786,7 +3250,41 @@
           updateNetworkUI(data.network);
         }
         if (data.esp32_device) {
+          latestEspData = data.esp32_device;
           updateEsp32UI(data.esp32_device, data.route_mode);
+
+          // Tự động đồng bộ ngay kết quả soát vé từ phần cứng ESP32 lên màn hình
+          const lastScan = data.esp32_device.last_scan;
+          if (lastScan && typeof lastScan === 'object') {
+            const scanSeq = String(lastScan.seq || lastScan.timestamp || lastScan.ticket_code || lastScan.ticketCode || '');
+            if (scanSeq && scanSeq !== lastHandledScanSeq) {
+              const scanQr = lastScan.ticket_code || lastScan.ticketCode || lastScan.qr;
+              if (scanQr && isVerifying) {
+                lastHandledScanSeq = scanSeq;
+                const scanRes = String(lastScan.result || lastScan.status || '').toUpperCase();
+                const resolved = buildTicketFromIotResponse(scanQr, scanQr, lastScan);
+                if (scanRes === 'OK' || scanRes === 'CONFIRMED') {
+                  const statusEl = document.getElementById('scan-status');
+                  if (statusEl) statusEl.innerHTML = `<div style="color: #34d399; font-size: 12px; font-weight: 600; padding: 4px 0;">✓ Đã xác thực & check-in vé thành công qua ESP32!</div>`;
+                  displayTicket(resolved, true, { confirmedSource: 'esp32_hardware', confirmedAuto: true });
+                  addCheckinHistory(currentTicket, 'esp32_hardware', true);
+                  playBeep('success');
+                  isVerifying = false;
+                } else if (scanRes === 'VERIFIED') {
+                  const statusEl = document.getElementById('scan-status');
+                  if (statusEl) statusEl.innerHTML = `<div style="color: #34d399; font-size: 12px; font-weight: 600; padding: 4px 0;">✓ Xác thực vé thành công từ máy chủ!</div>`;
+                  displayTicket(resolved);
+                  playBeep('success');
+                  isVerifying = false;
+                } else if (scanRes === 'USED') {
+                  resolved.status = 'USED';
+                  displayTicket(resolved, false, { allowAutoConfirm: false });
+                  playBeep('error');
+                  isVerifying = false;
+                }
+              }
+            }
+          }
         }
       } catch (e) {}
       setTimeout(pollStatus, 1500);
@@ -2911,6 +3409,13 @@
         if (cardLatDot) cardLatDot.style.background = '#f87171';
         if (cardLatStatus) cardLatStatus.innerText = 'Không kết nối được server';
         if (warnBox) warnBox.style.display = 'block';
+      }
+
+      if (net && net.last_test_resp) {
+        const testStatusEl = document.getElementById('hw-test-status');
+        if (testStatusEl && (!testStatusEl.dataset.custom || Date.now() - Number(testStatusEl.dataset.customTime || 0) > 4000)) {
+          testStatusEl.innerHTML = `<span style="color:#60a5fa;">📡 Bo mạch ESP32:</span> <code style="color:#34d399; font-weight:bold; font-family:monospace;">${net.last_test_resp}</code>`;
+        }
       }
     }
 

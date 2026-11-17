@@ -53,3 +53,13 @@
 /* OLED 0.96" I2C (SSD1306) pins - conflict-free GPIOs on ESP32-S3-WROOM-1 N16R8 CAM */
 #define OLED_I2C_SDA_PIN  21  /* OLED I2C SDA (GPIO 21) */
 #define OLED_I2C_SCL_PIN  47  /* OLED I2C SCL (GPIO 47) */
+
+/* Servo Barrier Gate (SG90 / MG90S) PWM pin */
+#define SERVO_PIN         14  /* Servo PWM Signal output (GPIO 14) */
+
+/* Indicator Status LEDs (Green = Ticket OK, Red = Ticket Error / Used) */
+#define LED_GREEN_PIN     41  /* Green LED Signal (GPIO 41 - ON for 60s when ticket OK) */
+#define LED_RED_PIN       42  /* Red LED Signal (GPIO 42 - ON for 60s when ticket Error/Used) */
+
+/* Infrared Obstacle Sensor (IR Beam sensor to detect person passing through gate) */
+#define IR_SENSOR_PIN     48  /* IR Obstacle Sensor OUT signal (GPIO 48, Active LOW when obstacle detected) */

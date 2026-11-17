@@ -63,6 +63,55 @@ void oled_update_iot_status(oled_iot_status_t iot_status,
                             const char *event_code,
                             const char *mac_short);
 
+#define OLED_HISTORY_MAX_ITEMS 10
+
+typedef struct {
+    char ticket_code[24];
+    char attendee_name[24];
+    char result[16];
+    char scanned_at[24];
+    char message[32];
+    bool success;
+} oled_history_item_t;
+
+typedef struct {
+    int page;
+    int limit;
+    int total;
+    bool has_more;
+    int total_scans;
+    int ok_count;
+    int verified_count;
+    int failed_count;
+    char filter[16];
+    bool event_only;
+    bool offline_cached;
+    bool loading;
+    char error_msg[24];
+    int item_count;
+    oled_history_item_t items[OLED_HISTORY_MAX_ITEMS];
+} oled_history_snapshot_t;
+
+/**
+ * @brief Update the cached device history snapshot shown when History mode is active.
+ */
+void oled_update_history(const oled_history_snapshot_t *hist);
+
+/**
+ * @brief Switch between normal idle/scan view and History screen (or move item cursor).
+ */
+void oled_set_history_mode(bool visible, int selected_idx);
+
+/**
+ * @brief Check whether OLED History screen is currently visible.
+ */
+bool oled_is_history_mode(void);
+
+/**
+ * @brief Get current selected item index in OLED History screen.
+ */
+int oled_get_history_selected_idx(void);
+
 #ifdef __cplusplus
 }
 #endif

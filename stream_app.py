@@ -45,6 +45,81 @@ def _load_local_env():
         print(f"[!] Warning reading .env: {e}")
 
 
+def save_env_server_config(api_url=None, iot_url=None, backend_host=None):
+    global DEFAULT_API_BASE_URL, DEFAULT_IOT_BASE_URL, DEFAULT_BACKEND_HOST
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    env_lines = []
+    if os.path.isfile(env_path):
+        try:
+            with open(env_path, "r", encoding="utf-8") as f:
+                env_lines = f.readlines()
+        except Exception as e:
+            print(f"[!] Warning reading .env for update: {e}")
+
+    updates = {}
+    if api_url:
+        u = api_url.strip().rstrip("/")
+        if u:
+            updates["EVENTHUB_API_BASE_URL"] = u
+            DEFAULT_API_BASE_URL = u
+            os.environ["EVENTHUB_API_BASE_URL"] = u
+            try:
+                from urllib.parse import urlparse
+                p = urlparse(u)
+                if p.netloc:
+                    updates["EVENTHUB_BACKEND_HOST"] = p.netloc
+                    DEFAULT_BACKEND_HOST = p.netloc
+                    os.environ["EVENTHUB_BACKEND_HOST"] = p.netloc
+            except Exception:
+                pass
+
+    if iot_url:
+        u = iot_url.strip().rstrip("/")
+        if u:
+            updates["EVENTHUB_IOT_BASE_URL"] = u
+            DEFAULT_IOT_BASE_URL = u
+            os.environ["EVENTHUB_IOT_BASE_URL"] = u
+    elif api_url:
+        u = f"{api_url.strip().rstrip('/')}/iot/v1"
+        updates["EVENTHUB_IOT_BASE_URL"] = u
+        DEFAULT_IOT_BASE_URL = u
+        os.environ["EVENTHUB_IOT_BASE_URL"] = u
+
+    if backend_host:
+        updates["EVENTHUB_BACKEND_HOST"] = backend_host.strip()
+        DEFAULT_BACKEND_HOST = backend_host.strip()
+        os.environ["EVENTHUB_BACKEND_HOST"] = backend_host.strip()
+
+    if not updates:
+        return
+
+    new_lines = []
+    written_keys = set()
+    for line in env_lines:
+        sline = line.strip()
+        if sline and not sline.startswith("#") and "=" in sline:
+            k, _ = sline.split("=", 1)
+            k = k.strip()
+            if k in updates:
+                new_lines.append(f"{k}={updates[k]}\n")
+                written_keys.add(k)
+                continue
+        new_lines.append(line)
+
+    for k, v in updates.items():
+        if k not in written_keys:
+            if new_lines and not new_lines[-1].endswith("\n"):
+                new_lines[-1] += "\n"
+            new_lines.append(f"{k}={v}\n")
+
+    try:
+        with open(env_path, "w", encoding="utf-8") as f:
+            f.writelines(new_lines)
+        print(f"[Config Saved]: Persisted API={DEFAULT_API_BASE_URL}, IOT={DEFAULT_IOT_BASE_URL} to .env")
+    except Exception as e:
+        print(f"[!] Warning writing .env: {e}")
+
+
 _load_local_env()
 
 DEFAULT_BACKEND_HOST = os.environ.get("EVENTHUB_BACKEND_HOST", "api.example.com").strip()
@@ -187,6 +262,10 @@ esp_checkin_event = threading.Event()
 esp_checkin_result = {"status_code": 500, "content": b""}
 esp_checkin_lock = threading.Lock()
 
+esp_ir_event = threading.Event()
+esp_ir_result = {"detected": False, "state": 0}
+esp_ir_lock = threading.Lock()
+
 
 def send_esp32_uart_or_http(uart_cmd, ack_event, http_path, http_payload, wait_timeout=0.8):
     """Send a control command over USB UART first, falling back to ESP32 HTTP when unplugged."""
@@ -238,7 +317,15 @@ def notify_esp32_oled_and_beep(oled_status=None, qr_code="", beep_ms=0):
         st_clean = str(oled_status).strip().upper()
         code_clean = _extract_short_ticket_code(qr_code)
         cmds.append(f"OLED:{st_clean}|{code_clean}")
-    if beep_ms and int(beep_ms) > 0:
+        if st_clean in ("OK", "VERIFIED"):
+            # Bíp bíp 2 tiếng vui tai khi vé hợp lệ
+            cmds.append("BEEP:DOUBLE")
+            cmds.append("LED:GREEN")
+        elif st_clean in ("USED", "ERROR", "NOTFOUND", "INVALID", "WRONG_EVENT"):
+            # Bíp dài khi vé lỗi / đã sử dụng
+            cmds.append("BEEP:LONG")
+            cmds.append("LED:RED")
+    elif beep_ms and int(beep_ms) > 0:
         cmds.append(f"BEEP:{int(beep_ms)}")
     if not cmds:
         return
@@ -328,6 +415,16 @@ def check_esp32_latency(ip, port=80, timeout=1.2):
 
 def parse_text_telemetry(raw_bytes):
     global esp32_device_state
+    if not raw_bytes or len(raw_bytes) < 3:
+        return
+    # Chỉ bỏ qua nếu thực sự là binary rác và không chứa bất kỳ từ khóa telemetry nào
+    keywords = (b"RESP:", b"STAT:", b"SCAN:", b"CHECKIN", b"VERIFY", b"AUTO", b"TEST", b"WIFI", b"IOT")
+    has_keyword = any(k in raw_bytes for k in keywords)
+    if not has_keyword:
+        sample = raw_bytes[:min(128, len(raw_bytes))]
+        printable = sum(1 for b in sample if 32 <= b <= 126 or b in (10, 13, 9))
+        if printable < len(sample) * 0.65:
+            return
     try:
         text = raw_bytes.decode("utf-8", errors="ignore")
         for m in re.finditer(r"ESPSTAT:WIFI=(\d+),IP=([0-9.]+),RSSI=(-?\d+),SSID=([^\r\n]*)", text):
@@ -431,6 +528,16 @@ def parse_text_telemetry(raw_bytes):
                 else:
                     esp32_device_state["iot"] = iot_payload
 
+            esp_url = parts.get("URL", "").strip()
+            if esp_url and (esp_url.startswith("http://") or esp_url.startswith("https://")) and "example.com" not in esp_url:
+                if esp_url != DEFAULT_IOT_BASE_URL:
+                    save_env_server_config(iot_url=esp_url)
+
+        for m in re.finditer(r"IOTURLSAVED:([^\r\n]+)", text):
+            saved_u = m.group(1).strip()
+            if saved_u:
+                save_env_server_config(iot_url=saved_u)
+
         for m in re.finditer(r"WIFISAVED:(\d+)", text):
             cnt = int(m.group(1))
             with esp32_state_lock:
@@ -509,6 +616,12 @@ def parse_text_telemetry(raw_bytes):
             with esp_verify_lock:
                 esp_verify_result["content"] = v_content.encode("utf-8")
                 esp_verify_result["status_code"] = 200
+            try:
+                parsed_v = json.loads(v_content)
+                with esp32_state_lock:
+                    esp32_device_state["last_scan"] = parsed_v
+            except Exception:
+                pass
             esp_verify_event.set()
 
         for m in re.finditer(r"CHECKINRESP:([^\r\n]*)", text):
@@ -517,7 +630,29 @@ def parse_text_telemetry(raw_bytes):
             with esp_checkin_lock:
                 esp_checkin_result["content"] = c_content.encode("utf-8")
                 esp_checkin_result["status_code"] = 200
+            try:
+                parsed_c = json.loads(c_content)
+                with esp32_state_lock:
+                    esp32_device_state["last_scan"] = parsed_c
+            except Exception:
+                pass
             esp_checkin_event.set()
+
+        for m in re.finditer(r"TESTRESP:([^\r\n]*)", text):
+            t_msg = m.group(1).strip()
+            print(f"[ESP32 HW TEST] {t_msg}")
+            with esp32_state_lock:
+                esp32_device_state["last_test_resp"] = t_msg
+                esp32_device_state["last_test_time"] = time.time()
+            if t_msg.startswith("IR="):
+                try:
+                    ir_v = int(t_msg.split("=", 1)[1].strip())
+                    with esp_ir_lock:
+                        esp_ir_result["detected"] = (ir_v == 1)
+                        esp_ir_result["state"] = ir_v
+                    esp_ir_event.set()
+                except Exception:
+                    pass
 
         for m in re.finditer(r"WIFISTAT:(CONNECTED|DISCONNECTED)\|([0-9.]+)\|(-?\d+)\|([^\r\n]*)", text):
             w_conn = (m.group(1) == "CONNECTED")
@@ -956,6 +1091,55 @@ def serial_receiver_thread(port_name, baud_rate):
 
                 buffer.extend(chunk)
 
+                # 1. Trích xuất ngay lập tức các phản hồi đối soát (CHECKINRESP / VERIFYRESP) và TESTRESP trực tiếp từ buffer
+                while True:
+                    m = re.search(rb"(CHECKINRESP|VERIFYRESP|TESTRESP):([^\r\n]*)[\r\n]", buffer)
+                    if not m:
+                        break
+                    tag = m.group(1).decode("ascii")
+                    resp_raw = m.group(2)
+                    resp_str = resp_raw.decode("utf-8", errors="ignore").strip()
+                    del buffer[m.start():m.end()]
+
+                    if tag == "CHECKINRESP":
+                        print(f"[ESP32 UART DIRECT] Nhận CHECKINRESP ({len(resp_str)} bytes)")
+                        with esp_checkin_lock:
+                            esp_checkin_result["content"] = resp_raw
+                            esp_checkin_result["status_code"] = 200
+                        try:
+                            parsed_scan = json.loads(resp_str)
+                            with esp32_state_lock:
+                                esp32_device_state["last_scan"] = parsed_scan
+                        except Exception:
+                            pass
+                        esp_checkin_event.set()
+                    elif tag == "VERIFYRESP":
+                        print(f"[ESP32 UART DIRECT] Nhận VERIFYRESP ({len(resp_str)} bytes)")
+                        with esp_verify_lock:
+                            esp_verify_result["content"] = resp_raw
+                            esp_verify_result["status_code"] = 200
+                        try:
+                            parsed_scan = json.loads(resp_str)
+                            with esp32_state_lock:
+                                esp32_device_state["last_scan"] = parsed_scan
+                        except Exception:
+                            pass
+                        esp_verify_event.set()
+                    elif tag == "TESTRESP":
+                        print(f"[ESP32 HW TEST DIRECT] {resp_str}")
+                        with esp32_state_lock:
+                            esp32_device_state["last_test_resp"] = resp_str
+                            esp32_device_state["last_test_time"] = time.time()
+                        if resp_str.startswith("IR="):
+                            try:
+                                ir_v = int(resp_str.split("=", 1)[1].strip())
+                                with esp_ir_lock:
+                                    esp_ir_result["detected"] = (ir_v == 1)
+                                    esp_ir_result["state"] = ir_v
+                                esp_ir_event.set()
+                            except Exception:
+                                pass
+
                 # Look for complete text lines or frames in buffer
                 while len(buffer) > 0:
                     idx = buffer.find(SYNC_MAGIC)
@@ -1002,10 +1186,21 @@ def serial_receiver_thread(port_name, baud_rate):
 
                         del buffer[:total_packet_len]
                     else:
-                        del buffer[:4]
+                        next_sync = buffer.find(SYNC_MAGIC, 4)
+                        if next_sync != -1:
+                            parse_text_telemetry(buffer[:next_sync])
+                            del buffer[:next_sync]
+                        else:
+                            parse_text_telemetry(buffer[:4])
+                            del buffer[:4]
 
         except serial.SerialException as e:
             with serial_lock:
+                if serial_connection:
+                    try:
+                        serial_connection.close()
+                    except Exception:
+                        pass
                 serial_connection = None
             is_serial_connected = False
             current_fps = 0.0
@@ -1013,6 +1208,11 @@ def serial_receiver_thread(port_name, baud_rate):
             time.sleep(2)
         except Exception as e:
             with serial_lock:
+                if serial_connection:
+                    try:
+                        serial_connection.close()
+                    except Exception:
+                        pass
                 serial_connection = None
             is_serial_connected = False
             print(f"[-] Unexpected error in serial thread: {e}")
@@ -1117,6 +1317,9 @@ class CheckinHTTPHandler(BaseHTTPRequestHandler):
             self.end_headers()
             with network_lock:
                 net_info = dict(network_state)
+            with esp32_state_lock:
+                net_info["last_test_resp"] = esp32_device_state.get("last_test_resp")
+                net_info["last_test_time"] = esp32_device_state.get("last_test_time")
             self.wfile.write(json.dumps(net_info).encode("utf-8"))
         elif clean_path.startswith("/api/wifi-scan"):
             force = ("refresh=1" in self.path or "force=1" in self.path)
@@ -1143,6 +1346,57 @@ class CheckinHTTPHandler(BaseHTTPRequestHandler):
                 "count": len(nets),
                 "networks": nets
             })
+        elif clean_path in ("/api/history", "/api/proxy/device-history"):
+            parsed_url = urlparse(self.path)
+            query_str = parsed_url.query
+            with esp32_iot_creds_lock:
+                dev_id = esp32_iot_creds.get("device_id", "")
+                dev_sec = esp32_iot_creds.get("device_secret", "")
+
+            with esp32_state_lock:
+                esp_ip = esp32_device_state.get("ip", "0.0.0.0")
+                esp_conn = esp32_device_state.get("wifi_connected", False)
+                esp_iot_url = str((esp32_device_state.get("iot") or {}).get("iot_base_url") or "").strip().rstrip("/")
+
+            with request_route_lock:
+                r_mode = request_route_mode
+
+            handled = False
+            if r_mode != "esp32" and dev_id and dev_sec:
+                iot_base = esp_iot_url if esp_iot_url else DEFAULT_IOT_BASE_URL
+                target_url = f"{iot_base}/devices/history"
+                if query_str:
+                    target_url = f"{target_url}?{query_str}"
+                try:
+                    resp = requests.get(
+                        target_url,
+                        headers={"X-Device-Id": dev_id, "X-Device-Secret": dev_sec},
+                        timeout=5
+                    )
+                    self._send_proxied_json_response(resp.status_code, resp.content, "pc")
+                    handled = True
+                except Exception as e:
+                    print(f"   [-] Lỗi fetch history từ PC route ({e})")
+
+            if not handled and esp_conn and esp_ip and esp_ip != "0.0.0.0":
+                try:
+                    esp_url = f"http://{esp_ip}/api/history"
+                    if query_str:
+                        esp_url = f"{esp_url}?{query_str}"
+                    esp_resp = requests.get(esp_url, timeout=5)
+                    self._send_proxied_json_response(esp_resp.status_code, esp_resp.content, "esp32")
+                    handled = True
+                except Exception as e:
+                    print(f"   [-] Lỗi fetch history từ ESP32 ({e})")
+
+            if not handled:
+                self.send_json_response(200, {
+                    "success": True,
+                    "device_id": dev_id,
+                    "items": [],
+                    "stats": {"total_scans": 0, "ok_count": 0, "verified_count": 0, "failed_count": 0},
+                    "pagination": {"page": 1, "limit": 10, "total": 0, "has_more": False}
+                })
         elif clean_path == "/capture":
             with latest_frame_lock:
                 frame = latest_frame
@@ -1263,6 +1517,8 @@ class CheckinHTTPHandler(BaseHTTPRequestHandler):
             new_url = str(body.get("iot_base_url", "")).strip()
             do_reset = bool(body.get("reset", False))
             do_sync = bool(body.get("sync", False))
+            if new_url:
+                save_env_server_config(iot_url=new_url)
             http_payload = {}
             if new_url:
                 http_payload["iot_base_url"] = new_url
@@ -1305,6 +1561,34 @@ class CheckinHTTPHandler(BaseHTTPRequestHandler):
                     "success": False,
                     "message": "Chưa kết nối được ESP32 qua USB Serial hoặc Wi-Fi HTTP."
                 })
+
+        elif clean_path == "/api/save-server-config":
+            api_url = str(body.get("api_base_url", "")).strip()
+            iot_url = str(body.get("iot_base_url", "")).strip()
+            if not iot_url and api_url:
+                iot_url = f"{api_url.rstrip('/')}/iot/v1"
+            elif not api_url and iot_url:
+                api_url = iot_url.rsplit("/iot/v1", 1)[0]
+                if not api_url.endswith("/api"):
+                    api_url = f"{api_url}/api"
+
+            save_env_server_config(api_url=api_url, iot_url=iot_url)
+
+            # Đồng thời gửi lệnh xuống ESP32 qua UART / HTTP nếu có kết nối
+            via = "none"
+            if iot_url:
+                uart_cmd = f"SETIOTURL:{iot_url}"
+                ok, via, acked, _ = send_esp32_uart_or_http(
+                    uart_cmd, None, "/api/iot-config", {"iot_base_url": iot_url, "sync": True}, wait_timeout=0.4
+                )
+
+            self.send_json_response(200, {
+                "success": True,
+                "message": "Đã lưu vĩnh viễn cấu hình API Server vào .env và ESP32 Flash!",
+                "api_base_url": DEFAULT_API_BASE_URL,
+                "iot_base_url": DEFAULT_IOT_BASE_URL,
+                "via": via
+            })
 
         elif clean_path == "/api/esp32/wifi-profiles":
             raw_profiles = body.get("profiles") or []
@@ -1460,7 +1744,10 @@ class CheckinHTTPHandler(BaseHTTPRequestHandler):
                 return
 
             has_explicit_api = bool(str(body.get("apiBase", "")).strip())
-            self.handle_iot_proxy_scan("verify", qr_text, api_base, has_explicit_api)
+            scan_action = str(body.get("action", "verify")).strip()
+            if scan_action not in ("auto", "verify", "checkin"):
+                scan_action = "verify"
+            self.handle_iot_proxy_scan(scan_action, qr_text, api_base, has_explicit_api)
 
         elif clean_path == "/api/proxy/check-in":
             qr_text = str(body.get("qrCode", "")).strip()
@@ -1478,6 +1765,109 @@ class CheckinHTTPHandler(BaseHTTPRequestHandler):
             qr_code = body.get("qr_code", "")
             notify_esp32_oled_and_beep(oled_status=oled_status, qr_code=qr_code, beep_ms=duration)
             self.send_json_response(200, {"success": True})
+
+        elif clean_path in ("/api/servo", "/api/esp32/servo", "/api/servo-open"):
+            angle = body.get("angle")
+            if angle is not None:
+                uart_cmd = f"SERVO:ANGLE:{int(angle)}"
+            else:
+                uart_cmd = "SERVO:OPEN"
+
+            ok, via, acked, _ = send_esp32_uart_or_http(
+                uart_cmd, None, "/api/servo", body, wait_timeout=0.3
+            )
+            self.send_json_response(200, {
+                "success": ok,
+                "via": via,
+                "message": "Đã gửi lệnh điều khiển Servo mở cổng (90 độ)!" if ok else "Chưa gửi được lệnh tới ESP32."
+            })
+
+        elif clean_path == "/api/test/led":
+            color = str(body.get("color", "green")).lower()
+            state = int(body.get("state", 1))
+            mode = str(body.get("mode", "direct")).lower()
+            if mode == "auto":
+                cmd = "LED:GREEN" if color == "green" else "LED:RED"
+            else:
+                cmd = f"TEST:{'GREEN' if color == 'green' else 'RED'}:{1 if state else 0}"
+
+            http_payload = {"device": f"led_{color}", "state": state}
+            ok, via, acked, _ = send_esp32_uart_or_http(cmd, None, "/api/test", http_payload, wait_timeout=0.3)
+            self.send_json_response(200, {
+                "success": ok,
+                "via": via,
+                "color": color,
+                "state": state,
+                "command": cmd,
+                "message": f"Đã gửi lệnh {cmd} tới bo mạch ESP32!" if ok else "Chưa gửi được lệnh tới ESP32."
+            })
+
+        elif clean_path == "/api/test/buzzer":
+            duration = int(body.get("duration", 150))
+            cmd = f"TEST:BUZZER:{duration}"
+            http_payload = {"device": "buzzer", "duration": duration}
+            ok, via, acked, _ = send_esp32_uart_or_http(cmd, None, "/api/test", http_payload, wait_timeout=0.3)
+            self.send_json_response(200, {
+                "success": ok,
+                "via": via,
+                "duration": duration,
+                "command": cmd,
+                "message": f"Đã kích hoạt còi Buzzer ({duration}ms)!" if ok else "Chưa gửi được lệnh tới ESP32."
+            })
+
+        elif clean_path == "/api/test/servo":
+            angle = body.get("angle")
+            action = body.get("action", "")
+            if action == "cycle" or angle is None:
+                cmd = "SERVO:OPEN"
+                http_payload = {"device": "servo", "angle": 90}
+            else:
+                cmd = f"TEST:SERVO:{int(angle)}"
+                http_payload = {"device": "servo", "angle": int(angle)}
+
+            ok, via, acked, _ = send_esp32_uart_or_http(cmd, None, "/api/test", http_payload, wait_timeout=0.3)
+            self.send_json_response(200, {
+                "success": ok,
+                "via": via,
+                "command": cmd,
+                "message": f"Đã gửi lệnh Servo ({cmd}) tới ESP32!" if ok else "Chưa gửi được lệnh tới ESP32."
+            })
+
+        elif clean_path in ("/api/test/ir", "/api/test/sensor"):
+            cmd = "TEST:IR"
+            http_payload = {"device": "ir"}
+            esp_ir_event.clear()
+            ok, via, acked, http_res = send_esp32_uart_or_http(cmd, esp_ir_event, "/api/test", http_payload, wait_timeout=1.0)
+            
+            detected = False
+            state = 0
+            if via == "http" and isinstance(http_res, dict):
+                detected = bool(http_res.get("detected") or http_res.get("state") == 1)
+                state = 1 if detected else 0
+            elif via == "uart":
+                with esp_ir_lock:
+                    detected = esp_ir_result.get("detected", False)
+                    state = esp_ir_result.get("state", 0)
+
+            self.send_json_response(200, {
+                "success": ok,
+                "via": via,
+                "detected": detected,
+                "state": state,
+                "command": cmd,
+                "message": ("Có vật cản/người chắn tia hồng ngoại!" if detected else "Đường đi thông thoáng (không có vật cản).") if ok else "Chưa gửi được lệnh tới ESP32."
+            })
+
+        elif clean_path == "/api/test/all":
+            cmd = "TEST:ALL"
+            http_payload = {"device": "all"}
+            ok, via, acked, _ = send_esp32_uart_or_http(cmd, None, "/api/test", http_payload, wait_timeout=0.3)
+            self.send_json_response(200, {
+                "success": ok,
+                "via": via,
+                "command": cmd,
+                "message": "Đã bắt đầu chu trình kiểm tra toàn bộ phần cứng trên ESP32!" if ok else "Chưa gửi được lệnh tới ESP32."
+            })
 
         elif clean_path == "/api/cam-settings":
             with serial_lock:
@@ -1648,7 +2038,7 @@ class CheckinHTTPHandler(BaseHTTPRequestHandler):
                     serial_connection.write(cmd.encode("utf-8"))
                     serial_connection.flush()
 
-            if ev.wait(timeout=12.0):
+            if ev.wait(timeout=2.8):
                 with lk:
                     raw_resp = res_dict.get("content", b"")
                 if raw_resp:
@@ -1685,12 +2075,12 @@ class CheckinHTTPHandler(BaseHTTPRequestHandler):
 
         # Fallback sang HTTP Local nếu chạy độc lập (không cắm dây USB)
         if esp_ip and esp_ip != "0.0.0.0":
-            print(f"   [ESP32 Route]: Chuyển tiếp HTTP tới http://{esp_ip}{http_endpoint}...")
+            print(f"   [ESP32 Route]: Thử chuyển tiếp HTTP tới http://{esp_ip}{http_endpoint}...")
             try:
                 esp_resp = requests.post(
                     f"http://{esp_ip}{http_endpoint}",
                     json={"qrCode": clean_code},
-                    timeout=10
+                    timeout=1.2
                 )
                 try:
                     self._sync_iot_cfg_into_state(esp_resp.json(), from_pc_route=False)
@@ -1702,10 +2092,19 @@ class CheckinHTTPHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 print(f"   [-] Lỗi gửi qua ESP32 HTTP ({e})")
 
+        # Failsafe: Tự động fallback sang Mạng PC gửi trực tiếp EventHub API để không bao giờ bị đơ/timeout!
+        with esp32_iot_creds_lock:
+            dev_id = esp32_iot_creds.get("device_id", "")
+            dev_sec = esp32_iot_creds.get("device_secret", "")
+        if dev_id and dev_sec:
+            print("   [ESP32 Fallback -> PC]: ESP32 Wi-Fi không phản hồi. Tự động chuyển sang Mạng PC để phản hồi tức thì!")
+            self.forward_iot_pc_request(action, qr_text, "", False, dev_id, dev_sec)
+            return
+
         self.send_json_response(504, {
             "success": False,
             "errorCode": "ESP32_TIMEOUT",
-            "message": "ESP32 không phản hồi khi gửi yêu cầu qua Wi-Fi 2.4GHz (Timeout > 12s). Vui lòng kiểm tra kết nối Wi-Fi của ESP32 hoặc chuyển sang Mạng Máy Tính (PC)."
+            "message": "ESP32 không phản hồi khi gửi yêu cầu qua Wi-Fi 2.4GHz. Vui lòng kiểm tra kết nối Wi-Fi của ESP32 hoặc chuyển sang Mạng Máy Tính (PC)."
         })
 
     def forward_api_request(self, method, url, data, auth_header, extra_headers=None, qr_hint="", action_hint=None):
