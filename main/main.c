@@ -45,6 +45,7 @@
 #include "lwip/sys.h"
 
 #include "esp_camera.h"
+#include "img_converters.h"
 #include "camera_pins.h"
 #include "oled_ssd1306.h"
 #include "quirc.h"
@@ -67,7 +68,8 @@ static const char *TAG = "EVENTHUB_DUAL_CAM";
  * ============================================================================ */
 #define UART_PORT_NUM           UART_NUM_0
 #define UART_BAUD_RATE          2000000              /* 2.0 Mbps USB Serial */
-#define UART_BUF_SIZE           16384
+#define UART_RX_BUF_SIZE        8192
+#define UART_TX_BUF_SIZE        32768                /* 32KB TX ring buffer: gửi VGA JPEG không chặn CPU */
 
 static const uint8_t SYNC_MAGIC[4] = {0xAA, 0x55, 0xAA, 0x55};
 static const uint8_t END_MAGIC[4]  = {0x55, 0xAA, 0x55, 0xAA};
@@ -113,7 +115,8 @@ static const uint8_t END_MAGIC[4]  = {0x55, 0xAA, 0x55, 0xAA};
 #define LED_RED_PIN             42                   /* GPIO 42: Đèn LED Đỏ (Vé lỗi / Đã check-in) */
 #endif
 
-#define STATUS_LED_HOLD_MS      60000                /* Thời gian sáng đèn: 60,000ms (1 phút) */
+#define STATUS_LED_GREEN_HOLD_MS 60000               /* Thời gian sáng đèn xanh: 60,000ms (1 phút) */
+#define STATUS_LED_RED_HOLD_MS   30000               /* Thời gian sáng đèn đỏ: 30,000ms (30 giây) */
 
 /* Wi-Fi & Network Global State */
 #define MAX_WIFI_PROFILES 4
@@ -169,8 +172,13 @@ static volatile bool g_iot_pending_auto_sync = false;
 static char g_iot_last_err[96] = "";
 
 #define SNAP_JPG_MAX_BYTES 131072
+#define SNAP_GRAY_MAX_BYTES (640 * 480)
 static uint8_t *s_snap_jpg_buf = NULL;
 static size_t s_snap_jpg_len = 0;
+static uint8_t *s_snap_gray_buf = NULL;
+static uint16_t s_snap_gray_w = 0;
+static uint16_t s_snap_gray_h = 0;
+static volatile bool s_snap_is_gray = false;
 static volatile bool s_snap_requested = false;
 static volatile bool s_snap_ready = false;
 
@@ -617,6 +625,8 @@ static bool is_ir_obstacle_detected(void)
     return gpio_get_level(IR_SENSOR_PIN) == 0;
 }
 
+static void led_turn_off_green(void);
+
 static void servo_gate_task(void *pvParameters)
 {
     (void)pvParameters;
@@ -634,7 +644,7 @@ static void servo_gate_task(void *pvParameters)
         /* Trạng thái thông minh với cảm biến hồng ngoại:
          * 1. Cổng mở góc 90 độ.
          * 2. Chờ người bước vào cổng (cảm biến IR phát hiện có người = LOW).
-         * 3. Khi người đã bước qua hẳn khỏi cổng (cảm biến IR quay lại HIGH) -> Đóng cổng!
+         * 3. Khi người đã bước qua hẳn khỏi cổng (cảm biến IR quay lại HIGH) -> Đóng cổng & tắt đèn xanh!
          * 4. Kèm timeout an toàn (SERVO_GATE_SAFETY_TIMEOUT_MS) nếu người đổi ý không bước vào. */
         TickType_t start_tick = xTaskGetTickCount();
         bool person_entered = false;
@@ -655,9 +665,17 @@ static void servo_gate_task(void *pvParameters)
                 }
             } else {
                 if (person_entered) {
-                    /* Người đã đi qua hẳn khỏi cảm biến hồng ngoại! Chờ 400ms an toàn rồi đóng cổng */
+                    /* Người đã đi qua hẳn khỏi cảm biến hồng ngoại! Chờ 400ms an toàn rồi đóng cổng & tắt đèn xanh */
                     vTaskDelay(pdMS_TO_TICKS(400));
-                    ESP_LOGI(TAG, "Servo Gate: IR Sensor -> Person PASSED completely. CLOSING GATE (%d deg)...", SERVO_GATE_CLOSE_DEGREE);
+                    if (ulTaskNotifyTake(pdTRUE, 0) > 0) {
+                        /* Có vé hợp lệ kế tiếp vừa quét trong lúc người trước rời cổng -> giữ cổng mở & giữ đèn xanh */
+                        ESP_LOGI(TAG, "Servo Gate: Next valid ticket scanned right after exit, keeping gate open...");
+                        start_tick = xTaskGetTickCount();
+                        person_entered = false;
+                        continue;
+                    }
+                    ESP_LOGI(TAG, "Servo Gate: IR Sensor -> Person PASSED completely. CLOSING GATE (%d deg) & turning GREEN LED OFF...", SERVO_GATE_CLOSE_DEGREE);
+                    led_turn_off_green();
                     break;
                 }
             }
@@ -677,7 +695,7 @@ static void servo_gate_task(void *pvParameters)
 }
 
 /* ============================================================================
- * 2.2. ĐÈN LED BÁO TRẠNG THÁI SOÁT VÉ (LED XANH LÁ & ĐỎ - SÁNG 1 PHÚT)
+ * 2.2. ĐÈN LED BÁO TRẠNG THÁI SOÁT VÉ (LED XANH: 60s / TẮT KHI QUA CỔNG, LED ĐỎ: 30s)
  * ============================================================================ */
 static TimerHandle_t s_led_green_timer = NULL;
 static TimerHandle_t s_led_red_timer = NULL;
@@ -693,7 +711,14 @@ static void led_red_timer_cb(TimerHandle_t xTimer)
 {
     (void)xTimer;
     gpio_set_level(LED_RED_PIN, 0);
-    ESP_LOGI(TAG, "Status LED: Red LED turned OFF after 60s timeout");
+    ESP_LOGI(TAG, "Status LED: Red LED turned OFF after 30s timeout");
+}
+
+static void led_turn_off_green(void)
+{
+    if (s_led_green_timer) xTimerStop(s_led_green_timer, 0);
+    gpio_set_level(LED_GREEN_PIN, 0);
+    ESP_LOGI(TAG, "Status LED: Green LED turned OFF (person passed gate)");
 }
 
 static void led_turn_off_all(void)
@@ -738,12 +763,12 @@ void led_trigger_red_error(void)
     if (s_led_green_timer) xTimerStop(s_led_green_timer, 0);
     gpio_set_level(LED_GREEN_PIN, 0);
 
-    /* Bật đèn đỏ và kích hoạt/gia hạn bộ đếm 1 phút (60s) */
+    /* Bật đèn đỏ và kích hoạt/gia hạn bộ đếm 30 giây */
     gpio_set_level(LED_RED_PIN, 1);
     if (s_led_red_timer) {
         xTimerReset(s_led_red_timer, 0);
     }
-    ESP_LOGI(TAG, "Status LED: RED ON for 60s (Ticket Error/Used)");
+    ESP_LOGI(TAG, "Status LED: RED ON for 30s (Ticket Error/Used)");
 }
 
 static void hw_test_task(void *pvParameters)
@@ -810,13 +835,13 @@ static void init_status_leds(void)
     gpio_set_drive_capability(LED_RED_PIN, GPIO_DRIVE_CAP_3);
     gpio_set_level(LED_RED_PIN, 0);
 
-    /* Khởi tạo FreeRTOS One-shot Timers (60 giây) */
+    /* Khởi tạo FreeRTOS One-shot Timers (LED Xanh: 60s, LED Đỏ: 30s) */
     if (!s_led_green_timer) {
-        s_led_green_timer = xTimerCreate("led_grn_tmr", pdMS_TO_TICKS(STATUS_LED_HOLD_MS),
+        s_led_green_timer = xTimerCreate("led_grn_tmr", pdMS_TO_TICKS(STATUS_LED_GREEN_HOLD_MS),
                                           pdFALSE, NULL, led_green_timer_cb);
     }
     if (!s_led_red_timer) {
-        s_led_red_timer   = xTimerCreate("led_red_tmr", pdMS_TO_TICKS(STATUS_LED_HOLD_MS),
+        s_led_red_timer   = xTimerCreate("led_red_tmr", pdMS_TO_TICKS(STATUS_LED_RED_HOLD_MS),
                                           pdFALSE, NULL, led_red_timer_cb);
     }
 
@@ -827,7 +852,7 @@ static void init_status_leds(void)
     gpio_set_level(LED_GREEN_PIN, 0);
     gpio_set_level(LED_RED_PIN, 0);
 
-    ESP_LOGI(TAG, "Status LEDs initialized safely on GPIO %d (Green) & GPIO %d (Red) - JTAG detached, 60s auto-off",
+    ESP_LOGI(TAG, "Status LEDs initialized safely on GPIO %d (Green 60s/IR-off) & GPIO %d (Red 30s) - JTAG detached",
              LED_GREEN_PIN, LED_RED_PIN);
 }
 
@@ -895,63 +920,224 @@ static esp_err_t optimizeOV5640Registers(sensor_t *s)
     return ESP_OK;
 }
 
+static void fill_camera_base_config(camera_config_t *config, int xclk_hz, pixformat_t fmt, framesize_t fsize)
+{
+    memset(config, 0, sizeof(camera_config_t));
+    config->ledc_channel  = LEDC_CHANNEL_0;
+    config->ledc_timer    = LEDC_TIMER_0;
+    config->pin_d0        = CAM_PIN_D0;
+    config->pin_d1        = CAM_PIN_D1;
+    config->pin_d2        = CAM_PIN_D2;
+    config->pin_d3        = CAM_PIN_D3;
+    config->pin_d4        = CAM_PIN_D4;
+    config->pin_d5        = CAM_PIN_D5;
+    config->pin_d6        = CAM_PIN_D6;
+    config->pin_d7        = CAM_PIN_D7;
+    config->pin_xclk      = CAM_PIN_XCLK;
+    config->pin_pclk      = CAM_PIN_PCLK;
+    config->pin_vsync     = CAM_PIN_VSYNC;
+    config->pin_href      = CAM_PIN_HREF;
+    config->pin_sccb_sda  = CAM_PIN_SIOD;
+    config->pin_sccb_scl  = CAM_PIN_SIOC;
+    config->pin_pwdn      = CAM_PIN_PWDN;
+    config->pin_reset     = CAM_PIN_RESET;
+    config->xclk_freq_hz  = xclk_hz;
+    config->sccb_i2c_port = -1;
+    config->pixel_format  = fmt;
+    config->frame_size    = fsize;
+    config->jpeg_quality  = 12;
+    config->fb_count      = 2;
+    config->fb_location   = CAMERA_FB_IN_PSRAM;
+    config->grab_mode     = CAMERA_GRAB_LATEST;
+}
+
+static bool g_camera_sw_jpeg_mode = false;
+
+static void probe_gpio_electrical_state(const char *label, int gpio_num)
+{
+    if (gpio_num < 0) return;
+    gpio_config_t io = {
+        .pin_bit_mask = (1ULL << gpio_num),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&io);
+    esp_rom_delay_us(200);
+    int lv_pu = gpio_get_level(gpio_num);
+
+    io.pull_up_en = GPIO_PULLUP_DISABLE;
+    io.pull_down_en = GPIO_PULLDOWN_ENABLE;
+    gpio_config(&io);
+    esp_rom_delay_us(200);
+    int lv_pd = gpio_get_level(gpio_num);
+
+    io.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    gpio_config(&io);
+
+    const char *verdict = (lv_pu == 0 && lv_pd == 0) ? "SHORTED_TO_GND_OR_DRIVEN_LOW" :
+                          (lv_pu == 1 && lv_pd == 1) ? "SHORTED_TO_3V3_OR_DRIVEN_HIGH" :
+                                                       "FLOATING_OR_OPEN_TRACE";
+    ESP_LOGW(TAG, "CAM_DIAG_ELEC: %s (GPIO %d) -> PU=%d, PD=%d [%s]", label, gpio_num, lv_pu, lv_pd, verdict);
+}
+
+static uint8_t run_camera_data_bus_diag(void)
+{
+    ESP_LOGW(TAG, "CAM_DIAG: Running GRAYSCALE D0-D7 pin integrity probe...");
+    const int cam_data_pins[8] = {
+        CAM_PIN_D0, CAM_PIN_D1, CAM_PIN_D2, CAM_PIN_D3,
+        CAM_PIN_D4, CAM_PIN_D5, CAM_PIN_D6, CAM_PIN_D7
+    };
+    uint8_t stuck_mask = 0;
+
+    camera_config_t dcfg;
+    fill_camera_base_config(&dcfg, 10000000, PIXFORMAT_GRAYSCALE, FRAMESIZE_QQVGA);
+    dcfg.fb_count = 1;
+    if (esp_camera_init(&dcfg) == ESP_OK) {
+        vTaskDelay(pdMS_TO_TICKS(150));
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (fb && fb->len >= 16) {
+            uint8_t or_mask = 0x00;
+            uint8_t and_mask = 0xFF;
+            size_t sample_len = fb->len < 4096 ? fb->len : 4096;
+            for (size_t i = 0; i < sample_len; i++) {
+                or_mask |= fb->buf[i];
+                and_mask &= fb->buf[i];
+            }
+            ESP_LOGW(TAG, "CAM_DIAG: GRAYSCALE len=%u or_mask=0x%02X and_mask=0x%02X first8=%02X %02X %02X %02X %02X %02X %02X %02X",
+                     (unsigned)fb->len, or_mask, and_mask,
+                     fb->buf[0], fb->buf[1], fb->buf[2], fb->buf[3],
+                     fb->buf[4], fb->buf[5], fb->buf[6], fb->buf[7]);
+            for (int b = 0; b < 8; b++) {
+                if (((or_mask >> b) & 1) == 0) {
+                    ESP_LOGE(TAG, "CAM_DIAG: Data line D%d (GPIO %d) appears STUCK LOW (0)!", b, cam_data_pins[b]);
+                    stuck_mask |= (1U << b);
+                } else if (((and_mask >> b) & 1) == 1) {
+                    ESP_LOGE(TAG, "CAM_DIAG: Data line D%d (GPIO %d) appears STUCK HIGH (1)!", b, cam_data_pins[b]);
+                    stuck_mask |= (1U << b);
+                }
+            }
+            esp_camera_fb_return(fb);
+        } else {
+            ESP_LOGE(TAG, "CAM_DIAG: GRAYSCALE frame capture also timed out (VSYNC/HREF/PCLK issue)!");
+            if (fb) esp_camera_fb_return(fb);
+        }
+        esp_camera_deinit();
+    } else {
+        ESP_LOGE(TAG, "CAM_DIAG: GRAYSCALE init failed!");
+    }
+
+    if (stuck_mask != 0) {
+        for (int b = 0; b < 8; b++) {
+            if ((stuck_mask >> b) & 1) {
+                char lbl[8];
+                snprintf(lbl, sizeof(lbl), "D%d", b);
+                probe_gpio_electrical_state(lbl, cam_data_pins[b]);
+            }
+        }
+    }
+    return stuck_mask;
+}
+
 static esp_err_t init_camera(void)
 {
-    recover_sccb_bus();
-
-    camera_config_t config;
-    memset(&config, 0, sizeof(camera_config_t));
-    config.ledc_channel = LEDC_CHANNEL_0;
-    config.ledc_timer   = LEDC_TIMER_0;
-    config.pin_d0       = CAM_PIN_D0;
-    config.pin_d1       = CAM_PIN_D1;
-    config.pin_d2       = CAM_PIN_D2;
-    config.pin_d3       = CAM_PIN_D3;
-    config.pin_d4       = CAM_PIN_D4;
-    config.pin_d5       = CAM_PIN_D5;
-    config.pin_d6       = CAM_PIN_D6;
-    config.pin_d7       = CAM_PIN_D7;
-    config.pin_xclk     = CAM_PIN_XCLK;
-    config.pin_pclk     = CAM_PIN_PCLK;
-    config.pin_vsync    = CAM_PIN_VSYNC;
-    config.pin_href     = CAM_PIN_HREF;
-    config.pin_sccb_sda = CAM_PIN_SIOD;
-    config.pin_sccb_scl = CAM_PIN_SIOC;
-    config.pin_pwdn     = CAM_PIN_PWDN;
-    config.pin_reset    = CAM_PIN_RESET;
-    config.xclk_freq_hz = 20000000;
-    config.sccb_i2c_port = -1;
-
-    config.pixel_format = PIXFORMAT_JPEG;
-    config.frame_size   = FRAMESIZE_VGA;
-    config.jpeg_quality = 12;
-    config.fb_count     = 2;
-    config.fb_location  = CAMERA_FB_IN_PSRAM;
-    config.grab_mode    = CAMERA_GRAB_LATEST;
-
     if (!esp_psram_is_initialized()) {
         ESP_LOGE(TAG, "PSRAM is REQUIRED for VGA buffers!");
         return ESP_ERR_NOT_SUPPORTED;
     }
 
+    g_camera_sw_jpeg_mode = false;
+    esp_err_t last_err = ESP_FAIL;
+
+    /* Bước 1: Thử Hardware JPEG chuẩn (16MHz trước, rồi 10MHz nếu không lỗi chân dữ liệu) */
+    recover_sccb_bus();
+    camera_config_t config;
+    fill_camera_base_config(&config, 16000000, PIXFORMAT_JPEG, FRAMESIZE_VGA);
+    ESP_LOGI(TAG, "Probing camera HW-JPEG @ XCLK=16000000 Hz...");
     esp_err_t err = esp_camera_init(&config);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "First probe failed (0x%x). Retrying with 10MHz XCLK...", err);
+    if (err == ESP_OK) {
+        sensor_t *s = esp_camera_sensor_get();
+        if (s) optimizeOV5640Registers(s);
+        vTaskDelay(pdMS_TO_TICKS(120));
+        camera_fb_t *test_fb = esp_camera_fb_get();
+        if (test_fb && test_fb->len >= 4 && test_fb->buf[0] == 0xFF && test_fb->buf[1] == 0xD8) {
+            ESP_LOGI(TAG, "Camera HW-JPEG verified OK @ 16MHz (test frame=%u bytes)", (unsigned)test_fb->len);
+            esp_camera_fb_return(test_fb);
+            return ESP_OK;
+        }
+        if (test_fb) esp_camera_fb_return(test_fb);
         esp_camera_deinit();
+        vTaskDelay(pdMS_TO_TICKS(80));
+    } else {
+        last_err = err;
+        esp_camera_deinit();
+    }
+
+    /* Bước 2: Chạy chẩn đoán bus D0-D7 */
+    uint8_t stuck_mask = run_camera_data_bus_diag();
+
+    if (stuck_mask == 0) {
+        /* Không có chân nào bị đứt/kẹt -> thử HW-JPEG ở 10MHz */
         recover_sccb_bus();
-        config.xclk_freq_hz = 10000000;
+        fill_camera_base_config(&config, 10000000, PIXFORMAT_JPEG, FRAMESIZE_VGA);
+        ESP_LOGI(TAG, "No stuck pins detected; retrying HW-JPEG @ XCLK=10000000 Hz...");
         err = esp_camera_init(&config);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "FATAL: Camera Init Failed: 0x%x!", err);
-            return err;
+        if (err == ESP_OK) {
+            sensor_t *s = esp_camera_sensor_get();
+            if (s) optimizeOV5640Registers(s);
+            vTaskDelay(pdMS_TO_TICKS(120));
+            camera_fb_t *test_fb = esp_camera_fb_get();
+            if (test_fb && test_fb->len >= 4 && test_fb->buf[0] == 0xFF && test_fb->buf[1] == 0xD8) {
+                ESP_LOGI(TAG, "Camera HW-JPEG verified OK @ 10MHz (test frame=%u bytes)", (unsigned)test_fb->len);
+                esp_camera_fb_return(test_fb);
+                return ESP_OK;
+            }
+            if (test_fb) esp_camera_fb_return(test_fb);
+            esp_camera_deinit();
         }
     }
 
-    sensor_t *s = esp_camera_sensor_get();
-    if (!s) return ESP_FAIL;
+    /* Bước 3: Tự động cứu hộ sang GRAYSCALE + Software JPEG ưu tiên độ nét cao (VGA 640x480 @ 20MHz XCLK, Q=72) */
+    const framesize_t sw_sizes[] = { FRAMESIZE_VGA, FRAMESIZE_HVGA, FRAMESIZE_QVGA };
+    const char *sw_names[] = { "VGA 640x480", "HVGA 480x320", "QVGA 320x240" };
 
-    optimizeOV5640Registers(s);
-    return ESP_OK;
+    for (size_t i = 0; i < sizeof(sw_sizes) / sizeof(sw_sizes[0]); i++) {
+        recover_sccb_bus();
+        camera_config_t sw_cfg;
+        fill_camera_base_config(&sw_cfg, 20000000, PIXFORMAT_GRAYSCALE, sw_sizes[i]);
+        sw_cfg.fb_count = 3;
+        ESP_LOGW(TAG, "CAM_RECOVERY: Activating GRAYSCALE + SW-JPEG fallback (%s @ 20MHz)...", sw_names[i]);
+        err = esp_camera_init(&sw_cfg);
+        if (err != ESP_OK) {
+            last_err = err;
+            esp_camera_deinit();
+            continue;
+        }
+        sensor_t *s = esp_camera_sensor_get();
+        if (s) optimizeOV5640Registers(s);
+        vTaskDelay(pdMS_TO_TICKS(150));
+        camera_fb_t *test_fb = esp_camera_fb_get();
+        if (test_fb && test_fb->len > 1000) {
+            uint8_t *jpg_buf = NULL;
+            size_t jpg_len = 0;
+            bool ok = frame2jpg(test_fb, 72, &jpg_buf, &jpg_len);
+            esp_camera_fb_return(test_fb);
+            if (ok && jpg_buf && jpg_len > 100) {
+                ESP_LOGW(TAG, "CAM_RECOVERY: SUCCESS! GRAYSCALE (%s) -> SW-JPEG (%u bytes) active!",
+                         sw_names[i], (unsigned)jpg_len);
+                free(jpg_buf);
+                g_camera_sw_jpeg_mode = true;
+                return ESP_OK;
+            }
+            if (jpg_buf) free(jpg_buf);
+        } else {
+            if (test_fb) esp_camera_fb_return(test_fb);
+        }
+        esp_camera_deinit();
+    }
+
+    return last_err;
 }
 
 /* ============================================================================
@@ -2142,15 +2328,35 @@ static esp_err_t jpg_stream_httpd_handler(httpd_req_t *req)
             break;
         }
 
+        uint8_t *jpg_buf = fb->buf;
+        size_t jpg_len = fb->len;
+        bool jpg_alloc = false;
+
+        if (fb->format != PIXFORMAT_JPEG) {
+            jpg_buf = NULL;
+            jpg_len = 0;
+            if (!frame2jpg(fb, 75, &jpg_buf, &jpg_len) || !jpg_buf || jpg_len < 4) {
+                esp_camera_fb_return(fb);
+                fb = NULL;
+                if (jpg_buf) free(jpg_buf);
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
+            }
+            jpg_alloc = true;
+        }
+
         if (res == ESP_OK) {
             res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
         }
         if (res == ESP_OK) {
-            size_t hlen = snprintf(part_buf, 64, _STREAM_PART, (uint32_t)fb->len);
+            size_t hlen = snprintf(part_buf, 64, _STREAM_PART, (uint32_t)jpg_len);
             res = httpd_resp_send_chunk(req, part_buf, hlen);
         }
         if (res == ESP_OK) {
-            res = httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len);
+            res = httpd_resp_send_chunk(req, (const char *)jpg_buf, jpg_len);
+        }
+        if (jpg_alloc && jpg_buf) {
+            free(jpg_buf);
         }
         esp_camera_fb_return(fb);
         fb = NULL;
@@ -3151,7 +3357,8 @@ static void start_standalone_webserver(void)
 static void camera_stream_task(void *pvParameters)
 {
     uint32_t frame_seq = 0;
-    ESP_LOGI(TAG, "Starting camera streaming loop @ %d baud...", UART_BAUD_RATE);
+    ESP_LOGI(TAG, "Starting camera streaming loop @ %d baud (sw_jpeg=%d)...",
+             UART_BAUD_RATE, g_camera_sw_jpeg_mode ? 1 : 0);
     vTaskDelay(pdMS_TO_TICKS(400));
 
     while (1) {
@@ -3161,22 +3368,85 @@ static void camera_stream_task(void *pvParameters)
             continue;
         }
 
-        if (fb->len >= 4 && fb->buf[0] == 0xFF && fb->buf[1] == 0xD8) {
-            if (s_snap_requested && !s_snap_ready && s_snap_jpg_buf && fb->len <= SNAP_JPG_MAX_BYTES) {
-                memcpy(s_snap_jpg_buf, fb->buf, fb->len);
-                s_snap_jpg_len = fb->len;
+        /* Chế độ GRAYSCALE (tự cứu hộ khi cáp camera đứt chân D1):
+         * 1. Cấp ảnh xám thô không nén (640x480 lossless) trực tiếp cho quét QR độc lập -> bỏ qua esp_jpeg_decode (vốn không hỗ trợ Grayscale JPEG), tăng tốc gấp 5 lần!
+         * 2. Chỉ nén SW-JPEG khi cắm USB stream lên PC (khi chạy nguồn ngoài độc lập không tốn CPU nén JPEG). */
+        if (fb->format == PIXFORMAT_GRAYSCALE) {
+            size_t expected_len = (size_t)fb->width * (size_t)fb->height;
+            if (s_snap_requested && !s_snap_ready && s_snap_gray_buf &&
+                fb->width > 0 && fb->height > 0 &&
+                expected_len <= SNAP_GRAY_MAX_BYTES && fb->len >= expected_len) {
+                memcpy(s_snap_gray_buf, fb->buf, expected_len);
+                s_snap_gray_w = (uint16_t)fb->width;
+                s_snap_gray_h = (uint16_t)fb->height;
+                s_snap_is_gray = true;
                 s_snap_ready = true;
                 s_snap_requested = false;
             }
 
             if (is_pc_usb_active() || xTaskGetTickCount() < pdMS_TO_TICKS(15000)) {
-                uint32_t payload_len = (uint32_t)fb->len;
+                uint8_t *jpg_buf = NULL;
+                size_t jpg_len = 0;
+                bool ok = frame2jpg(fb, 72, &jpg_buf, &jpg_len);
+                /* Trả buffer DMA ngay sau khi nén xong để cảm biến chụp khung kế tiếp song song khi truyền UART */
+                esp_camera_fb_return(fb);
+                fb = NULL;
+                if (ok && jpg_buf && jpg_len >= 4 && jpg_buf[0] == 0xFF && jpg_buf[1] == 0xD8) {
+                    uint32_t payload_len = (uint32_t)jpg_len;
+                    if (g_uart_mutex) xSemaphoreTake(g_uart_mutex, portMAX_DELAY);
+                    uart_write_bytes(UART_PORT_NUM, (const char *)SYNC_MAGIC, 4);
+                    uart_write_bytes(UART_PORT_NUM, (const char *)&payload_len, 4);
+                    uart_write_bytes(UART_PORT_NUM, (const char *)&frame_seq, 4);
+                    uart_write_bytes(UART_PORT_NUM, (const char *)jpg_buf, jpg_len);
+                    uart_write_bytes(UART_PORT_NUM, (const char *)END_MAGIC, 4);
+                    if (g_uart_mutex) xSemaphoreGive(g_uart_mutex);
+                    frame_seq++;
+                }
+                if (jpg_buf) free(jpg_buf);
+            } else {
+                esp_camera_fb_return(fb);
+                fb = NULL;
+            }
+            int delay_ms = is_pc_usb_active() ? 1 : 25;
+            vTaskDelay(pdMS_TO_TICKS(delay_ms));
+            continue;
+        }
+
+        uint8_t *jpg_buf = fb->buf;
+        size_t jpg_len = fb->len;
+        bool jpg_alloc = false;
+
+        if (fb->format != PIXFORMAT_JPEG) {
+            jpg_buf = NULL;
+            jpg_len = 0;
+            if (frame2jpg(fb, 72, &jpg_buf, &jpg_len) && jpg_buf && jpg_len >= 4) {
+                jpg_alloc = true;
+            } else {
+                if (jpg_buf) free(jpg_buf);
+                jpg_buf = NULL;
+                jpg_len = 0;
+            }
+            esp_camera_fb_return(fb);
+            fb = NULL;
+        }
+
+        if (jpg_buf && jpg_len >= 4 && jpg_buf[0] == 0xFF && jpg_buf[1] == 0xD8) {
+            if (s_snap_requested && !s_snap_ready && s_snap_jpg_buf && jpg_len <= SNAP_JPG_MAX_BYTES) {
+                memcpy(s_snap_jpg_buf, jpg_buf, jpg_len);
+                s_snap_jpg_len = jpg_len;
+                s_snap_is_gray = false;
+                s_snap_ready = true;
+                s_snap_requested = false;
+            }
+
+            if (is_pc_usb_active() || xTaskGetTickCount() < pdMS_TO_TICKS(15000)) {
+                uint32_t payload_len = (uint32_t)jpg_len;
 
                 if (g_uart_mutex) xSemaphoreTake(g_uart_mutex, portMAX_DELAY);
                 uart_write_bytes(UART_PORT_NUM, (const char *)SYNC_MAGIC, 4);
                 uart_write_bytes(UART_PORT_NUM, (const char *)&payload_len, 4);
                 uart_write_bytes(UART_PORT_NUM, (const char *)&frame_seq, 4);
-                uart_write_bytes(UART_PORT_NUM, (const char *)fb->buf, fb->len);
+                uart_write_bytes(UART_PORT_NUM, (const char *)jpg_buf, jpg_len);
                 uart_write_bytes(UART_PORT_NUM, (const char *)END_MAGIC, 4);
                 if (g_uart_mutex) xSemaphoreGive(g_uart_mutex);
 
@@ -3184,8 +3454,13 @@ static void camera_stream_task(void *pvParameters)
             }
         }
 
-        esp_camera_fb_return(fb);
-        int delay_ms = is_pc_usb_active() ? 5 : 12;
+        if (jpg_alloc && jpg_buf) {
+            free(jpg_buf);
+        }
+        if (fb) {
+            esp_camera_fb_return(fb);
+        }
+        int delay_ms = (is_pc_usb_active() && g_camera_sw_jpeg_mode) ? 1 : (is_pc_usb_active() ? 5 : 12);
         vTaskDelay(pdMS_TO_TICKS(delay_ms));
     }
 }
@@ -3204,6 +3479,7 @@ static void standalone_qr_task(void *pvParameters)
     uint32_t last_code_cooldown_ms = 8000;
     uint32_t scan_cycle = 0;
     bool resources_ready = false;
+    bool logged_gray_direct = false;
 
     while (1) {
         if (is_pc_usb_active() || !g_wifi_connected || !is_iot_device_paired_active()) {
@@ -3215,12 +3491,15 @@ static void standalone_qr_task(void *pvParameters)
             if (!s_snap_jpg_buf) {
                 s_snap_jpg_buf = (uint8_t *)heap_caps_malloc(SNAP_JPG_MAX_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
             }
+            if (!s_snap_gray_buf) {
+                s_snap_gray_buf = (uint8_t *)heap_caps_malloc(SNAP_GRAY_MAX_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            }
             rgb_buf = (uint8_t *)heap_caps_malloc(rgb_cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
             qr_code = (struct quirc_code *)heap_caps_calloc(1, sizeof(struct quirc_code), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
             qr_data = (struct quirc_data *)heap_caps_calloc(1, sizeof(struct quirc_data), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
             qr_ctx = quirc_new();
 
-            if (!s_snap_jpg_buf || !rgb_buf || !qr_code || !qr_data || !qr_ctx) {
+            if (!s_snap_jpg_buf || !s_snap_gray_buf || !rgb_buf || !qr_code || !qr_data || !qr_ctx) {
                 ESP_LOGE(TAG, "Standalone QR PSRAM init failed!");
                 vTaskDelay(pdMS_TO_TICKS(2000));
                 continue;
@@ -3233,41 +3512,61 @@ static void standalone_qr_task(void *pvParameters)
             cur_w = 640;
             cur_h = 480;
             resources_ready = true;
-            ESP_LOGI(TAG, "Standalone onboard QR scanner armed (auto_confirm=%d).", g_auto_confirm ? 1 : 0);
+            ESP_LOGI(TAG, "Standalone onboard QR scanner armed (auto_confirm=%d, sw_gray=%d).",
+                     g_auto_confirm ? 1 : 0, g_camera_sw_jpeg_mode ? 1 : 0);
         }
 
+        s_snap_is_gray = false;
         s_snap_ready = false;
         s_snap_requested = true;
         int wait_tries = 0;
-        while (!s_snap_ready && wait_tries < 15) {
+        while (!s_snap_ready && wait_tries < 40) {
             vTaskDelay(pdMS_TO_TICKS(15));
             wait_tries++;
         }
-        if (!s_snap_ready || s_snap_jpg_len < 128) {
+        if (!s_snap_ready || (!s_snap_is_gray && s_snap_jpg_len < 128)) {
             s_snap_requested = false;
-            vTaskDelay(pdMS_TO_TICKS(150));
+            vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
 
-        esp_jpeg_image_cfg_t jcfg = {
-            .indata = s_snap_jpg_buf,
-            .indata_size = (uint32_t)s_snap_jpg_len,
-            .outbuf = rgb_buf,
-            .outbuf_size = (uint32_t)rgb_cap,
-            .out_format = JPEG_IMAGE_FORMAT_RGB888,
-            .out_scale = JPEG_IMAGE_SCALE_0,
-            .flags = { .swap_color_bytes = 0 },
-        };
-        esp_jpeg_image_output_t jout = {0};
-        if (esp_jpeg_decode(&jcfg, &jout) != ESP_OK || jout.width == 0 || jout.height == 0) {
-            vTaskDelay(pdMS_TO_TICKS(180));
-            continue;
+        int src_w = 0, src_h = 0;
+        bool use_direct_gray = s_snap_is_gray;
+
+        if (use_direct_gray) {
+            src_w = (int)s_snap_gray_w;
+            src_h = (int)s_snap_gray_h;
+            if (src_w <= 0 || src_h <= 0 || (size_t)src_w * (size_t)src_h > SNAP_GRAY_MAX_BYTES) {
+                vTaskDelay(pdMS_TO_TICKS(100));
+                continue;
+            }
+            if (!logged_gray_direct) {
+                logged_gray_direct = true;
+                ESP_LOGI(TAG, "Standalone QR active: direct lossless GRAYSCALE %dx%d -> quirc!", src_w, src_h);
+            }
+        } else {
+            esp_jpeg_image_cfg_t jcfg = {
+                .indata = s_snap_jpg_buf,
+                .indata_size = (uint32_t)s_snap_jpg_len,
+                .outbuf = rgb_buf,
+                .outbuf_size = (uint32_t)rgb_cap,
+                .out_format = JPEG_IMAGE_FORMAT_RGB888,
+                .out_scale = JPEG_IMAGE_SCALE_0,
+                .flags = { .swap_color_bytes = 0 },
+            };
+            esp_jpeg_image_output_t jout = {0};
+            if (esp_jpeg_decode(&jcfg, &jout) != ESP_OK || jout.width == 0 || jout.height == 0) {
+                vTaskDelay(pdMS_TO_TICKS(180));
+                continue;
+            }
+            src_w = (int)jout.width;
+            src_h = (int)jout.height;
         }
 
-        if ((int)jout.width != cur_w || (int)jout.height != cur_h) {
-            if (quirc_resize(qr_ctx, jout.width, jout.height) == 0) {
-                cur_w = jout.width;
-                cur_h = jout.height;
+        if (src_w != cur_w || src_h != cur_h) {
+            if (quirc_resize(qr_ctx, src_w, src_h) == 0) {
+                cur_w = src_w;
+                cur_h = src_h;
             } else {
                 vTaskDelay(pdMS_TO_TICKS(250));
                 continue;
@@ -3278,12 +3577,22 @@ static void standalone_qr_task(void *pvParameters)
         uint8_t *gray = quirc_begin(qr_ctx, &qw, &qh);
         if (gray) {
             bool invert_pass = ((scan_cycle++ & 1) != 0);
-            size_t total_px = (size_t)jout.width * (size_t)jout.height;
-            const uint8_t *rgb = rgb_buf;
-            for (size_t i = 0; i < total_px; i++) {
-                uint8_t lum = (uint8_t)((77U * rgb[0] + 150U * rgb[1] + 29U * rgb[2]) >> 8);
-                gray[i] = invert_pass ? (uint8_t)(255U - lum) : lum;
-                rgb += 3;
+            size_t total_px = (size_t)src_w * (size_t)src_h;
+            if (use_direct_gray) {
+                if (!invert_pass) {
+                    memcpy(gray, s_snap_gray_buf, total_px);
+                } else {
+                    for (size_t i = 0; i < total_px; i++) {
+                        gray[i] = (uint8_t)(255U - s_snap_gray_buf[i]);
+                    }
+                }
+            } else {
+                const uint8_t *rgb = rgb_buf;
+                for (size_t i = 0; i < total_px; i++) {
+                    uint8_t lum = (uint8_t)((77U * rgb[0] + 150U * rgb[1] + 29U * rgb[2]) >> 8);
+                    gray[i] = invert_pass ? (uint8_t)(255U - lum) : lum;
+                    rgb += 3;
+                }
             }
             vTaskDelay(pdMS_TO_TICKS(5));
             quirc_end(qr_ctx);
@@ -4198,7 +4507,7 @@ static void uart_cmd_task(void *pvParameters)
                             safe_uart_write_string("LED:GREEN_ON_60S\n");
                         } else if (strcmp(s_cmd_str, "LED:RED") == 0 || strcmp(s_cmd_str, "LEDRED") == 0) {
                             led_trigger_red_error();
-                            safe_uart_write_string("LED:RED_ON_60S\n");
+                            safe_uart_write_string("LED:RED_ON_30S\n");
                         } else if (strcmp(s_cmd_str, "LED:OFF") == 0 || strcmp(s_cmd_str, "LEDOFF") == 0) {
                             led_turn_off_all();
                             safe_uart_write_string("LED:ALL_OFF\n");
@@ -4443,11 +4752,11 @@ void app_main(void)
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
         .source_clk = UART_SCLK_DEFAULT,
     };
-    ESP_ERROR_CHECK(uart_driver_install(UART_PORT_NUM, UART_BUF_SIZE, UART_BUF_SIZE, 0, NULL, 0));
+    ESP_ERROR_CHECK(uart_driver_install(UART_PORT_NUM, UART_RX_BUF_SIZE, UART_TX_BUF_SIZE, 0, NULL, 0));
     ESP_ERROR_CHECK(uart_param_config(UART_PORT_NUM, &uart_config));
 
-    /* 6. Khởi chạy Task Streaming Video trên Core 1 */
-    xTaskCreatePinnedToCore(camera_stream_task, "cam_stream", 4096, NULL, 5, NULL, 1);
+    /* 6. Khởi chạy Task Streaming Video trên Core 1 (12KB stack cho SW-JPEG recovery khi cần) */
+    xTaskCreatePinnedToCore(camera_stream_task, "cam_stream", 12288, NULL, 5, NULL, 1);
 
     /* 7. Khởi chạy Task Nhận Lệnh & Telemetry trên Core 0 */
     xTaskCreatePinnedToCore(uart_cmd_task, "uart_cmd", 14336, NULL, 4, NULL, 0);
