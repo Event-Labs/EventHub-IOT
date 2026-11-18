@@ -2042,36 +2042,55 @@ class CheckinHTTPHandler(BaseHTTPRequestHandler):
                 with lk:
                     raw_resp = res_dict.get("content", b"")
                 if raw_resp:
+                    raw_text = raw_resp.decode("utf-8", errors="ignore").strip()
                     print(f"   [ESP32 Response via UART]: {len(raw_resp)} bytes")
                     status_to_send = 200
+                    parsed = None
                     try:
-                        parsed = json.loads(raw_resp.decode("utf-8", errors="ignore"))
-                        if isinstance(parsed, dict):
-                            self._sync_iot_cfg_into_state(parsed, from_pc_route=False)
-                            res_tag = str(parsed.get("result", "")).upper()
-                            err_code = str(parsed.get("errorCode", "") or parsed.get("code", "")).upper()
-                            msg_lower = str(parsed.get("message", "")).lower()
-                            if parsed.get("statusCode") and isinstance(parsed.get("statusCode"), int):
-                                status_to_send = parsed["statusCode"]
-                            elif res_tag == "USED":
-                                status_to_send = 409
-                            elif res_tag in ("DEVICE_DISABLED", "WRONG_EVENT"):
+                        parsed = json.loads(raw_text)
+                    except Exception as json_err:
+                        print(f"   [!] Cảnh báo JSON từ UART bị cắt/nhiễu ({json_err}): {raw_text[:180]}")
+                        # Thử khôi phục JSON hợp lệ nếu ESP32 đã chốt OK/USED (tránh gửi lại gây lỗi 409 giả)
+                        m_res = re.search(r'"result"\s*:\s*"([A-Z_]+)"', raw_text)
+                        if m_res:
+                            salv_res = m_res.group(1).upper()
+                            m_code = re.search(r'"ticket_code"\s*:\s*"([^"]+)"', raw_text)
+                            m_msg = re.search(r'"message"\s*:\s*"([^"]+)"', raw_text)
+                            parsed = {
+                                "success": salv_res in ("OK", "VERIFIED"),
+                                "result": salv_res,
+                                "ticket_code": m_code.group(1) if m_code else clean_code,
+                                "message": m_msg.group(1) if m_msg else (
+                                    "Check-in thành công qua ESP32" if salv_res == "OK" else "Đã nhận kết quả từ ESP32"
+                                ),
+                            }
+                            print(f"   [+] Đã tự khôi phục JSON hợp lệ từ UART: result={salv_res}, code={parsed['ticket_code']}")
+
+                    if isinstance(parsed, dict):
+                        self._sync_iot_cfg_into_state(parsed, from_pc_route=False)
+                        res_tag = str(parsed.get("result", "")).upper()
+                        err_code = str(parsed.get("errorCode", "") or parsed.get("code", "")).upper()
+                        msg_lower = str(parsed.get("message", "")).lower()
+                        if parsed.get("statusCode") and isinstance(parsed.get("statusCode"), int):
+                            status_to_send = parsed["statusCode"]
+                        elif res_tag == "USED":
+                            status_to_send = 409
+                        elif res_tag in ("DEVICE_DISABLED", "WRONG_EVENT"):
+                            status_to_send = 403
+                        elif res_tag == "NOT_FOUND":
+                            status_to_send = 404
+                        elif res_tag in ("NO_EVENT_ASSIGNED",) or err_code == "IOT_NOT_PAIRED":
+                            status_to_send = 400
+                        elif parsed.get("success") is False:
+                            if "401" in err_code or "unauthorized" in msg_lower:
+                                status_to_send = 401
+                            elif "403" in err_code or "forbidden" in msg_lower:
                                 status_to_send = 403
-                            elif res_tag == "NOT_FOUND":
-                                status_to_send = 404
-                            elif res_tag in ("NO_EVENT_ASSIGNED",) or err_code == "IOT_NOT_PAIRED":
-                                status_to_send = 400
-                            elif parsed.get("success") is False:
-                                if "401" in err_code or "unauthorized" in msg_lower:
-                                    status_to_send = 401
-                                elif "403" in err_code or "forbidden" in msg_lower:
-                                    status_to_send = 403
-                                elif "loi ket noi" in msg_lower:
-                                    status_to_send = 502
-                    except Exception:
-                        pass
-                    self._send_proxied_json_response(status_to_send, raw_resp, "esp32")
-                    return
+                            elif "loi ket noi" in msg_lower:
+                                status_to_send = 502
+                        clean_bytes = json.dumps(parsed, ensure_ascii=False).encode("utf-8")
+                        self._send_proxied_json_response(status_to_send, clean_bytes, "esp32")
+                        return
 
         # Fallback sang HTTP Local nếu chạy độc lập (không cắm dây USB)
         if esp_ip and esp_ip != "0.0.0.0":

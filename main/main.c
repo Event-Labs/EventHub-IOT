@@ -10,6 +10,7 @@
  */
 
 #include <stdio.h>
+#include <stdarg.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -115,8 +116,7 @@ static const uint8_t END_MAGIC[4]  = {0x55, 0xAA, 0x55, 0xAA};
 #define LED_RED_PIN             42                   /* GPIO 42: Đèn LED Đỏ (Vé lỗi / Đã check-in) */
 #endif
 
-#define STATUS_LED_GREEN_HOLD_MS 60000               /* Thời gian sáng đèn xanh: 60,000ms (1 phút) */
-#define STATUS_LED_RED_HOLD_MS   30000               /* Thời gian sáng đèn đỏ: 30,000ms (30 giây) */
+#define STATUS_LED_HOLD_MS      60000                /* Thời gian sáng đèn: 60,000ms (1 phút) */
 
 /* Wi-Fi & Network Global State */
 #define MAX_WIFI_PROFILES 4
@@ -477,6 +477,29 @@ static void safe_uart_write_string(const char *str)
     }
 }
 
+/* Chuyển hướng toàn bộ ESP_LOGI/W/E qua g_uart_mutex để tuyệt đối không xen ngang làm đứt JSON CHECKINRESP hoặc frame camera */
+static int safe_uart_log_vprintf(const char *fmt, va_list args)
+{
+    if (xPortInIsrContext()) {
+        return 0;
+    }
+    char log_buf[256];
+    int len = vsnprintf(log_buf, sizeof(log_buf), fmt, args);
+    if (len <= 0) return 0;
+    if (len >= (int)sizeof(log_buf)) {
+        len = (int)sizeof(log_buf) - 1;
+    }
+    if (g_uart_mutex) {
+        if (xSemaphoreTake(g_uart_mutex, pdMS_TO_TICKS(30)) == pdTRUE) {
+            uart_write_bytes(UART_PORT_NUM, log_buf, len);
+            xSemaphoreGive(g_uart_mutex);
+        }
+    } else {
+        uart_write_bytes(UART_PORT_NUM, log_buf, len);
+    }
+    return len;
+}
+
 /* ============================================================================
  * 2. ĐIỀU KHIỂN THIẾT BỊ NGOẠI VI (BUZZER & LED PWM)
  * ============================================================================ */
@@ -625,8 +648,6 @@ static bool is_ir_obstacle_detected(void)
     return gpio_get_level(IR_SENSOR_PIN) == 0;
 }
 
-static void led_turn_off_green(void);
-
 static void servo_gate_task(void *pvParameters)
 {
     (void)pvParameters;
@@ -644,7 +665,7 @@ static void servo_gate_task(void *pvParameters)
         /* Trạng thái thông minh với cảm biến hồng ngoại:
          * 1. Cổng mở góc 90 độ.
          * 2. Chờ người bước vào cổng (cảm biến IR phát hiện có người = LOW).
-         * 3. Khi người đã bước qua hẳn khỏi cổng (cảm biến IR quay lại HIGH) -> Đóng cổng & tắt đèn xanh!
+         * 3. Khi người đã bước qua hẳn khỏi cổng (cảm biến IR quay lại HIGH) -> Đóng cổng!
          * 4. Kèm timeout an toàn (SERVO_GATE_SAFETY_TIMEOUT_MS) nếu người đổi ý không bước vào. */
         TickType_t start_tick = xTaskGetTickCount();
         bool person_entered = false;
@@ -665,17 +686,9 @@ static void servo_gate_task(void *pvParameters)
                 }
             } else {
                 if (person_entered) {
-                    /* Người đã đi qua hẳn khỏi cảm biến hồng ngoại! Chờ 400ms an toàn rồi đóng cổng & tắt đèn xanh */
+                    /* Người đã đi qua hẳn khỏi cảm biến hồng ngoại! Chờ 400ms an toàn rồi đóng cổng */
                     vTaskDelay(pdMS_TO_TICKS(400));
-                    if (ulTaskNotifyTake(pdTRUE, 0) > 0) {
-                        /* Có vé hợp lệ kế tiếp vừa quét trong lúc người trước rời cổng -> giữ cổng mở & giữ đèn xanh */
-                        ESP_LOGI(TAG, "Servo Gate: Next valid ticket scanned right after exit, keeping gate open...");
-                        start_tick = xTaskGetTickCount();
-                        person_entered = false;
-                        continue;
-                    }
-                    ESP_LOGI(TAG, "Servo Gate: IR Sensor -> Person PASSED completely. CLOSING GATE (%d deg) & turning GREEN LED OFF...", SERVO_GATE_CLOSE_DEGREE);
-                    led_turn_off_green();
+                    ESP_LOGI(TAG, "Servo Gate: IR Sensor -> Person PASSED completely. CLOSING GATE (%d deg)...", SERVO_GATE_CLOSE_DEGREE);
                     break;
                 }
             }
@@ -695,7 +708,7 @@ static void servo_gate_task(void *pvParameters)
 }
 
 /* ============================================================================
- * 2.2. ĐÈN LED BÁO TRẠNG THÁI SOÁT VÉ (LED XANH: 60s / TẮT KHI QUA CỔNG, LED ĐỎ: 30s)
+ * 2.2. ĐÈN LED BÁO TRẠNG THÁI SOÁT VÉ (LED XANH LÁ & ĐỎ - SÁNG 1 PHÚT)
  * ============================================================================ */
 static TimerHandle_t s_led_green_timer = NULL;
 static TimerHandle_t s_led_red_timer = NULL;
@@ -711,14 +724,7 @@ static void led_red_timer_cb(TimerHandle_t xTimer)
 {
     (void)xTimer;
     gpio_set_level(LED_RED_PIN, 0);
-    ESP_LOGI(TAG, "Status LED: Red LED turned OFF after 30s timeout");
-}
-
-static void led_turn_off_green(void)
-{
-    if (s_led_green_timer) xTimerStop(s_led_green_timer, 0);
-    gpio_set_level(LED_GREEN_PIN, 0);
-    ESP_LOGI(TAG, "Status LED: Green LED turned OFF (person passed gate)");
+    ESP_LOGI(TAG, "Status LED: Red LED turned OFF after 60s timeout");
 }
 
 static void led_turn_off_all(void)
@@ -763,12 +769,12 @@ void led_trigger_red_error(void)
     if (s_led_green_timer) xTimerStop(s_led_green_timer, 0);
     gpio_set_level(LED_GREEN_PIN, 0);
 
-    /* Bật đèn đỏ và kích hoạt/gia hạn bộ đếm 30 giây */
+    /* Bật đèn đỏ và kích hoạt/gia hạn bộ đếm 1 phút (60s) */
     gpio_set_level(LED_RED_PIN, 1);
     if (s_led_red_timer) {
         xTimerReset(s_led_red_timer, 0);
     }
-    ESP_LOGI(TAG, "Status LED: RED ON for 30s (Ticket Error/Used)");
+    ESP_LOGI(TAG, "Status LED: RED ON for 60s (Ticket Error/Used)");
 }
 
 static void hw_test_task(void *pvParameters)
@@ -835,13 +841,13 @@ static void init_status_leds(void)
     gpio_set_drive_capability(LED_RED_PIN, GPIO_DRIVE_CAP_3);
     gpio_set_level(LED_RED_PIN, 0);
 
-    /* Khởi tạo FreeRTOS One-shot Timers (LED Xanh: 60s, LED Đỏ: 30s) */
+    /* Khởi tạo FreeRTOS One-shot Timers (60 giây) */
     if (!s_led_green_timer) {
-        s_led_green_timer = xTimerCreate("led_grn_tmr", pdMS_TO_TICKS(STATUS_LED_GREEN_HOLD_MS),
+        s_led_green_timer = xTimerCreate("led_grn_tmr", pdMS_TO_TICKS(STATUS_LED_HOLD_MS),
                                           pdFALSE, NULL, led_green_timer_cb);
     }
     if (!s_led_red_timer) {
-        s_led_red_timer   = xTimerCreate("led_red_tmr", pdMS_TO_TICKS(STATUS_LED_RED_HOLD_MS),
+        s_led_red_timer   = xTimerCreate("led_red_tmr", pdMS_TO_TICKS(STATUS_LED_HOLD_MS),
                                           pdFALSE, NULL, led_red_timer_cb);
     }
 
@@ -852,7 +858,7 @@ static void init_status_leds(void)
     gpio_set_level(LED_GREEN_PIN, 0);
     gpio_set_level(LED_RED_PIN, 0);
 
-    ESP_LOGI(TAG, "Status LEDs initialized safely on GPIO %d (Green 60s/IR-off) & GPIO %d (Red 30s) - JTAG detached",
+    ESP_LOGI(TAG, "Status LEDs initialized safely on GPIO %d (Green) & GPIO %d (Red) - JTAG detached, 60s auto-off",
              LED_GREEN_PIN, LED_RED_PIN);
 }
 
@@ -3651,7 +3657,7 @@ static void standalone_qr_task(void *pvParameters)
                                 for (char *rp = v_resp; *rp; rp++) {
                                     if (*rp == '\r' || *rp == '\n') *rp = ' ';
                                 }
-                                snprintf(uart_line, 4120, "CHECKINRESP:%s\n", v_resp);
+                                snprintf(uart_line, 4120, "\nCHECKINRESP:%s\n", v_resp);
                                 safe_uart_write_string(uart_line);
                                 free(uart_line);
                             }
@@ -4317,23 +4323,29 @@ static void uart_cmd_task(void *pvParameters)
                             char *uart_line = (char *)malloc(4120);
                             if (api_resp && uart_line) {
                                 api_resp[0] = '\0';
-                                if (is_iot_device_paired_active()) {
-                                    int http_code = -1;
+                                int http_code = -1;
+                                bool paired_ok = is_iot_device_paired_active();
+                                if (paired_ok) {
                                     esp32_iot_scan_ticket(qr_p, is_checkin ? "checkin" : "verify",
                                                           api_resp, 4096, &http_code);
-                                    process_iot_scan_response(qr_p, clean_qr, api_resp, http_code, NULL);
                                 } else {
                                     snprintf(api_resp, 4096,
                                              "{\"success\":false,\"errorCode\":\"IOT_NOT_PAIRED\",\"statusCode\":400,"
                                              "\"message\":\"ESP32 chua duoc Admin duyet ghep noi IoT!\"}");
-                                    oled_show_ticket_status(OLED_TICKET_NET_ERR, clean_qr, "CHUA GHEP IOT");
-                                    buzzer_beep(240);
                                 }
                                 for (char *rp = api_resp; *rp; rp++) {
                                     if (*rp == '\r' || *rp == '\n') *rp = ' ';
                                 }
-                                snprintf(uart_line, 4120, "%s:%s\n", is_checkin ? "CHECKINRESP" : "VERIFYRESP", api_resp);
+                                /* Gửi kết quả JSON về PC NGAY LẬP TỨC trước khi bíp còi/mở servo để giao diện Web cập nhật tức thì! */
+                                snprintf(uart_line, 4120, "\n%s:%s\n", is_checkin ? "CHECKINRESP" : "VERIFYRESP", api_resp);
                                 safe_uart_write_string(uart_line);
+
+                                if (paired_ok) {
+                                    process_iot_scan_response(qr_p, clean_qr, api_resp, http_code, NULL);
+                                } else {
+                                    oled_show_ticket_status(OLED_TICKET_NET_ERR, clean_qr, "CHUA GHEP IOT");
+                                    buzzer_beep(240);
+                                }
                             }
                             free(uart_line);
                             free(api_resp);
@@ -4507,7 +4519,7 @@ static void uart_cmd_task(void *pvParameters)
                             safe_uart_write_string("LED:GREEN_ON_60S\n");
                         } else if (strcmp(s_cmd_str, "LED:RED") == 0 || strcmp(s_cmd_str, "LEDRED") == 0) {
                             led_trigger_red_error();
-                            safe_uart_write_string("LED:RED_ON_30S\n");
+                            safe_uart_write_string("LED:RED_ON_60S\n");
                         } else if (strcmp(s_cmd_str, "LED:OFF") == 0 || strcmp(s_cmd_str, "LEDOFF") == 0) {
                             led_turn_off_all();
                             safe_uart_write_string("LED:ALL_OFF\n");
@@ -4754,6 +4766,9 @@ void app_main(void)
     };
     ESP_ERROR_CHECK(uart_driver_install(UART_PORT_NUM, UART_RX_BUF_SIZE, UART_TX_BUF_SIZE, 0, NULL, 0));
     ESP_ERROR_CHECK(uart_param_config(UART_PORT_NUM, &uart_config));
+
+    /* Khóa tất cả ESP_LOGI/W/E qua g_uart_mutex để log hệ thống không bao giờ xen ngang làm đứt JSON hoặc frame camera */
+    esp_log_set_vprintf(safe_uart_log_vprintf);
 
     /* 6. Khởi chạy Task Streaming Video trên Core 1 (12KB stack cho SW-JPEG recovery khi cần) */
     xTaskCreatePinnedToCore(camera_stream_task, "cam_stream", 12288, NULL, 5, NULL, 1);
