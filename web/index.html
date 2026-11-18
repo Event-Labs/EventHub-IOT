@@ -2252,40 +2252,53 @@
       return '🎯 Đang hiển thị: ' + code + ' • Camera sẵn sàng quét vé tiếp';
     }
 
-    // Chuẩn hóa dữ liệu vé đồng bộ 100% với logic StaffQrCheckInPage.jsx của EventHub
+    // Chuẩn hóa dữ liệu vé đồng bộ 100% với logic StaffQrCheckInPage.jsx & IoT API của EventHub
     function normalizeTicket(ticket) {
       if (!ticket) return null;
       const t = ticket.raw || ticket;
+      const cfg = t.device_config || ticket.device_config || (latestEspData && latestEspData.iot) || {};
 
-      const ticketCode = t.ticket_code || t.ticketCode || t.id || 'N/A';
-      const eventName = t.event?.title || t.eventName || t.event_title || 'Không rõ sự kiện';
-      const buyerName = t.buyer?.name || t.order?.buyer_name || t.attendee_name || t.buyerName || 'Không rõ';
-      const buyerEmail = t.buyer?.email || t.order?.buyer_email || t.attendee_email || t.buyerEmail || 'Không rõ';
-      const buyerPhone = t.buyer?.phone || t.order?.buyer_phone || t.buyerPhone || 'Không có';
-      const ticketType = t.ticket_type?.name || t.ticketType || t.ticket_type_name || 'Không rõ hạng vé';
-      
+      const ticketCode = t.ticket_code || t.ticketCode || ticket.ticketCode || ticket.ticket_code || t.id || ticket.id || 'N/A';
+      const eventName =
+        t.event?.title || t.event?.name || t.eventName || t.event_name || t.event_title ||
+        cfg.event_name || ticket.eventName || latestEspData?.iot?.event_name ||
+        cfg.event_code || t.event_code || 'Sự kiện EventHub';
+      const buyerName =
+        t.buyer?.name || t.order?.buyer_name || t.attendee_name || t.buyer_name || t.buyerName ||
+        t.customer_name || t.user?.name || ticket.buyerName || ticket.attendee_name || 'Khách tham dự';
+      const buyerEmail =
+        t.buyer?.email || t.order?.buyer_email || t.attendee_email || t.buyer_email || t.buyerEmail ||
+        t.email || t.user?.email || ticket.buyerEmail || ticket.attendee_email || '--';
+      const buyerPhone =
+        t.buyer?.phone || t.order?.buyer_phone || t.attendee_phone || t.buyer_phone || t.buyerPhone ||
+        t.phone || t.user?.phone || ticket.buyerPhone || '--';
+      const ticketType =
+        (typeof t.ticket_type === 'string' ? t.ticket_type : t.ticket_type?.name) ||
+        t.ticketType || t.ticket_type_name || t.tier_name || ticket.ticketType || '--';
+
       let seat = null;
-      if (t.seat) {
-        if (typeof t.seat === 'string') {
-          seat = t.seat;
-        } else if (t.seat.label) {
-          seat = t.seat.label;
-        } else if (t.seat.row_label || t.seat.seat_number) {
-          seat = `${t.seat.row_label || ''}${t.seat.seat_number || ''}`;
+      const rawSeat = t.seat || ticket.seat;
+      if (rawSeat && rawSeat !== 'Không có' && rawSeat !== '--') {
+        if (typeof rawSeat === 'string') {
+          seat = rawSeat;
+        } else if (rawSeat.label) {
+          seat = rawSeat.label;
+        } else if (rawSeat.row_label || rawSeat.seat_number) {
+          seat = `${rawSeat.row_label || ''}${rawSeat.seat_number || ''}`;
         }
       }
-      if (!seat && t.seat_label) seat = t.seat_label;
-      if (!seat) seat = 'Không có';
+      if (!seat && (t.seat_label || t.seatLabel)) seat = t.seat_label || t.seatLabel;
+      if (!seat) seat = '--';
 
-      const status = (ticket._normalized ? (ticket.status || t.status) : (t.status || ticket.status)) || 'VALID';
+      const status = (ticket._normalized ? (ticket.status || t.status) : (ticket.status || t.status)) || 'VALID';
       const checkedInAt = (ticket._normalized
         ? (ticket.checkedInAt || ticket.checked_in_at || t.checked_in_at || t.checkedInAt)
         : (t.checked_in_at || t.checkedInAt || ticket.checkedInAt || ticket.checked_in_at)) || null;
       const checkedInBy = (ticket._normalized && ticket.checkedInBy)
-        || t.checked_in_by?.name || t.checked_in_by?.email || t.checkedInBy || 'Nhân sự';
+        || t.checked_in_by?.name || t.checked_in_by?.email || t.checkedInBy || ticket.checkedInBy || 'Thiết bị IoT';
 
       return {
-        id: t.id,
+        id: t.id || ticket.id || ticketCode,
         ticketCode,
         eventName,
         buyerName,
@@ -2305,6 +2318,43 @@
       };
     }
 
+    function _isGenericBuyerName(name) {
+      if (!name) return true;
+      const s = String(name).trim().toLowerCase();
+      return !s || s === 'khách' || s === 'khách tham dự' || s === 'không rõ' || s === 'đang xác thực...' || s === '--';
+    }
+
+    // Tự động lấy tên người mua (attendee_name) & thời gian soát thực tế từ /api/history của thiết bị IoT nếu scan API chỉ trả tối giản
+    async function enrichTicketFromDeviceHistory(ticketCode) {
+      if (!ticketCode) return;
+      try {
+        const res = await fetch('/api/history?limit=8');
+        if (!res.ok) return;
+        const hdata = await res.json();
+        if (!hdata || !hdata.success || !Array.isArray(hdata.items)) return;
+
+        const match = hdata.items.find(it => (it.ticket_code || it.code) === ticketCode && !_isGenericBuyerName(it.attendee_name || it.name));
+        const okScan = hdata.items.find(it => (it.ticket_code || it.code) === ticketCode && (it.result === 'OK' || it.success === true) && it.scanned_at);
+
+        if (currentTicket && (currentTicket.ticketCode === ticketCode || currentTicket.id === ticketCode)) {
+          if (match) {
+            const realName = match.attendee_name || match.name;
+            currentTicket.buyerName = realName;
+            currentTicket.attendee_name = realName;
+            const buyerEl = document.getElementById('t-buyer');
+            if (buyerEl && _isGenericBuyerName(buyerEl.innerText)) {
+              buyerEl.innerText = realName;
+            }
+          }
+          if (okScan && okScan.scanned_at && currentTicket.status === 'USED' && !currentTicket._confirmedSource) {
+            const timeEl = document.getElementById('t-checkin-time');
+            const timeStr = formatDateTime(okScan.scanned_at);
+            if (timeEl) timeEl.innerText = timeStr;
+          }
+        }
+      } catch (e) {}
+    }
+
     function buildTicketFromIotResponse(rawValue, cleanCode, data) {
       let parsed = null;
       try {
@@ -2316,23 +2366,39 @@
       const sub = (data && typeof data === 'object') ? (data.data || data.ticket || data) : {};
       const cfg = (data && data.device_config) || (sub && sub.device_config) || (latestEspData && latestEspData.iot) || {};
       const code = sub?.ticket_code || sub?.ticketCode || data?.ticket_code || data?.ticketCode || cleanCode || parsed?.ticket_code || parsed?.code || 'N/A';
-      const eventName = sub?.eventName || sub?.event_name || sub?.event?.title || cfg.event_name || data?.event_name || cfg.event_code || data?.event_code || parsed?.event || (latestEspData?.iot?.event_name) || 'Sự kiện EventHub';
+      const eventName =
+        sub?.event?.title || sub?.event?.name || sub?.eventName || sub?.event_name ||
+        cfg.event_name || data?.event_name || latestEspData?.iot?.event_name ||
+        cfg.event_code || data?.event_code || parsed?.event || 'Sự kiện EventHub';
       const resTag = String(data?.result || sub?.result || '').toUpperCase();
       const isOk = resTag === 'OK' || resTag === 'CONFIRMED';
       const isUsed = resTag === 'USED' || sub?.status === 'USED' || Boolean(sub?.checked_in_at || sub?.checkedInAt);
       const isVerifying = data?.status === 'VERIFYING';
       const status = (isOk || isUsed) ? 'USED' : (isVerifying ? 'VERIFYING' : 'VALID');
 
-      // Tìm kiếm thông tin khách trong lịch sử check-in nếu có
-      const hist = (Array.isArray(checkinHistory) ? checkinHistory.find(h => h.ticketCode === code || h.id === code) : null);
+      // Tìm kiếm thông tin khách trong lịch sử check-in (checkinHistory lưu theo field code & name)
+      const hist = Array.isArray(checkinHistory)
+        ? checkinHistory.find(h => (h.code === code || h.ticketCode === code || h.id === code) && !_isGenericBuyerName(h.name || h.buyerName))
+        : null;
+      const histName = hist ? (hist.name || hist.buyerName) : null;
 
-      const buyerName = sub?.buyerName || sub?.buyer_name || sub?.attendee_name || sub?.buyer?.name || sub?.order?.buyer_name || parsed?.attendee_name || parsed?.name || hist?.buyerName || (isVerifying ? 'Đang xác thực...' : 'Khách tham dự');
-      const buyerEmail = sub?.buyerEmail || sub?.buyer_email || sub?.attendee_email || sub?.buyer?.email || sub?.order?.buyer_email || parsed?.email || hist?.buyerEmail || '--';
-      const buyerPhone = sub?.buyerPhone || sub?.buyer_phone || sub?.buyer?.phone || sub?.order?.buyer_phone || parsed?.phone || hist?.buyerPhone || 'Không có';
-      const ticketType = sub?.ticketType || sub?.ticket_type_name || sub?.ticket_type?.name || data?.ticket_type_name || parsed?.ticket_type || hist?.ticketType || 'Vé tiêu chuẩn';
-      let seat = sub?.seat || sub?.seat_label || data?.seat_label || parsed?.seat || hist?.seat;
-      if (seat && typeof seat === 'object') seat = seat.label || `${seat.row_label || ''}${seat.seat_number || ''}` || 'Không có';
-      if (!seat) seat = 'Không có';
+      const buyerName =
+        sub?.buyer?.name || sub?.order?.buyer_name || sub?.buyerName || sub?.buyer_name || sub?.attendee_name ||
+        data?.attendee_name || data?.buyer_name || parsed?.attendee_name || parsed?.name ||
+        histName || (isVerifying ? 'Đang xác thực...' : 'Khách tham dự');
+      const buyerEmail =
+        sub?.buyer?.email || sub?.order?.buyer_email || sub?.buyerEmail || sub?.buyer_email || sub?.attendee_email ||
+        data?.buyer_email || data?.attendee_email || parsed?.email || hist?.buyerEmail || '--';
+      const buyerPhone =
+        sub?.buyer?.phone || sub?.order?.buyer_phone || sub?.buyerPhone || sub?.buyer_phone || sub?.attendee_phone ||
+        data?.buyer_phone || parsed?.phone || hist?.buyerPhone || '--';
+      const ticketType =
+        (typeof sub?.ticket_type === 'string' ? sub.ticket_type : (sub?.ticket_type?.name || sub?.ticket_type?.title)) ||
+        sub?.ticketType || sub?.ticket_type_name || data?.ticket_type_name || data?.ticket_type ||
+        parsed?.ticket_type || hist?.ticketType || '--';
+      let seat = sub?.seat || sub?.seat_label || sub?.seatLabel || data?.seat || data?.seat_label || parsed?.seat || hist?.seat;
+      if (seat && typeof seat === 'object') seat = seat.label || seat.name || `${seat.row_label || ''}${seat.seat_number || ''}` || '--';
+      if (!seat) seat = '--';
 
       return {
         id: sub?.id || sub?.ticket_id || sub?.ticketId || parsed?.ticket_id || parsed?.id || code,
@@ -2350,6 +2416,7 @@
         eventName: eventName,
         ticketType: ticketType,
         seat: seat,
+        device_config: cfg,
         raw: sub
       };
     }
@@ -2513,7 +2580,7 @@
         const resTag = String(data?.result || '').toUpperCase();
 
         if (res.ok && data.success) {
-          const resolvedTicket = data.data || data.ticket || buildTicketFromIotResponse(rawValue, cleanCode, data);
+          const resolvedTicket = buildTicketFromIotResponse(rawValue, cleanCode, data);
           if (resTag === 'OK') {
             const confirmSource = resolveCurrentConfirmSource(serverRoute);
             statusEl.innerHTML = `
@@ -2525,6 +2592,7 @@
             addCheckinHistory(currentTicket, confirmSource, true);
             playBeep('success');
             showAlert('✅ Check-in thành công: ' + (resolvedTicket.ticketCode || cleanCode), 'success');
+            enrichTicketFromDeviceHistory(resolvedTicket.ticketCode || cleanCode);
           } else {
             statusEl.innerHTML = `
               <div style="color: #34d399; font-size: 12px; font-weight: 600; padding: 4px 0;">
@@ -2532,6 +2600,7 @@
               </div>
             `;
             displayTicket(resolvedTicket);
+            enrichTicketFromDeviceHistory(resolvedTicket.ticketCode || cleanCode);
             if (resolvedTicket.status === 'USED' || resolvedTicket.checked_in_at || resolvedTicket.checkedInAt) {
               playBeep('error');
               showAlert('⚠️ Vé này đã được check-in trước đó!', 'error');
@@ -2547,9 +2616,10 @@
             }
           }
         } else if (res.status === 409 || resTag === 'USED') {
-          const usedTicket = data.data || data.ticket || buildTicketFromIotResponse(rawValue, cleanCode, { ...data, result: 'USED' });
+          const usedTicket = buildTicketFromIotResponse(rawValue, cleanCode, { ...data, result: 'USED' });
           usedTicket.status = 'USED';
           displayTicket(usedTicket, false, { allowAutoConfirm: false });
+          enrichTicketFromDeviceHistory(usedTicket.ticketCode || cleanCode);
           statusEl.innerHTML = `
             <div style="background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.35); border-radius: 8px; padding: 12px;">
               <div style="font-weight: 700; color: #f87171; font-size: 13px; margin-bottom: 4px;">
